@@ -267,8 +267,69 @@ jobs:
           fi
 
           KEYSTORE_FILE="${GITHUB_WORKSPACE}/my-upload-key.jks"
-          printf '%s' "${KEYSTORE_BASE64}" | tr -d '\r\n ' | base64 --decode > "${KEYSTORE_FILE}"
-          chmod 600 "${KEYSTORE_FILE}"
+          KEYSTORE_FILE="${KEYSTORE_FILE}" python3 - <<'PY'
+          import base64, os, re, sys
+
+          raw = os.environ.get("KEYSTORE_BASE64", "")
+          out_path = os.environ["KEYSTORE_FILE"]
+
+          # Remove surrounding quotes and any Data URI prefix (common when copied from web converters)
+          cleaned = raw.strip().strip('"').strip("'")
+          if cleaned.lower().startswith("data:") and ";base64," in cleaned.lower():
+              idx = cleaned.lower().index(";base64,")
+              cleaned = cleaned[idx + len(";base64,"):]
+
+          # Strip all ASCII/Unicode whitespace and zero-width characters from mobile copy-paste
+          cleaned = re.sub(r"[\s\u00a0\u200b-\u200d\ufeff]+", "", cleaned)
+
+          if not cleaned:
+              sys.exit("::error::KEYSTORE_BASE64 is empty after trimming whitespace.")
+
+          if "BEGINCERTIFICATE" in cleaned.upper() or "-----BEGIN" in raw.upper():
+              sys.exit("::error::KEYSTORE_BASE64 looks like a PEM text/certificate instead of the Base64-encoded .jks keystore file. Encode my-upload-key.jks itself to Base64.")
+
+          # Convert URL-safe base64 (-, _) to standard base64 (+, /) and fix missing '=' padding
+          normalized = cleaned.replace("-", "+").replace("_", "/")
+          invalid_chars = sorted(set(re.findall(r"[^A-Za-z0-9+/=]", normalized)))
+          if invalid_chars:
+              sys.exit(
+                  f"::error::KEYSTORE_BASE64 contains {len(invalid_chars)} invalid non-Base64 character type(s) "
+                  f"(cleaned length={len(normalized)}). Re-encode my-upload-key.jks using 'base64 -w 0 my-upload-key.jks' and paste the complete output without extra symbols."
+              )
+
+          # Strip any stray trailing/internal '=' issues and re-pad cleanly if mod 4 is 2 or 3
+          if "=" in normalized.rstrip("="):
+              sys.exit(
+                  f"::error::KEYSTORE_BASE64 has '=' padding characters in the middle (cleaned length={len(normalized)}). "
+                  "This usually means multiple lines or values were concatenated incorrectly. Re-generate and paste a single clean Base64 string."
+              )
+
+          normalized_unpadded = normalized.rstrip("=")
+          rem = len(normalized_unpadded) % 4
+          if rem == 1:
+              sys.exit(
+                  f"::error::KEYSTORE_BASE64 appears truncated or corrupted (unpadded length={len(normalized_unpadded)}, mod 4 == 1). "
+                  "On Android/Termux, copying from terminal screen can cut off characters; save to a .txt file (e.g. 'base64 -w 0 my-upload-key.jks > ks.b64.txt') and copy the entire file."
+              )
+          if rem in (2, 3):
+              normalized = normalized_unpadded + ("=" * (4 - rem))
+
+          try:
+              decoded = base64.b64decode(normalized, validate=True)
+          except Exception as exc:
+              sys.exit(f"::error::KEYSTORE_BASE64 could not be decoded ({type(exc).__name__}, length={len(normalized)}). Re-encode my-upload-key.jks cleanly.")
+
+          if len(decoded) < 100:
+              sys.exit(
+                  f"::error::Decoded keystore is only {len(decoded)} bytes, which is too small to be a valid .jks file. "
+                  "Make sure you encoded the my-upload-key.jks file itself, not the filename or password."
+              )
+
+          with open(out_path, "wb") as f:
+              f.write(decoded)
+          os.chmod(out_path, 0o600)
+          print(f"Decoded KEYSTORE_BASE64 cleanly ({len(decoded)} bytes)")
+          PY
 
           KEYTOOL_OUT=$(keytool -list -v \
             -keystore "${KEYSTORE_FILE}" \

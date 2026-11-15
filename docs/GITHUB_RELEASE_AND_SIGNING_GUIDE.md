@@ -51,17 +51,18 @@ keytool -list -v -keystore my-upload-key.jks -alias upload
 
 ### ধাপ ২.৩: `.jks` ফাইলকে Base64 টেক্সটে রূপান্তর করুন
 
-- **Linux / Git Bash:**
+- **Linux / Git Bash / Android Termux (সবচেয়ে নিরাপদ — ফাইলে সেভ করে নিন যাতে ফোন থেকে কপি করতে গিয়ে অক্ষর বাদ না পড়ে):**
   ```bash
-  base64 -w 0 my-upload-key.jks
+  base64 -w 0 my-upload-key.jks > ks.b64.txt
   ```
+  *(Termux-এ সরাসরি কপি করতে চাইলে `termux-clipboard-set < ks.b64.txt` অথবা টেক্সট এডিটর দিয়ে `ks.b64.txt`-এর পুরো লেখা Copy করুন। কাজ শেষে `ks.b64.txt` ডিলিট করে ফেলুন, তবে `my-upload-key.jks` নিরাপদে ব্যাকআপ রাখুন।)*
 - **macOS:**
   ```bash
-  base64 -i my-upload-key.jks | tr -d '\n'
+  base64 -i my-upload-key.jks | tr -d '\n' > ks.b64.txt
   ```
 - **Windows PowerShell:**
   ```powershell
-  [Convert]::ToBase64String([IO.File]::ReadAllBytes("my-upload-key.jks"))
+  [Convert]::ToBase64String([IO.File]::ReadAllBytes("my-upload-key.jks")) | Set-Clipboard
   ```
 
 ### ধাপ ২.৪: GitHub Repository Secrets ও Variables যোগ করুন
@@ -135,6 +136,7 @@ GitHub-এ আপনার repository খুলে যান:
 | সমস্যা / Error | কারণ | সমাধান |
 |---|---|---|
 | `Missing required permanent signing secret(s): KEYSTORE_BASE64 ...` | GitHub Secrets-এ ৩টি Secret এখনো যোগ করা হয়নি। | **Settings -> Secrets and variables -> Actions**-এ `KEYSTORE_BASE64`, `STORE_PASSWORD`, `KEY_PASSWORD` যোগ করে ওয়ার্কফ্লো পুনরায় চালান। |
+| `base64: invalid input` অথবা `KEYSTORE_BASE64 appears truncated / contains invalid ...` | `KEYSTORE_BASE64` সিক্রেটটি কপি-পেস্ট করার সময় অসম্পূর্ণ (truncated) হয়েছে, অথবা ভুল ফরম্যাট (`PEM`, ফাইল-নাম বা অপ্রয়োজনীয় চিহ্ন) পেস্ট হয়েছে। | `base64 -w 0 my-upload-key.jks > ks.b64.txt` দিয়ে একটি টেক্সট ফাইলে সেভ করে **শুরু থেকে শেষ পর্যন্ত পুরো টেক্সট** আবার `KEYSTORE_BASE64` সিক্রেটে পেস্ট করুন (প্রায় ৩,০০০+ অক্ষর থাকে)। |
 | `Could not open keystore or find alias 'upload'` | পাসওয়ার্ড ভুল অথবা Keystore তৈরি করার সময় alias `upload` দেওয়া হয়নি। | সঠিক পাসওয়ার্ড দিন অথবা `-alias upload` দিয়ে Keystore যাচাই করুন। |
 | `Keystore SHA-256 does not match EXPECTED_SIGNING_SHA256` | ভ্যারিয়েবলে পিন করা fingerprint-এর সাথে Keystore মিলছে না। | `keytool -list -v` দিয়ে সঠিক SHA-256 মিলিয়ে নিন। |
 | ফোনে আপডেটের সময় `App not installed as package conflicts with an existing package` | ফোনের বর্তমান অ্যাপটি ভিন্ন Key (পুরোনো অস্থায়ী/debug key) দিয়ে সাইন করা ছিল। | ব্যাকআপ এক্সপোর্ট করে পুরোনো অ্যাপটি **একবার** Uninstall করুন, তারপর নতুন স্থায়ী Release APK ইনস্টল করুন। এরপর আর কখনো এটি হবে না। |
