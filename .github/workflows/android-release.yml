@@ -1,0 +1,415 @@
+name: Android CI & Auto Release
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      version_name:
+        description: 'Optional semantic version (e.g. 1.0.5). Leave blank to auto-bump.'
+        required: false
+        default: ''
+      version_code:
+        description: 'Optional integer versionCode. Leave blank to auto-increment.'
+        required: false
+        default: ''
+      publish_release:
+        description: 'Publish GitHub Release'
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  EXPECTED_APPLICATION_ID: com.aistudio.jhgetway.iffndf
+  EXPECTED_KEY_ALIAS: upload
+
+jobs:
+  test:
+    name: Unit & Robolectric Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Set up Gradle 9.3.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.3.1'
+
+      - name: Ensure debug keystore exists for test builds
+        run: |
+          if [ ! -f debug.keystore ]; then
+            if [ -f debug.keystore.base64 ]; then
+              base64 --decode debug.keystore.base64 > debug.keystore
+            else
+              keytool -genkeypair -v \
+                -keystore debug.keystore \
+                -storepass android \
+                -alias androiddebugkey \
+                -keypass android \
+                -keyalg RSA \
+                -keysize 2048 \
+                -validity 10000 \
+                -dname "CN=Android Debug,O=Android,C=US"
+            fi
+          fi
+
+      - name: Run unit tests & debug compile check
+        timeout-minutes: 20
+        env:
+          GITHUB_REPOSITORY: ""
+        run: |
+          ARGS="-PgithubRepo= -Dorg.gradle.jvmargs=-Xmx2560m --console=plain --no-daemon"
+          if [ -x ./gradlew ]; then
+            ./gradlew :app:testDebugUnitTest :app:assembleDebug ${ARGS}
+          else
+            gradle :app:testDebugUnitTest :app:assembleDebug ${ARGS}
+          fi
+
+      - name: Upload test failure reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-failure-reports
+          path: |
+            app/build/reports/tests/testDebugUnitTest/
+            app/build/test-results/testDebugUnitTest/
+          retention-days: 7
+
+  release:
+    name: Build, Sign & Publish Release APK
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Set up Gradle 9.3.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.3.1'
+
+      - name: Compute release version & tag
+        id: version
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION_NAME: ${{ github.event.inputs.version_name }}
+          INPUT_VERSION_CODE: ${{ github.event.inputs.version_code }}
+          INPUT_PUBLISH_RELEASE: ${{ github.event.inputs.publish_release }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, sys, urllib.error, urllib.request
+
+          event_name = os.environ["EVENT_NAME"]
+          ref_type = os.environ.get("GITHUB_REF_TYPE", "")
+          ref_name = os.environ.get("GITHUB_REF_NAME", "")
+          run_number = int(os.environ.get("GITHUB_RUN_NUMBER", "1"))
+          repo = os.environ["REPO"]
+          token = os.environ.get("GH_TOKEN", "")
+
+          def gh_get(url, accept="application/vnd.github+json"):
+              req = urllib.request.Request(url, headers={
+                  "Accept": accept,
+                  "User-Agent": "JH-GetWay-Auto-Release"
+              })
+              if token and url.startswith("https://api.github.com/"):
+                  req.add_header("Authorization", f"Bearer {token}")
+              try:
+                  with urllib.request.urlopen(req, timeout=15) as r:
+                      return r.status, r.read().decode("utf-8")
+              except urllib.error.HTTPError as e:
+                  return e.code, e.read().decode("utf-8", errors="ignore")
+
+          def tag_exists(tag):
+              rel_status, _ = gh_get(f"https://api.github.com/repos/{repo}/releases/tags/{tag}")
+              if rel_status == 200:
+                  return True
+              ref_status, _ = gh_get(f"https://api.github.com/repos/{repo}/git/ref/tags/{tag}")
+              return ref_status == 200
+
+          prev_code = 0
+          prev_ver = ""
+          lat_status, lat_body = gh_get(f"https://api.github.com/repos/{repo}/releases/latest")
+          if lat_status == 200:
+              lat_json = json.loads(lat_body)
+              prev_ver = (lat_json.get("tag_name") or "").lstrip("vV").strip()
+              for asset in lat_json.get("assets", []):
+                  if asset.get("name", "").lower() == "update-manifest.json":
+                      asset_url = asset.get("url") or asset["browser_download_url"]
+                      m_status, m_body = gh_get(asset_url, accept="application/octet-stream")
+                      if m_status == 200:
+                          m_json = json.loads(m_body)
+                          prev_code = max(prev_code, int(m_json.get("versionCode", 0) or 0))
+                          if m_json.get("versionName"):
+                              prev_ver = str(m_json["versionName"]).lstrip("vV").strip()
+
+          def bump_patch(base_ver):
+              m = re.match(r"^(\d+)\.(\d+)\.(\d+)", base_ver or "")
+              if not m:
+                  return "1.0.1"
+              major, minor, patch = int(m.group(1)), int(m.group(2)), int(m.group(3))
+              return f"{major}.{minor}.{patch + 1}"
+
+          should_publish = "true"
+          if ref_type == "tag":
+              release_tag = ref_name.strip()
+              version_name = release_tag.lstrip("vV")
+              if tag_exists(release_tag):
+                  sys.exit(f"::error::Release for tag '{release_tag}' already exists.")
+          elif event_name == "workflow_dispatch":
+              raw_ver = os.environ.get("INPUT_VERSION_NAME", "").strip().lstrip("vV")
+              version_name = raw_ver if raw_ver else (bump_patch(prev_ver) if prev_ver else "1.0.1")
+              while not raw_ver and tag_exists(f"v{version_name}"):
+                  version_name = bump_patch(version_name)
+              release_tag = f"v{version_name}"
+              if tag_exists(release_tag):
+                  sys.exit(f"::error::Release or tag '{release_tag}' already exists.")
+              should_publish = "true" if os.environ.get("INPUT_PUBLISH_RELEASE", "true").lower() == "true" else "false"
+          else:
+              # Automatic release on push to main/master
+              version_name = bump_patch(prev_ver) if prev_ver else "1.0.1"
+              while tag_exists(f"v{version_name}"):
+                  version_name = bump_patch(version_name)
+              release_tag = f"v{version_name}"
+
+          if not re.match(r"^\d+\.\d+\.\d+(-[A-Za-z0-9._-]+)?$", version_name):
+              sys.exit(f"::error::Invalid semantic version '{version_name}'. Expected X.Y.Z.")
+
+          input_code_raw = os.environ.get("INPUT_VERSION_CODE", "").strip()
+          if input_code_raw:
+              if not input_code_raw.isdigit() or int(input_code_raw) <= 0:
+                  sys.exit("::error::version_code must be a positive integer.")
+              version_code = int(input_code_raw)
+          else:
+              version_code = max(prev_code + 1, run_number + 1, 2)
+
+          if version_code <= prev_code:
+              sys.exit(f"::error::versionCode ({version_code}) must be greater than previous release ({prev_code}).")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"version_code={version_code}\n")
+              out.write(f"version_name={version_name}\n")
+              out.write(f"release_tag={release_tag}\n")
+              out.write(f"should_publish={should_publish}\n")
+
+          print(f"Prepared release {release_tag} (versionName={version_name}, versionCode={version_code}, publish={should_publish})")
+          PY
+
+      - name: Configure permanent production keystore (fail closed)
+        id: signing
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          SECRET_STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          SECRET_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          EXPECTED_SIGNING_SHA256: ${{ vars.EXPECTED_SIGNING_SHA256 || secrets.EXPECTED_SIGNING_SHA256 }}
+        run: |
+          if [ ! -f debug.keystore ]; then
+            if [ -f debug.keystore.base64 ]; then
+              base64 --decode debug.keystore.base64 > debug.keystore
+            else
+              keytool -genkeypair -v \
+                -keystore debug.keystore \
+                -storepass android \
+                -alias androiddebugkey \
+                -keypass android \
+                -keyalg RSA \
+                -keysize 2048 \
+                -validity 10000 \
+                -dname "CN=Android Debug,O=Android,C=US"
+            fi
+          fi
+
+          MISSING=()
+          [ -z "${KEYSTORE_BASE64}" ] && MISSING+=("KEYSTORE_BASE64")
+          [ -z "${SECRET_STORE_PASSWORD}" ] && MISSING+=("STORE_PASSWORD")
+          [ -z "${SECRET_KEY_PASSWORD}" ] && MISSING+=("KEY_PASSWORD")
+          if [ "${#MISSING[@]}" -gt 0 ]; then
+            echo "::error::Missing required permanent signing secret(s): ${MISSING[*]}. See docs/GITHUB_RELEASE_AND_SIGNING_GUIDE.md to configure them once."
+            exit 1
+          fi
+
+          KEYSTORE_FILE="${GITHUB_WORKSPACE}/my-upload-key.jks"
+          printf '%s' "${KEYSTORE_BASE64}" | tr -d '\r\n ' | base64 --decode > "${KEYSTORE_FILE}"
+          chmod 600 "${KEYSTORE_FILE}"
+
+          KEYTOOL_OUT=$(keytool -list -v \
+            -keystore "${KEYSTORE_FILE}" \
+            -storepass "${SECRET_STORE_PASSWORD}" \
+            -alias "${EXPECTED_KEY_ALIAS}" 2>&1) || {
+            echo "::error::Could not open keystore or find alias '${EXPECTED_KEY_ALIAS}'."
+            exit 1
+          }
+
+          CERT_SHA256=$(printf '%s\n' "${KEYTOOL_OUT}" | grep -iE 'SHA256:|SHA-256:' | head -n 1 | sed -E 's/.*SHA-?256:[[:space:]]*//I' | tr -d ':' | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+          if [ -z "${CERT_SHA256}" ]; then
+            echo "::error::Could not extract SHA-256 fingerprint from keystore alias '${EXPECTED_KEY_ALIAS}'."
+            exit 1
+          fi
+
+          if [ -n "${EXPECTED_SIGNING_SHA256}" ]; then
+            PINNED=$(printf '%s' "${EXPECTED_SIGNING_SHA256}" | tr -d ':' | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+            if [ "${CERT_SHA256}" != "${PINNED}" ]; then
+              echo "::error::Keystore SHA-256 (${CERT_SHA256}) does not match EXPECTED_SIGNING_SHA256 (${PINNED})."
+              exit 1
+            fi
+          fi
+
+          echo "KEYSTORE_PATH=${KEYSTORE_FILE}" >> "$GITHUB_ENV"
+          echo "STORE_PASSWORD=${SECRET_STORE_PASSWORD}" >> "$GITHUB_ENV"
+          echo "KEY_PASSWORD=${SECRET_KEY_PASSWORD}" >> "$GITHUB_ENV"
+          echo "cert_sha256=${CERT_SHA256}" >> "$GITHUB_OUTPUT"
+          echo "Permanent keystore verified (alias=${EXPECTED_KEY_ALIAS}, sha256=${CERT_SHA256})"
+
+      - name: Build signed Release APK
+        timeout-minutes: 15
+        env:
+          APP_VERSION_CODE: ${{ steps.version.outputs.version_code }}
+          APP_VERSION_NAME: ${{ steps.version.outputs.version_name }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          GRADLE_ARGS="-PciVersionCode=${APP_VERSION_CODE} -PciVersionName=${APP_VERSION_NAME} -PgithubRepo=${GITHUB_REPOSITORY} -Dorg.gradle.jvmargs=-Xmx2560m --no-daemon --console=plain"
+          if [ -x ./gradlew ]; then
+            ./gradlew :app:assembleRelease ${GRADLE_ARGS}
+          else
+            gradle :app:assembleRelease ${GRADLE_ARGS}
+          fi
+
+      - name: Verify APK signature & package release assets
+        id: package
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
+          VERSION_CODE: ${{ steps.version.outputs.version_code }}
+          VERSION_NAME: ${{ steps.version.outputs.version_name }}
+          EXPECTED_CERT_SHA256: ${{ steps.signing.outputs.cert_sha256 }}
+          REPO: ${{ github.repository }}
+        run: |
+          RELEASE_APK_SRC=$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          if [ -z "${RELEASE_APK_SRC}" ] || [ ! -f "${RELEASE_APK_SRC}" ]; then
+            echo "::error::Release APK not found!"
+            exit 1
+          fi
+
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          BUILD_TOOLS_DIR=$(find "${SDK_ROOT}/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)
+          AAPT2_BIN="${BUILD_TOOLS_DIR}/aapt2"
+          APKSIGNER_BIN="${BUILD_TOOLS_DIR}/apksigner"
+
+          BADGING=$("${AAPT2_BIN}" dump badging "${RELEASE_APK_SRC}")
+          APK_PKG=$(printf '%s\n' "${BADGING}" | sed -n "s/^package: name='\([^']*\)'.*/\1/p" | head -n 1)
+          APK_VCODE=$(printf '%s\n' "${BADGING}" | sed -n "s/.*versionCode='\([^']*\)'.*/\1/p" | head -n 1)
+          APK_VNAME=$(printf '%s\n' "${BADGING}" | sed -n "s/.*versionName='\([^']*\)'.*/\1/p" | head -n 1)
+
+          if [ "${APK_PKG}" != "${EXPECTED_APPLICATION_ID}" ] || [ "${APK_VCODE}" != "${VERSION_CODE}" ] || [ "${APK_VNAME}" != "${VERSION_NAME}" ]; then
+            echo "::error::APK metadata mismatch (pkg=${APK_PKG}, code=${APK_VCODE}, name=${APK_VNAME})."
+            exit 1
+          fi
+
+          SIGNER_OUT=$("${APKSIGNER_BIN}" verify --verbose --print-certs "${RELEASE_APK_SRC}" 2>&1)
+          APK_CERT_SHA256=$(printf '%s\n' "${SIGNER_OUT}" | grep -i 'SHA-256 digest:' | head -n 1 | awk -F': ' '{print $2}' | tr -d ':' | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+          if [ -z "${APK_CERT_SHA256}" ] || [ "${APK_CERT_SHA256}" != "${EXPECTED_CERT_SHA256}" ]; then
+            echo "::error::APK signer SHA-256 (${APK_CERT_SHA256}) does not match expected keystore (${EXPECTED_CERT_SHA256})."
+            exit 1
+          fi
+
+          mkdir -p release-artifacts
+          RELEASE_APK_NAME="JH-GetWay-${RELEASE_TAG}-release.apk"
+          cp "${RELEASE_APK_SRC}" "release-artifacts/${RELEASE_APK_NAME}"
+          APK_SHA256=$(sha256sum "release-artifacts/${RELEASE_APK_NAME}" | awk '{print $1}')
+          BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          APK_URL="https://github.com/${REPO}/releases/download/${RELEASE_TAG}/${RELEASE_APK_NAME}"
+
+          cat > release-artifacts/update-manifest.json <<EOF
+          {
+            "tag": "${RELEASE_TAG}",
+            "versionName": "${VERSION_NAME}",
+            "versionCode": ${VERSION_CODE},
+            "packageId": "${EXPECTED_APPLICATION_ID}",
+            "apkName": "${RELEASE_APK_NAME}",
+            "apkAssetUrl": "${APK_URL}",
+            "sha256": "${APK_SHA256}",
+            "signingMode": "production",
+            "signingCertSha256": "${APK_CERT_SHA256}",
+            "releaseDate": "${BUILD_DATE}"
+          }
+          EOF
+
+          (
+            cd release-artifacts
+            sha256sum "${RELEASE_APK_NAME}" "update-manifest.json" > SHA256SUMS.txt
+            sha256sum -c SHA256SUMS.txt
+          )
+
+          echo "release_apk=${RELEASE_APK_NAME}" >> "$GITHUB_OUTPUT"
+          echo "apk_sha256=${APK_SHA256}" >> "$GITHUB_OUTPUT"
+          echo "apk_cert_sha256=${APK_CERT_SHA256}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Release APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: JH-GetWay-${{ steps.version.outputs.release_tag }}-release
+          path: |
+            release-artifacts/*.apk
+            release-artifacts/update-manifest.json
+            release-artifacts/SHA256SUMS.txt
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        if: steps.version.outputs.should_publish == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.release_tag }}
+          name: JH GetWay ${{ steps.version.outputs.release_tag }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          body: |
+            ## JH GetWay ${{ steps.version.outputs.release_tag }}
+
+            - **Application ID:** `${{ env.EXPECTED_APPLICATION_ID }}`
+            - **Version:** `${{ steps.version.outputs.version_name }}` (Build `${{ steps.version.outputs.version_code }}`)
+            - **Release APK:** `${{ steps.package.outputs.release_apk }}`
+            - **APK SHA-256:** `${{ steps.package.outputs.apk_sha256 }}`
+            - **Signing Cert SHA-256:** `${{ steps.package.outputs.apk_cert_sha256 }}`
+          files: |
+            release-artifacts/*.apk
+            release-artifacts/update-manifest.json
+            release-artifacts/SHA256SUMS.txt

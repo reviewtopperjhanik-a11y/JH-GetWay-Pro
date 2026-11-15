@@ -1,0 +1,8 @@
+{
+  "name": "JH GetWay",
+  "description": "Personal AI API Gateway, Key Vault, Smart Router, MCP Bridge & Workflow Orchestrator for Android by JH Soft Corporation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
