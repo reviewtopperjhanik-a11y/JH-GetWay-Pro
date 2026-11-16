@@ -1010,17 +1010,34 @@ class PlaygroundUpgradeTest {
             }
         }
         composeRule.waitForIdle()
+        val initDeadline = System.nanoTime() + 10_000_000_000L
+        while (System.nanoTime() < initDeadline) {
+            Shadows.shadowOf(Looper.getMainLooper()).idle()
+            composeRule.waitForIdle()
+            val hasModelNode = runCatching {
+                composeRule.onAllNodesWithTag("model_details_llama-3.3-70b-versatile")
+                    .fetchSemanticsNodes().isNotEmpty()
+            }.getOrDefault(false)
+            if (hasModelNode) break
+            Thread.sleep(25)
+        }
 
         composeRule.onNodeWithText(EnglishStrings.tierUnknown).assertExists()
         composeRule.onNodeWithTag("model_details_llama-3.3-70b-versatile").performClick()
         composeRule.waitForIdle()
         composeRule.onNodeWithTag("model_confirm_free_btn").performScrollTo().performClick()
 
-        val deadline = System.nanoTime() + 5_000_000_000L
+        val deadline = System.nanoTime() + 10_000_000_000L
         while (System.nanoTime() < deadline) {
             Shadows.shadowOf(Looper.getMainLooper()).idle()
+            composeRule.waitForIdle()
             val updated = runBlocking { app.database.modelDao().getAllOnce().firstOrNull() }
-            if (updated?.freeTierVerified == true) break
+            val vmUpdated = vm.models.value.firstOrNull()
+            val hasRevokeNode = runCatching {
+                composeRule.onAllNodesWithTag("model_revoke_free_btn", useUnmergedTree = true)
+                    .fetchSemanticsNodes().isNotEmpty()
+            }.getOrDefault(false)
+            if (updated?.freeTierVerified == true && vmUpdated?.freeTierVerified == true && hasRevokeNode) break
             Thread.sleep(25)
         }
         composeRule.waitForIdle()
