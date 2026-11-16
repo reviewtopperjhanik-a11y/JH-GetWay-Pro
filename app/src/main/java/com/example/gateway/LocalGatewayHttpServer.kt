@@ -84,14 +84,30 @@ data class RemoteHealthResult(
 
 interface RemoteGatewayHealthChecker {
     suspend fun checkHealth(url: String, bearerToken: String, timeoutSec: Int): RemoteHealthResult
+
+    suspend fun checkHealth(
+        url: String,
+        bearerToken: String,
+        timeoutSec: Int,
+        allowPrivateLocalHttp: Boolean
+    ): RemoteHealthResult = checkHealth(url, bearerToken, timeoutSec)
 }
 
 class OkHttpRemoteHealthChecker : RemoteGatewayHealthChecker {
     override suspend fun checkHealth(url: String, bearerToken: String, timeoutSec: Int): RemoteHealthResult =
+        checkHealth(url, bearerToken, timeoutSec, allowPrivateLocalHttp = false)
+
+    override suspend fun checkHealth(
+        url: String,
+        bearerToken: String,
+        timeoutSec: Int,
+        allowPrivateLocalHttp: Boolean
+    ): RemoteHealthResult =
         withContext(Dispatchers.IO) {
             val cleanBase = url.trim().trimEnd('/')
-            val allowLoopbackOnly = NetworkAddressClassifier.isLoopbackAddress(NetworkAddressClassifier.parseHost(cleanBase).orEmpty())
-            val sec = NetworkAddressClassifier.validateEndpointSecurity(cleanBase, allowLocalHttp = allowLoopbackOnly)
+            val isLoopback = NetworkAddressClassifier.isLoopbackAddress(NetworkAddressClassifier.parseHost(cleanBase).orEmpty())
+            val allowLocalHttp = isLoopback || allowPrivateLocalHttp
+            val sec = NetworkAddressClassifier.validateEndpointSecurity(cleanBase, allowLocalHttp = allowLocalHttp)
             if (!sec.allowed) {
                 return@withContext RemoteHealthResult(
                     status = GatewayRunStatus.ERROR,
@@ -102,7 +118,7 @@ class OkHttpRemoteHealthChecker : RemoteGatewayHealthChecker {
             val client = OkHttpClient.Builder()
                 .connectTimeout(timeoutSec.toLong().coerceIn(5, 60), TimeUnit.SECONDS)
                 .readTimeout(timeoutSec.toLong().coerceIn(5, 60), TimeUnit.SECONDS)
-                .dns(NetworkAddressClassifier.pinnedSafeDns(allowLocalHttp = allowLoopbackOnly))
+                .dns(NetworkAddressClassifier.pinnedSafeDns(allowLocalHttp = allowLocalHttp))
                 .followRedirects(false)
                 .followSslRedirects(false)
                 .build()
@@ -478,7 +494,12 @@ class LocalGatewayHttpServer(
             }
         } else ""
 
-        val result = healthChecker.checkHealth(validation.normalizedUrl, remoteToken, settings.gatewayTimeoutSec)
+        val result = healthChecker.checkHealth(
+            url = validation.normalizedUrl,
+            bearerToken = remoteToken,
+            timeoutSec = settings.gatewayTimeoutSec,
+            allowPrivateLocalHttp = allowLoopbackHttp
+        )
         _runtimeState.value = GatewayRuntimeState(
             status = result.status,
             mode = settings.gatewayMode,
@@ -515,6 +536,22 @@ class LocalGatewayHttpServer(
                 status = "STOPPED",
                 safeMessage = "Gateway stopped"
             )
+        )
+    }
+
+    suspend fun syncStoppedConfiguration(settings: GatewaySettingsState) = lifecycleMutex.withLock {
+        stopLocalEngineLocked()
+        val addr = if (settings.gatewayMode == GatewayMode.LOCAL) {
+            "http://${settings.gatewayHost.ifBlank { "127.0.0.1" }}:${settings.gatewayPort}"
+        } else {
+            settings.gatewayRemoteUrl.ifBlank { "https://" }
+        }
+        _runtimeState.value = GatewayRuntimeState(
+            status = GatewayRunStatus.STOPPED,
+            mode = settings.gatewayMode,
+            boundAddress = addr,
+            activeRequests = 0,
+            lastError = null
         )
     }
 

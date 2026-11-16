@@ -611,6 +611,36 @@ interface AppStrings {
     val resetAppSettingsConfirmTitle: String
     val resetAppSettingsConfirmMessage: String
     val resetAppSettingsConfirmButton: String
+
+    // Gateway Configuration Management
+    val gatewayConfigMenuTitle: String
+    val gatewayConfigMenuSubtitle: String
+    val gatewayConfigActiveModeLabel: String
+    val gatewayConfigSelectModeLabel: String
+    val gatewayConfigModeLocalDesc: String
+    val gatewayConfigModeRemoteDesc: String
+    val gatewayConfigModeExistingDesc: String
+    val gatewayConfigAllowExistingLocalLabel: String
+    val gatewayConfigModeSwitchTitle: String
+    val gatewayConfigModeSwitchMessage: String
+    val gatewayConfigSwitchConfirmAction: String
+    val gatewayConfigSavedMessage: String
+    val gatewayConfigTestingLabel: String
+
+    // Provider Directory & Isolated Views
+    val connectedApisCountLabel: String
+    val distinctProvidersCountLabel: String
+    val allApisOptionLabel: String
+    val allApisTitle: String
+    val apiCountSingular: String
+    val apiCountPlural: String
+    val manageKeysAction: String
+
+    // Updater Cache, Rate Limit & Manual Fallback
+    val openOfficialReleasesAction: String
+    val updaterLastCheckedPrefix: String
+    val updaterCachedReleaseBadge: String
+    val updaterRetryAfterPrefix: String
 }
 
 val LocalStrings = staticCompositionLocalOf<AppStrings> { EnglishStrings }

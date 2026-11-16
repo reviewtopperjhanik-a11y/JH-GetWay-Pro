@@ -7,6 +7,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -30,6 +31,7 @@ import com.example.ui.components.GatewayCard
 import com.example.ui.components.StatusPill
 import com.example.ui.components.StatusTone
 import com.example.ui.components.formatTimestamp
+import com.example.ui.components.gatewayStatusLabelAndTone
 import com.example.ui.navigation.Routes
 import com.example.ui.theme.MonoTextStyle
 import com.example.ui.theme.ThemeMode
@@ -114,9 +116,54 @@ fun SettingsScreen(
 
         // Gateway & Routing Quick Navigation
         item {
+            val (gwStatusLabel, gwStatusTone) = gatewayStatusLabelAndTone(viewModel.gatewayRuntime.collectAsState().value.status)
             GatewayCard {
                 Text("${s.gatewaySection} & ${s.routingSection}", style = MaterialTheme.typography.titleMedium)
                 Spacer(Modifier.height(8.dp))
+                Surface(
+                    onClick = { onNavigate(Routes.GATEWAY_CONFIG) },
+                    shape = MaterialTheme.shapes.medium,
+                    color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.35f),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .minimumInteractiveComponentSize()
+                        .testTag("settings_gateway_config_btn")
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp, vertical = 12.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                            Text(s.gatewayConfigMenuTitle, style = MaterialTheme.typography.titleSmall)
+                            Text(
+                                text = "${s.gatewayConfigActiveModeLabel}: ${gatewayModeDisplayName(settings.gatewayMode, s)}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                            Text(
+                                text = s.gatewayConfigMenuSubtitle,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Spacer(Modifier.width(8.dp))
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            StatusPill(text = gwStatusLabel, tone = gwStatusTone)
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                                contentDescription = s.gatewayConfigMenuTitle,
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+                Spacer(Modifier.height(10.dp))
                 FlowRow(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     verticalArrangement = Arrangement.spacedBy(6.dp)
@@ -365,6 +412,14 @@ fun SettingsScreen(
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
+                updateState.lastCheckedAtMs?.let { checkedAt ->
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        text = "${s.updaterLastCheckedPrefix}: ${formatTimestamp(checkedAt)}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
                 if (updateState.isChecking) {
                     Spacer(Modifier.height(6.dp))
                     LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
@@ -385,6 +440,28 @@ fun SettingsScreen(
                         Text(statusMsg, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
                     }
                 }
+                val fallbackUrl = updateState.manualReleasesUrl
+                    ?: viewModel.effectiveGithubUpdateRepo(settings)
+                        .takeIf { it.isNotBlank() }
+                        ?.let { "https://github.com/$it/releases" }
+                if (!updateState.isChecking &&
+                    fallbackUrl != null &&
+                    (updateState.errorMessage != null || updateState.rateLimitResetAtMs != null) &&
+                    !updateState.signingConflict
+                ) {
+                    val uriHandler = androidx.compose.ui.platform.LocalUriHandler.current
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedButton(
+                        onClick = { runCatching { uriHandler.openUri(fallbackUrl) } },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("settings_open_releases_fallback_btn")
+                    ) {
+                        Icon(Icons.Default.OpenInBrowser, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text(s.openOfficialReleasesAction)
+                    }
+                }
                 updateState.availableRelease?.let { release ->
                     val uriHandler = androidx.compose.ui.platform.LocalUriHandler.current
                     Spacer(Modifier.height(8.dp))
@@ -394,11 +471,21 @@ fun SettingsScreen(
                         modifier = Modifier.fillMaxWidth().testTag("settings_available_update_card")
                     ) {
                         Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                            Text(
-                                "${s.updateAvailableTitle}: ${release.tagName}",
-                                style = MaterialTheme.typography.titleSmall,
-                                color = MaterialTheme.colorScheme.primary
-                            )
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    "${s.updateAvailableTitle}: ${release.tagName}",
+                                    style = MaterialTheme.typography.titleSmall,
+                                    color = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                if (updateState.isUsingCachedRelease) {
+                                    StatusPill(text = s.updaterCachedReleaseBadge, tone = StatusTone.INFO)
+                                }
+                            }
                             if (!BuildConfig.DEBUG && release.signingMode == "ci-ephemeral") {
                                 Text(
                                     text = s.ephemeralReleaseWarning,

@@ -89,10 +89,12 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.navigation.NavGraph.Companion.findStartDestination
+import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
+import androidx.navigation.navArgument
 import com.example.core.i18n.AppLanguage
 import com.example.core.i18n.BengaliStrings
 import com.example.core.i18n.EnglishStrings
@@ -103,16 +105,20 @@ import com.example.ui.components.StatusPill
 import com.example.ui.components.gatewayStatusLabelAndTone
 import com.example.ui.navigation.Routes
 import com.example.ui.screens.ActivityLogsScreen
+import com.example.ui.screens.AllApisScreen
 import com.example.ui.screens.AnalyticsScreen
 import com.example.ui.screens.CodingAgentsScreen
 import com.example.ui.screens.DashboardScreen
 import com.example.ui.screens.DevicesScreen
+import com.example.ui.screens.GatewayConfigScreen
 import com.example.ui.screens.GatewayScreen
 import com.example.ui.screens.LocalAiScreen
 import com.example.ui.screens.McpServersScreen
 import com.example.ui.screens.ModelsScreen
 import com.example.ui.screens.OnboardingScreen
 import com.example.ui.screens.PlaygroundScreen
+import com.example.ui.screens.ProviderDetailScreen
+import com.example.ui.screens.ProviderDirectoryHelper
 import com.example.ui.screens.ProvidersScreen
 import com.example.ui.screens.SettingsScreen
 import com.example.ui.screens.SmartRouterScreen
@@ -377,6 +383,7 @@ private fun MainGatewayScaffold(viewModel: GatewayViewModel) {
 
     val bannerMessage by viewModel.uiBannerMessage.collectAsState()
     val runtime by viewModel.gatewayRuntime.collectAsState()
+    val providers by viewModel.providers.collectAsState()
     val pendingMcpApproval by viewModel.pendingMcpApproval.collectAsState()
     val updateState by viewModel.appUpdateUiState.collectAsState()
     val snackbarHostState = remember { SnackbarHostState() }
@@ -392,7 +399,31 @@ private fun MainGatewayScaffold(viewModel: GatewayViewModel) {
 
     val navigateTo: (String) -> Unit = { route ->
         showMoreSheet = false
-        if (currentRoute != route) {
+        if (route == Routes.PROVIDERS && currentRoute.startsWith("providers/")) {
+            if (!navController.popBackStack(Routes.PROVIDERS, inclusive = false)) {
+                navController.navigate(Routes.PROVIDERS) {
+                    popUpTo(navController.graph.findStartDestination().id) {
+                        saveState = true
+                    }
+                    launchSingleTop = true
+                    restoreState = true
+                }
+            }
+        } else if (route == Routes.SETTINGS && currentRoute == Routes.GATEWAY_CONFIG) {
+            if (!navController.popBackStack(Routes.SETTINGS, inclusive = false)) {
+                navController.navigate(Routes.SETTINGS) {
+                    popUpTo(navController.graph.findStartDestination().id) {
+                        saveState = true
+                    }
+                    launchSingleTop = true
+                    restoreState = true
+                }
+            }
+        } else if (route.startsWith("settings/") || route.startsWith("providers/")) {
+            navController.navigate(route) {
+                launchSingleTop = true
+            }
+        } else if (currentRoute != route) {
             navController.navigate(route) {
                 popUpTo(navController.graph.findStartDestination().id) {
                     saveState = true
@@ -425,12 +456,23 @@ private fun MainGatewayScaffold(viewModel: GatewayViewModel) {
     )
 
     val isPrimaryRoute = primaryTabs.any { it.route == currentRoute }
-    val currentTitle = remember(currentRoute, s) {
+    val selectedTabRoute = when {
+        currentRoute == Routes.PROVIDERS || currentRoute.startsWith("providers/") -> Routes.PROVIDERS
+        primaryTabs.any { it.route == currentRoute } -> currentRoute
+        else -> null
+    }
+    val activeDetailGroupKey = navBackStackEntry?.arguments?.getString("groupKey")?.let { Uri.decode(it) }
+    val currentTitle = remember(currentRoute, activeDetailGroupKey, providers, s) {
         when (currentRoute) {
             Routes.DASHBOARD -> s.appName
             Routes.PROVIDERS -> s.navProviders
+            Routes.PROVIDERS_ALL -> s.allApisTitle
+            Routes.PROVIDER_DETAIL_PATTERN -> activeDetailGroupKey?.let { key ->
+                ProviderDirectoryHelper.findGroup(providers, key)?.displayName
+            } ?: s.providersTitle
             Routes.MODELS -> s.navModels
             Routes.GATEWAY -> s.navGateway
+            Routes.GATEWAY_CONFIG -> s.gatewayConfigMenuTitle
             Routes.SMART_ROUTER -> s.navSmartRouter
             Routes.CODING_AGENTS -> s.navCodingAgents
             Routes.LOCAL_AI -> s.navLocalAi
@@ -491,7 +533,7 @@ private fun MainGatewayScaffold(viewModel: GatewayViewModel) {
             NavigationBar {
                 primaryTabs.forEach { tab ->
                     NavigationBarItem(
-                        selected = currentRoute == tab.route,
+                        selected = selectedTabRoute == tab.route,
                         onClick = { navigateTo(tab.route) },
                         icon = { Icon(tab.icon, contentDescription = tab.label) },
                         label = { Text(tab.label, maxLines = 1, overflow = TextOverflow.Ellipsis) },
@@ -499,7 +541,7 @@ private fun MainGatewayScaffold(viewModel: GatewayViewModel) {
                     )
                 }
                 NavigationBarItem(
-                    selected = !isPrimaryRoute,
+                    selected = selectedTabRoute == null,
                     onClick = { showMoreSheet = true },
                     icon = { Icon(Icons.Default.Apps, contentDescription = s.navMore) },
                     label = { Text(s.navMore, maxLines = 1, overflow = TextOverflow.Ellipsis) },
@@ -521,11 +563,33 @@ private fun MainGatewayScaffold(viewModel: GatewayViewModel) {
             composable(Routes.PROVIDERS) {
                 ProvidersScreen(viewModel = viewModel, onNavigate = navigateTo)
             }
+            composable(Routes.PROVIDERS_ALL) {
+                AllApisScreen(viewModel = viewModel)
+            }
+            composable(
+                route = Routes.PROVIDER_DETAIL_PATTERN,
+                arguments = listOf(navArgument("groupKey") { type = NavType.StringType })
+            ) { entry ->
+                val encodedKey = entry.arguments?.getString("groupKey").orEmpty()
+                ProviderDetailScreen(
+                    groupKey = Uri.decode(encodedKey),
+                    viewModel = viewModel
+                )
+            }
             composable(Routes.MODELS) {
                 ModelsScreen(viewModel = viewModel, onNavigate = navigateTo)
             }
             composable(Routes.GATEWAY) {
-                GatewayScreen(viewModel = viewModel)
+                GatewayScreen(
+                    viewModel = viewModel,
+                    onOpenGatewayConfig = { navigateTo(Routes.GATEWAY_CONFIG) }
+                )
+            }
+            composable(Routes.GATEWAY_CONFIG) {
+                GatewayConfigScreen(
+                    viewModel = viewModel,
+                    onBack = { navController.popBackStack() }
+                )
             }
             composable(Routes.SMART_ROUTER) {
                 SmartRouterScreen(viewModel = viewModel)

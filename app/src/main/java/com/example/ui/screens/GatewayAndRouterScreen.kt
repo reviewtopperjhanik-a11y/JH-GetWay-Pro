@@ -13,6 +13,7 @@ import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.AltRoute
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -20,7 +21,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.example.core.i18n.LocalStrings
@@ -31,25 +31,13 @@ import com.example.ui.components.*
 import com.example.ui.theme.MonoTextStyle
 
 @Composable
-fun GatewayScreen(viewModel: GatewayViewModel) {
+fun GatewayScreen(
+    viewModel: GatewayViewModel,
+    onOpenGatewayConfig: () -> Unit = {}
+) {
     val s = LocalStrings.current
     val settings by viewModel.settings.collectAsState()
     val runtime by viewModel.gatewayRuntime.collectAsState()
-
-    var gwName by remember(settings.gatewayName) { mutableStateOf(settings.gatewayName) }
-    var mode by remember(settings.gatewayMode) { mutableStateOf(settings.gatewayMode) }
-    var host by remember(settings.gatewayHost) { mutableStateOf(settings.gatewayHost) }
-    var portText by remember(settings.gatewayPort) { mutableStateOf(settings.gatewayPort.toString()) }
-    var remoteUrl by remember(settings.gatewayRemoteUrl) { mutableStateOf(settings.gatewayRemoteUrl) }
-    var allowLanExposure by remember(settings.gatewayAllowLanExposure) { mutableStateOf(settings.gatewayAllowLanExposure) }
-    var remoteAuthTokenInput by remember { mutableStateOf("") }
-    var clearSavedRemoteToken by remember { mutableStateOf(false) }
-    var authReq by remember(settings.gatewayAuthRequired) { mutableStateOf(settings.gatewayAuthRequired) }
-    var timeoutText by remember(settings.gatewayTimeoutSec) { mutableStateOf(settings.gatewayTimeoutSec.toString()) }
-    var maxKbText by remember(settings.gatewayMaxRequestKb) { mutableStateOf(settings.gatewayMaxRequestKb.toString()) }
-    var streaming by remember(settings.gatewayStreamingEnabled) { mutableStateOf(settings.gatewayStreamingEnabled) }
-    var rateLimitText by remember(settings.gatewayRateLimitPerMin) { mutableStateOf(settings.gatewayRateLimitPerMin.toString()) }
-    var loggingLevel by remember(settings.gatewayLoggingLevel) { mutableStateOf(settings.gatewayLoggingLevel) }
 
     var selectedEndpoint by remember { mutableStateOf("/v1/models") }
     var testModel by remember { mutableStateOf("jh-general") }
@@ -82,7 +70,9 @@ fun GatewayScreen(viewModel: GatewayViewModel) {
     }
 
     LazyColumn(
-        modifier = Modifier.fillMaxSize(),
+        modifier = Modifier
+            .fillMaxSize()
+            .testTag("gateway_screen_list"),
         contentPadding = PaddingValues(16.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
@@ -249,119 +239,55 @@ fun GatewayScreen(viewModel: GatewayViewModel) {
             }
         }
 
-        // Gateway Configuration Form
+        // Gateway Configuration Summary & Entry Point to Validated Mode Switcher
         item {
             GatewayCard {
-                Text(s.gatewaySettings, style = MaterialTheme.typography.titleMedium)
-                Spacer(Modifier.height(8.dp))
-                OutlinedTextField(value = gwName, onValueChange = { gwName = it }, label = { Text(s.gatewayName) }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                Spacer(Modifier.height(8.dp))
-                LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    items(GatewayMode.entries) { m ->
-                        FilterChip(selected = mode == m, onClick = { mode = m }, label = { Text(m.name) })
-                    }
-                }
-                Spacer(Modifier.height(8.dp))
-                if (mode == GatewayMode.LOCAL) {
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedTextField(value = host, onValueChange = { host = it }, label = { Text(s.hostLabel) }, textStyle = MonoTextStyle, singleLine = true, modifier = Modifier.weight(1.5f))
-                        OutlinedTextField(value = portText, onValueChange = { portText = it.filter { c -> c.isDigit() } }, label = { Text(s.portLabel) }, textStyle = MonoTextStyle, singleLine = true, modifier = Modifier.weight(1f))
-                    }
-                    Spacer(Modifier.height(6.dp))
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Switch(
-                            checked = allowLanExposure,
-                            onCheckedChange = { allowLanExposure = it },
-                            modifier = Modifier.testTag("gateway_allow_lan_switch")
-                        )
-                        Spacer(Modifier.width(8.dp))
-                        Text(s.allowLanExposureLabel, style = MaterialTheme.typography.bodyMedium)
-                    }
-                    if (allowLanExposure) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Text(s.gatewayConfigMenuTitle, style = MaterialTheme.typography.titleMedium)
                         Text(
-                            text = s.allowLanExposureWarning,
+                            text = "${s.gatewayConfigActiveModeLabel}: ${gatewayModeDisplayName(settings.gatewayMode, s)}",
                             style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.error
+                            color = MaterialTheme.colorScheme.primary
                         )
                     }
+                    StatusPill(text = settings.gatewayMode.name, tone = StatusTone.INFO)
+                }
+                Spacer(Modifier.height(6.dp))
+                val configuredEndpoint = if (settings.gatewayMode == GatewayMode.LOCAL) {
+                    "http://${settings.gatewayHost}:${settings.gatewayPort}"
                 } else {
-                    OutlinedTextField(value = remoteUrl, onValueChange = { remoteUrl = it }, label = { Text(s.remoteHttpsUrlLabel) }, textStyle = MonoTextStyle, singleLine = true, modifier = Modifier.fillMaxWidth())
-                    Spacer(Modifier.height(8.dp))
-                    OutlinedTextField(
-                        value = remoteAuthTokenInput,
-                        onValueChange = {
-                            remoteAuthTokenInput = it
-                            if (it.isNotBlank()) clearSavedRemoteToken = false
-                        },
-                        label = { Text(s.remoteAuthTokenLabel) },
-                        placeholder = {
-                            Text(
-                                if (settings.gatewayRemoteAuthTokenEnc.isNotBlank() && !clearSavedRemoteToken) s.savedLeaveBlankHint else s.optionalBearerHint
-                            )
-                        },
-                        visualTransformation = PasswordVisualTransformation(),
-                        textStyle = MonoTextStyle,
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    if (settings.gatewayRemoteAuthTokenEnc.isNotBlank() && !clearSavedRemoteToken) {
-                        TextButton(onClick = { clearSavedRemoteToken = true; remoteAuthTokenInput = "" }) {
-                            Text(s.clear)
-                        }
-                    }
+                    settings.gatewayRemoteUrl.ifBlank { "—" }
                 }
-                Spacer(Modifier.height(8.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedTextField(value = timeoutText, onValueChange = { timeoutText = it.filter { c -> c.isDigit() } }, label = { Text(s.requestTimeoutSec) }, singleLine = true, modifier = Modifier.weight(1f))
-                    OutlinedTextField(value = rateLimitText, onValueChange = { rateLimitText = it.filter { c -> c.isDigit() } }, label = { Text(s.rateLimitPerMin) }, singleLine = true, modifier = Modifier.weight(1f))
-                }
-                Spacer(Modifier.height(8.dp))
-                OutlinedTextField(value = maxKbText, onValueChange = { maxKbText = it.filter { c -> c.isDigit() } }, label = { Text(s.maxRequestSizeKb) }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Switch(checked = authReq, onCheckedChange = { authReq = it })
-                    Spacer(Modifier.width(8.dp))
-                    Text(s.authRequired)
-                }
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Switch(checked = streaming, onCheckedChange = { streaming = it })
-                    Spacer(Modifier.width(8.dp))
-                    Text(s.streamingLabel)
-                }
-                Text(s.loggingLevel, style = MaterialTheme.typography.labelMedium)
-                LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    items(LoggingLevel.entries) { lvl ->
-                        FilterChip(selected = loggingLevel == lvl, onClick = { loggingLevel = lvl }, label = { Text(lvl.name) })
-                    }
-                }
+                Text(
+                    text = "${settings.gatewayName} • $configuredEndpoint",
+                    style = MonoTextStyle,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    text = "${s.requestTimeoutSec}: ${settings.gatewayTimeoutSec}s • ${s.rateLimitPerMin}: ${settings.gatewayRateLimitPerMin} • ${s.loggingLevel}: ${settings.gatewayLoggingLevel.name}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
                 Spacer(Modifier.height(10.dp))
                 Button(
-                    onClick = {
-                        val tokenArg: String? = when {
-                            clearSavedRemoteToken -> ""
-                            remoteAuthTokenInput.isNotBlank() -> remoteAuthTokenInput
-                            else -> null
-                        }
-                        viewModel.updateGatewayConfig(
-                            name = gwName,
-                            mode = mode,
-                            host = host,
-                            port = portText.toIntOrNull() ?: 8787,
-                            remoteUrl = remoteUrl,
-                            authRequired = authReq,
-                            timeoutSec = timeoutText.toIntOrNull() ?: 60,
-                            maxReqKb = maxKbText.toIntOrNull() ?: 2048,
-                            streaming = streaming,
-                            rateLimit = rateLimitText.toIntOrNull() ?: 60,
-                            loggingLevel = loggingLevel,
-                            allowLanExposure = allowLanExposure,
-                            remoteAuthTokenPlain = tokenArg
-                        )
-                        remoteAuthTokenInput = ""
-                        clearSavedRemoteToken = false
-                        viewModel.postBanner("Gateway configuration saved")
-                    },
-                    modifier = Modifier.fillMaxWidth()
-                ) { Text(s.save) }
+                    onClick = onOpenGatewayConfig,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .minimumInteractiveComponentSize()
+                        .testTag("gateway_open_config_btn")
+                ) {
+                    Icon(Icons.Default.Tune, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text(s.gatewayConfigMenuTitle)
+                    Spacer(Modifier.width(6.dp))
+                    Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null, modifier = Modifier.size(18.dp))
+                }
             }
         }
     }

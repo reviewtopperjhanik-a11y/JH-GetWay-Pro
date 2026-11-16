@@ -453,8 +453,16 @@ object NetworkAddressClassifier {
                     else RemoteUrlValidationResult(true, trimmed)
                 }
                 "http" -> {
-                    if (allowExistingPrivateHttp && isLoopbackAddress(host)) {
-                        RemoteUrlValidationResult(true, trimmed)
+                    if (allowExistingPrivateHttp) {
+                        val sec = validateEndpointSecurity(trimmed, allowLocalHttp = true)
+                        if (sec.allowed && (sec.locality == EndpointLocality.LOOPBACK || sec.locality == EndpointLocality.PRIVATE_LAN)) {
+                            RemoteUrlValidationResult(true, trimmed)
+                        } else {
+                            RemoteUrlValidationResult(
+                                false,
+                                errorMessage = sec.errorMessage ?: "Public HTTP endpoints are blocked; use HTTPS or a private LAN/loopback address."
+                            )
+                        }
                     } else {
                         RemoteUrlValidationResult(
                             false,

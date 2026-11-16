@@ -120,7 +120,11 @@ data class AppUpdateUiState(
     val errorMessage: String? = null,
     val showPromptDialog: Boolean = false,
     val needsInstallPermission: Boolean = false,
-    val signingConflict: Boolean = false
+    val signingConflict: Boolean = false,
+    val manualReleasesUrl: String? = null,
+    val rateLimitResetAtMs: Long? = null,
+    val lastCheckedAtMs: Long? = null,
+    val isUsingCachedRelease: Boolean = false
 )
 
 data class FetchedModelsPrompt(
@@ -282,6 +286,9 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
 
     private val _agentConnectionStatuses = MutableStateFlow<Map<String, CodingAgentTestStatus>>(emptyMap())
     val agentConnectionStatuses: StateFlow<Map<String, CodingAgentTestStatus>> = _agentConnectionStatuses.asStateFlow()
+
+    private val _gatewayConfigTestResult = MutableStateFlow(GatewayConnectionTestResult())
+    val gatewayConfigTestResult: StateFlow<GatewayConnectionTestResult> = _gatewayConfigTestResult.asStateFlow()
 
     private val agentGatewayTester = CodingAgentGatewayTester()
     private val appLockManager = AppLockManager()
@@ -2101,6 +2108,210 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
         withContext(Dispatchers.Main) { onResult(outText) }
     }
 
+    fun clearGatewayConfigTestResult() {
+        _gatewayConfigTestResult.value = GatewayConnectionTestResult()
+    }
+
+    fun testGatewayDraftConnection(draft: GatewayConfigDraft) = viewModelScope.launch(Dispatchers.IO) {
+        val validation = GatewayConfigValidator.validate(draft)
+        if (!validation.valid) {
+            _gatewayConfigTestResult.value = GatewayConnectionTestResult(
+                isTesting = false,
+                success = false,
+                message = validation.errorMessage ?: "Invalid gateway configuration.",
+                runtimeStatus = GatewayRunStatus.ERROR,
+                testedAtMs = System.currentTimeMillis()
+            )
+            return@launch
+        }
+
+        _gatewayConfigTestResult.value = GatewayConnectionTestResult(
+            isTesting = true,
+            message = "Testing connection..."
+        )
+
+        if (draft.mode == GatewayMode.LOCAL) {
+            val currentRuntime = gatewayRuntime.value
+            val candidateAddr = "http://${validation.normalizedHost}:${validation.normalizedPort}"
+            if (currentRuntime.mode == GatewayMode.LOCAL &&
+                currentRuntime.status == GatewayRunStatus.LOCAL_RUNNING &&
+                currentRuntime.boundAddress.equals(candidateAddr, ignoreCase = true)
+            ) {
+                val client = OkHttpClient.Builder()
+                    .connectTimeout(draft.timeoutSec.toLong().coerceIn(5, 30), java.util.concurrent.TimeUnit.SECONDS)
+                    .readTimeout(draft.timeoutSec.toLong().coerceIn(5, 30), java.util.concurrent.TimeUnit.SECONDS)
+                    .build()
+                val res = runCatching {
+                    client.newCall(Request.Builder().url("$candidateAddr/health").get().build()).execute().use { resp ->
+                        val ok = resp.isSuccessful
+                        GatewayConnectionTestResult(
+                            isTesting = false,
+                            success = ok,
+                            message = if (ok) {
+                                "Local Gateway is running and healthy at $candidateAddr (HTTP ${resp.code})."
+                            } else {
+                                "Local Gateway responded with HTTP ${resp.code} at $candidateAddr."
+                            },
+                            runtimeStatus = if (ok) GatewayRunStatus.LOCAL_RUNNING else GatewayRunStatus.ERROR,
+                            httpCode = resp.code,
+                            testedAtMs = System.currentTimeMillis()
+                        )
+                    }
+                }.getOrElse { err ->
+                    GatewayConnectionTestResult(
+                        isTesting = false,
+                        success = false,
+                        message = MaskingUtils.sanitizeErrorMessage(err.message),
+                        runtimeStatus = GatewayRunStatus.ERROR,
+                        testedAtMs = System.currentTimeMillis()
+                    )
+                }
+                _gatewayConfigTestResult.value = res
+                return@launch
+            }
+
+            // Probe actual socket availability on the target host & port
+            val bindCheck = runCatching {
+                java.net.ServerSocket().use { sock ->
+                    sock.reuseAddress = true
+                    sock.bind(java.net.InetSocketAddress(validation.normalizedHost, validation.normalizedPort))
+                }
+            }
+            _gatewayConfigTestResult.value = if (bindCheck.isSuccess) {
+                GatewayConnectionTestResult(
+                    isTesting = false,
+                    success = true,
+                    message = "Local Gateway configuration valid and port ${validation.normalizedPort} on ${validation.normalizedHost} is available.",
+                    runtimeStatus = currentRuntime.status,
+                    testedAtMs = System.currentTimeMillis()
+                )
+            } else {
+                val err = bindCheck.exceptionOrNull()
+                GatewayConnectionTestResult(
+                    isTesting = false,
+                    success = false,
+                    message = "Port ${validation.normalizedPort} on ${validation.normalizedHost} cannot be bound: ${MaskingUtils.sanitizeErrorMessage(err?.message)}",
+                    runtimeStatus = GatewayRunStatus.ERROR,
+                    testedAtMs = System.currentTimeMillis()
+                )
+            }
+            return@launch
+        }
+
+        // Remote or Existing Gateway: execute actual remote health probe
+        val currentSettings = settings.value
+        val effectiveToken = when {
+            draft.remoteAuthTokenInput.isNotBlank() -> draft.remoteAuthTokenInput.trim()
+            draft.clearSavedRemoteToken -> ""
+            currentSettings.gatewayRemoteAuthTokenEnc.isNotBlank() -> {
+                CryptoManager.decryptResult(currentSettings.gatewayRemoteAuthTokenEnc).getOrElse { err ->
+                    _gatewayConfigTestResult.value = GatewayConnectionTestResult(
+                        isTesting = false,
+                        success = false,
+                        message = "Saved remote token could not be decrypted: ${MaskingUtils.sanitizeErrorMessage(err.message)}",
+                        runtimeStatus = GatewayRunStatus.ERROR,
+                        testedAtMs = System.currentTimeMillis()
+                    )
+                    return@launch
+                }
+            }
+            else -> ""
+        }
+
+        val probe = OkHttpRemoteHealthChecker().checkHealth(
+            url = validation.normalizedRemoteUrl,
+            bearerToken = effectiveToken,
+            timeoutSec = draft.timeoutSec,
+            allowPrivateLocalHttp = (draft.mode == GatewayMode.EXISTING && draft.allowExistingLocalHttp)
+        )
+        val ok = probe.status == GatewayRunStatus.REMOTE_CONNECTED
+        val detailMsg = if (ok) {
+            "Connected to ${validation.normalizedRemoteUrl}" + (probe.httpCode?.let { " (HTTP $it)" } ?: "")
+        } else {
+            probe.errorMessage ?: "Gateway health check returned ${probe.status.name}."
+        }
+        _gatewayConfigTestResult.value = GatewayConnectionTestResult(
+            isTesting = false,
+            success = ok,
+            message = detailMsg,
+            runtimeStatus = probe.status,
+            httpCode = probe.httpCode,
+            testedAtMs = probe.checkedAt
+        )
+    }
+
+    suspend fun saveAndApplyGatewayConfig(draft: GatewayConfigDraft): Result<Unit> {
+        val validation = GatewayConfigValidator.validate(draft)
+        if (!validation.valid) {
+            return Result.failure(IllegalArgumentException(validation.errorMessage ?: "Invalid gateway configuration."))
+        }
+
+        val tokenArg: String? = when {
+            draft.clearSavedRemoteToken -> ""
+            draft.remoteAuthTokenInput.isNotBlank() -> draft.remoteAuthTokenInput.trim()
+            else -> null
+        }
+        val encRemoteToken = when {
+            tokenArg == null -> null
+            tokenArg.isBlank() -> ""
+            else -> runCatching { CryptoManager.encrypt(tokenArg) }.getOrElse { err ->
+                return Result.failure(IllegalStateException(MaskingUtils.sanitizeErrorMessage(err.message, listOf(tokenArg))))
+            }
+        }
+
+        val previousSettings = settings.value
+        val modeChanged = previousSettings.gatewayMode != draft.mode
+        val wasLocalRunning = gatewayRuntime.value.mode == GatewayMode.LOCAL &&
+            (gatewayRuntime.value.status == GatewayRunStatus.LOCAL_RUNNING || gatewayRuntime.value.status == GatewayRunStatus.STARTING)
+
+        prefs.updateGatewaySettings(
+            name = draft.name.trim(),
+            mode = draft.mode,
+            host = validation.normalizedHost,
+            port = validation.normalizedPort,
+            remoteUrl = validation.normalizedRemoteUrl,
+            authRequired = draft.authRequired,
+            timeoutSec = draft.timeoutSec,
+            maxRequestKb = draft.maxRequestKb,
+            streaming = draft.streamingEnabled,
+            rateLimitPerMin = draft.rateLimitPerMin,
+            loggingLevel = draft.loggingLevel,
+            allowLanExposure = draft.allowLanExposure,
+            remoteAuthTokenEnc = encRemoteToken
+        )
+
+        if (draft.mode == GatewayMode.EXISTING && previousSettings.localNetworkAccessAllowed != draft.allowExistingLocalHttp) {
+            prefs.updateLocalAiSettings(
+                policy = previousSettings.localRoutingPolicy,
+                allowCloudFallback = previousSettings.allowCloudFallbackForLocal,
+                localNetworkAllowed = draft.allowExistingLocalHttp
+            )
+        }
+
+        val updatedSettings = prefs.settingsFlow.first()
+        if (draft.mode != GatewayMode.LOCAL) {
+            stopLocalGatewayServiceIfNeeded()
+            gatewayServer.refreshRemoteHealth(updatedSettings)
+        } else {
+            if (wasLocalRunning || previousSettings.gatewayServiceDesiredRunning) {
+                prefs.setGatewayServiceDesiredRunning(true)
+                GatewayForegroundService.dispatchRestart(app)
+                gatewayServer.restart(updatedSettings)
+            } else {
+                gatewayServer.syncStoppedConfiguration(updatedSettings)
+            }
+        }
+
+        logEvent(
+            ActivityCategory.SYSTEM_EVENT,
+            draft.name.trim(),
+            if (modeChanged) "GATEWAY_MODE_SWITCHED" else "GATEWAY_CONFIG_UPDATED",
+            "Gateway mode set to ${draft.mode.name}; all user data preserved"
+        )
+        postBanner("Gateway configuration saved (${draft.mode.name})")
+        return Result.success(Unit)
+    }
+
     // Settings, Security, Backup & Logs
     fun updateGatewayConfig(
         name: String,
@@ -2429,7 +2640,9 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
             val res = AppUpdateManager.checkForUpdate(
                 repoInput = repoSlug,
                 currentVersionCode = BuildConfig.VERSION_CODE,
-                currentVersionName = BuildConfig.VERSION_NAME
+                currentVersionName = BuildConfig.VERSION_NAME,
+                context = app,
+                forceRefresh = !silent
             )
             when (res) {
                 is AppUpdateCheckResult.UpdateAvailable -> {
@@ -2443,10 +2656,19 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
                             statusMessage = "Update ${res.release.tagName} available",
                             errorMessage = null,
                             showPromptDialog = !silent || !skipped,
-                            signingConflict = false
+                            signingConflict = false,
+                            manualReleasesUrl = res.release.htmlUrl.ifBlank { AppUpdateManager.officialReleasesUrl(res.release.repoSlug) },
+                            rateLimitResetAtMs = null,
+                            lastCheckedAtMs = res.checkedAtMs,
+                            isUsingCachedRelease = res.fromCache
                         )
                     }
-                    logEvent(ActivityCategory.SYSTEM_EVENT, "App Updater", "UPDATE_FOUND", "Release ${res.release.tagName} available from $repoSlug")
+                    logEvent(
+                        ActivityCategory.SYSTEM_EVENT,
+                        "App Updater",
+                        "UPDATE_FOUND",
+                        "Release ${res.release.tagName} available from $repoSlug" + if (res.fromCache) " (cached)" else ""
+                    )
                 }
                 is AppUpdateCheckResult.UpToDate -> {
                     _appUpdateUiState.update {
@@ -2456,7 +2678,11 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
                             statusMessage = "Up to date (v${res.currentVersionName})",
                             errorMessage = null,
                             showPromptDialog = false,
-                            signingConflict = false
+                            signingConflict = false,
+                            manualReleasesUrl = AppUpdateManager.officialReleasesUrl(repoSlug),
+                            rateLimitResetAtMs = null,
+                            lastCheckedAtMs = res.checkedAtMs,
+                            isUsingCachedRelease = res.fromCache
                         )
                     }
                     if (!silent) {
@@ -2471,17 +2697,44 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
                             statusMessage = if (silent) null else "No releases published yet for ${res.repoSlug}.",
                             errorMessage = null,
                             showPromptDialog = false,
-                            signingConflict = false
+                            signingConflict = false,
+                            manualReleasesUrl = AppUpdateManager.officialReleasesUrl(res.repoSlug),
+                            rateLimitResetAtMs = null,
+                            lastCheckedAtMs = res.checkedAtMs,
+                            isUsingCachedRelease = false
                         )
                     }
                 }
-                is AppUpdateCheckResult.Error -> {
-                    _appUpdateUiState.update {
-                        it.copy(
+                is AppUpdateCheckResult.RateLimited -> {
+                    _appUpdateUiState.update { prev ->
+                        val preserved = res.cachedRelease ?: prev.availableRelease
+                        prev.copy(
                             isChecking = false,
+                            availableRelease = preserved,
                             errorMessage = if (silent) null else res.message,
                             showPromptDialog = false,
-                            signingConflict = false
+                            signingConflict = false,
+                            manualReleasesUrl = res.releasesUrl,
+                            rateLimitResetAtMs = res.retryAfterEpochMs,
+                            isUsingCachedRelease = preserved != null
+                        )
+                    }
+                    if (!silent) {
+                        postBanner(res.message)
+                    }
+                }
+                is AppUpdateCheckResult.Error -> {
+                    _appUpdateUiState.update { prev ->
+                        val preserved = res.cachedRelease ?: prev.availableRelease
+                        prev.copy(
+                            isChecking = false,
+                            availableRelease = preserved,
+                            errorMessage = if (silent) null else res.message,
+                            showPromptDialog = false,
+                            signingConflict = false,
+                            manualReleasesUrl = res.releasesUrl ?: AppUpdateManager.officialReleasesUrl(repoSlug),
+                            rateLimitResetAtMs = null,
+                            isUsingCachedRelease = preserved != null
                         )
                     }
                 }
@@ -2516,12 +2769,12 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
                             isDownloading = false,
                             downloadProgressPct = 100,
                             downloadedApkFile = apkFile,
-                            statusMessage = "Ready to install ${release.tagName}",
+                            statusMessage = "Verified ${release.apkFileName}; launching installer...",
                             errorMessage = null,
                             signingConflict = false
                         )
                     }
-                    logEvent(ActivityCategory.SYSTEM_EVENT, "App Updater", "APK_DOWNLOADED", "Downloaded ${release.apkFileName}")
+                    logEvent(ActivityCategory.SYSTEM_EVENT, "App Updater", "APK_VERIFIED", "Downloaded & verified ${release.apkFileName}")
                     launchDownloadedApkInstall()
                 },
                 onFailure = { err ->
@@ -2546,16 +2799,34 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
         when (val launch = AppUpdateManager.launchApkInstaller(app, apkFile, release)) {
             is ApkInstallLaunchResult.Launched -> {
                 _appUpdateUiState.update {
-                    it.copy(needsInstallPermission = false, errorMessage = null, signingConflict = false)
+                    it.copy(
+                        needsInstallPermission = false,
+                        errorMessage = null,
+                        signingConflict = false,
+                        statusMessage = "Installer launched for ${release?.tagName ?: apkFile.name}"
+                    )
+                }
+                viewModelScope.launch {
+                    logEvent(ActivityCategory.SYSTEM_EVENT, "App Updater", "INSTALLER_LAUNCHED", "Verified APK passed to Android installer (${release?.tagName ?: apkFile.name})")
                 }
             }
             is ApkInstallLaunchResult.UnknownSourcesPermissionRequired -> {
-                _appUpdateUiState.update { it.copy(needsInstallPermission = true, signingConflict = false) }
+                _appUpdateUiState.update {
+                    it.copy(
+                        needsInstallPermission = true,
+                        signingConflict = false,
+                        statusMessage = null
+                    )
+                }
             }
             is ApkInstallLaunchResult.SigningConflict -> {
                 val msg = "Package signing key mismatch (${launch.installedSha256.take(8)} vs ${launch.apkSha256.take(8)}). Back up data, uninstall old build once, then install the new APK."
                 _appUpdateUiState.update {
-                    it.copy(signingConflict = true, errorMessage = msg)
+                    it.copy(
+                        signingConflict = true,
+                        errorMessage = msg,
+                        statusMessage = null
+                    )
                 }
                 viewModelScope.launch {
                     logEvent(ActivityCategory.SYSTEM_EVENT, "App Updater", "SIGNING_CONFLICT", msg)
@@ -2563,7 +2834,13 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
                 postBanner(msg)
             }
             is ApkInstallLaunchResult.Failed -> {
-                _appUpdateUiState.update { it.copy(errorMessage = launch.message, signingConflict = false) }
+                _appUpdateUiState.update {
+                    it.copy(
+                        errorMessage = launch.message,
+                        signingConflict = false,
+                        statusMessage = null
+                    )
+                }
                 postBanner(launch.message)
             }
         }
