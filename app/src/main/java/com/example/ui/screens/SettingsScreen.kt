@@ -674,6 +674,12 @@ fun SettingsScreen(
                                     style = MonoTextStyle
                                 )
                                 Text(
+                                    text = "Attachments: ${pv.attachmentCount} file(s) (${com.example.data.local.PlaygroundAttachmentManager.formatReadableSize(pv.attachmentTotalBytes)})" +
+                                        if (pv.unavailableAttachmentCount > 0) " • ${pv.unavailableAttachmentCount} unavailable" else "",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if (pv.unavailableAttachmentCount > 0) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                Text(
                                     text = "${s.backupConflictsLabel}: ${pv.conflicts.totalConflicts}",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = if (pv.conflicts.totalConflicts > 0) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
@@ -715,7 +721,9 @@ fun SettingsScreen(
                         scope.launch {
                             viewModel.restoreEncryptedBackup(payload, passphrase, strategy).fold(
                                 onSuccess = { res ->
-                                    viewModel.postBanner("Restored ${res.importedCount} items (skipped ${res.skippedConflicts})")
+                                    val attSummary = if (res.restoredAttachmentCount > 0) ", ${res.restoredAttachmentCount} attachment(s)" else ""
+                                    val warnSummary = if (res.warnings.isNotEmpty()) " (${res.warnings.joinToString("; ")})" else ""
+                                    viewModel.postBanner("Restored ${res.importedCount} items$attSummary (skipped ${res.skippedConflicts})$warnSummary")
                                     showBackupRestoreDialog = false
                                 },
                                 onFailure = { err = it.message ?: s.restoreFailedLabel }

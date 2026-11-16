@@ -1,5 +1,7 @@
 package com.example.data.local
 
+import android.content.Context
+import android.util.Base64
 import androidx.annotation.VisibleForTesting
 import androidx.room.withTransaction
 import com.example.BuildConfig
@@ -10,7 +12,10 @@ import com.example.ui.theme.ThemeMode
 import kotlinx.coroutines.flow.first
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
+import java.io.FileOutputStream
 import java.security.MessageDigest
+import java.util.UUID
 
 enum class RestoreConflictStrategy {
     OVERWRITE_EXISTING,
@@ -84,7 +89,10 @@ data class BackupRestorePreview(
     val integrityVerified: Boolean,
     val counts: BackupEntityCounts,
     val conflicts: BackupConflictSummary,
-    val manifest: BackupManifest? = null
+    val manifest: BackupManifest? = null,
+    val attachmentCount: Int = 0,
+    val attachmentTotalBytes: Long = 0L,
+    val unavailableAttachmentCount: Int = 0
 )
 
 data class RestoreResult(
@@ -93,7 +101,11 @@ data class RestoreResult(
     val overwrittenCount: Int,
     val strategy: RestoreConflictStrategy,
     val preferencesRestored: Boolean = false,
-    val nonPortableCategories: List<String> = emptyList()
+    val nonPortableCategories: List<String> = emptyList(),
+    val restoredAttachmentCount: Int = 0,
+    val restoredAttachmentBytes: Long = 0L,
+    val unavailableAttachmentCount: Int = 0,
+    val warnings: List<String> = emptyList()
 )
 
 class BackupManager(
@@ -101,7 +113,10 @@ class BackupManager(
     private val prefs: AppPreferences? = null,
     private val appVersionName: String = BuildConfig.VERSION_NAME,
     private val appVersionCode: Int = BuildConfig.VERSION_CODE,
-    private val applicationId: String = BuildConfig.APPLICATION_ID
+    private val applicationId: String = BuildConfig.APPLICATION_ID,
+    private val context: Context? = null,
+    private val maxAttachmentFileBytes: Long = PlaygroundAttachmentManager.MAX_FILE_BYTES,
+    private val maxBackupAttachmentsTotalBytes: Long = MAX_BACKUP_ATTACHMENTS_TOTAL_BYTES
 ) {
 
     companion object {
@@ -109,19 +124,33 @@ class BackupManager(
         const val CURRENT_DB_SCHEMA_VERSION = 5
         const val MAX_BACKUP_WORKFLOW_RUNS = 500
         const val MAX_BACKUP_METRICS = 2000
+        const val MAX_BACKUP_ATTACHMENTS_TOTAL_BYTES = 24L * 1024L * 1024L
 
         val DEFAULT_NON_PORTABLE_CATEGORIES = listOf(
             "android_keystore_master_key",
             "app_lock_pin_and_biometric",
-            "playground_attachment_files",
             "activity_logs",
             "ephemeral_runtime_state"
         )
+
+        private val sha256HexRegex = Regex("^[0-9a-f]{64}$")
     }
 
     private data class StagedPreferences(
         val state: GatewaySettingsState,
         val remoteAuthTokenPlain: String?
+    )
+
+    private data class StagedAttachment(
+        val id: String,
+        val messageId: String,
+        val displayName: String,
+        val mimeType: String,
+        val category: AttachmentCategory,
+        val sizeBytes: Long,
+        val sha256: String,
+        val archivePath: String,
+        val bytes: ByteArray
     )
 
     private data class StagedArchive(
@@ -145,6 +174,7 @@ class BackupManager(
         val workflowRuns: List<WorkflowRunEntity>,
         val playgroundSessions: List<PlaygroundSessionEntity>,
         val playgroundMessages: List<PlaygroundMessageEntity>,
+        val attachments: List<StagedAttachment>,
         val requestMetrics: List<RequestMetricEntity>,
         val preferences: StagedPreferences?
     ) {
@@ -417,9 +447,105 @@ class BackupManager(
         }
 
         val messages = db.playgroundDao().getAllMessagesOnce()
+        val attachmentsArr = JSONArray()
+        var attachmentIndex = 0
+        var totalAttachmentBytes = 0L
+        var unavailableOnExport = 0
+
         if (messages.isNotEmpty()) {
             val msgArr = JSONArray()
             messages.forEach { m ->
+                val sanitizedMetaArr = JSONArray()
+                val rawMeta = m.attachmentsMetadataJson
+                if (rawMeta.isNotBlank() && rawMeta != "[]") {
+                    runCatching {
+                        val arr = JSONArray(rawMeta)
+                        for (i in 0 until arr.length()) {
+                            val obj = arr.optJSONObject(i) ?: continue
+                            val attId = obj.optString("id", "").trim().ifBlank { "att_$attachmentIndex" }
+                            val displayName = obj.optString("displayName", "file").ifBlank { "file" }
+                            val mimeType = obj.optString("mimeType", "application/octet-stream").ifBlank { "application/octet-stream" }
+                            val category = obj.optString("category", AttachmentCategory.DOCUMENT.name)
+                            var sizeBytes = obj.optLong("sizeBytes", 0L).coerceAtLeast(0L)
+                            val localPath = obj.optString("localFilePath", "").trim()
+
+                            var archivePathForEntry: String? = null
+                            var sha256ForEntry: String? = null
+
+                            if (context != null && localPath.isNotBlank()) {
+                                val candidateFile = File(localPath)
+                                val withinApproved = PlaygroundAttachmentManager.isFileWithinApprovedRoots(context, candidateFile)
+                                if (withinApproved) {
+                                    val canonFile = candidateFile.canonicalFile
+                                    if (canonFile.exists() && canonFile.isFile && canonFile.canRead()) {
+                                        val fileLen = canonFile.length()
+                                        if (fileLen > maxAttachmentFileBytes) {
+                                            throw IllegalArgumentException(
+                                                "Attachment '$displayName' exceeds maximum backup file size ($maxAttachmentFileBytes bytes)."
+                                            )
+                                        }
+                                        if (fileLen > 0L) {
+                                            if (totalAttachmentBytes + fileLen > maxBackupAttachmentsTotalBytes) {
+                                                throw IllegalArgumentException(
+                                                    "Playground attachments exceed maximum backup archive limit ($maxBackupAttachmentsTotalBytes bytes)."
+                                                )
+                                            }
+                                            val bytes = canonFile.readBytes()
+                                            if (bytes.size.toLong() != fileLen) {
+                                                throw IllegalArgumentException("Failed to consistently read attachment '$displayName'.")
+                                            }
+                                            totalAttachmentBytes += bytes.size.toLong()
+                                            sizeBytes = bytes.size.toLong()
+                                            val sha = sha256HexBytes(bytes)
+                                            val safeId = sanitizeArchiveSegment(attId, fallback = "att")
+                                            val safeName = sanitizeArchiveSegment(displayName, fallback = "file")
+                                            val archivePath = "attachments/${attachmentIndex}_${safeId}_${safeName}"
+                                            attachmentIndex++
+                                            archivePathForEntry = archivePath
+                                            sha256ForEntry = sha
+                                            attachmentsArr.put(JSONObject().apply {
+                                                put("id", attId)
+                                                put("messageId", m.id)
+                                                put("displayName", displayName)
+                                                put("mimeType", mimeType)
+                                                put("category", category)
+                                                put("sizeBytes", bytes.size.toLong())
+                                                put("sha256", sha)
+                                                put("archivePath", archivePath)
+                                                put("dataBase64", Base64.encodeToString(bytes, Base64.NO_WRAP))
+                                            })
+                                        } else {
+                                            unavailableOnExport++
+                                        }
+                                    } else {
+                                        unavailableOnExport++
+                                    }
+                                } else {
+                                    // Never read or leak files outside approved app attachment roots
+                                    unavailableOnExport++
+                                }
+                            } else if (localPath.isNotBlank()) {
+                                unavailableOnExport++
+                            }
+
+                            sanitizedMetaArr.put(JSONObject().apply {
+                                put("id", attId)
+                                put("displayName", displayName)
+                                put("mimeType", mimeType)
+                                put("sizeBytes", sizeBytes)
+                                put("category", category)
+                                put("localFilePath", "")
+                                if (archivePathForEntry != null) {
+                                    put("archivePath", archivePathForEntry)
+                                    put("sha256", sha256ForEntry)
+                                }
+                            })
+                        }
+                    }.onFailure { err ->
+                        if (err is IllegalArgumentException) throw err
+                    }
+                }
+
                 msgArr.put(JSONObject().apply {
                     put("id", m.id)
                     put("sessionId", m.sessionId)
@@ -433,11 +559,19 @@ class BackupManager(
                     put("estimatedCostUsd", m.estimatedCostUsd ?: JSONObject.NULL)
                     put("isError", m.isError)
                     put("timestamp", m.timestamp)
-                    put("attachmentsMetadataJson", sanitizeAttachmentsMetadataForBackup(m.attachmentsMetadataJson))
+                    put("attachmentsMetadataJson", sanitizedMetaArr.toString())
                 })
             }
             dataObj.put("playgroundMessages", msgArr)
             includedCategories += "playground_messages"
+        }
+
+        if (attachmentsArr.length() > 0) {
+            dataObj.put("playgroundAttachments", attachmentsArr)
+            includedCategories += "playground_attachments"
+        }
+        if (unavailableOnExport > 0) {
+            nonPortableCategories += "playground_attachment_files"
         }
 
         val metrics = db.metricAndLogDao().getMetricsOnce().take(MAX_BACKUP_METRICS)
@@ -560,6 +694,7 @@ class BackupManager(
     suspend fun previewEncryptedBackup(encryptedPayload: String, passphrase: String): BackupRestorePreview {
         val staged = parseAndValidateArchive(encryptedPayload, passphrase)
         val conflicts = computeConflicts(staged)
+        val attachmentStats = computeAttachmentPreviewStats(staged)
         return BackupRestorePreview(
             formatVersion = staged.formatVersion,
             schemaVersion = staged.schemaVersion,
@@ -569,7 +704,10 @@ class BackupManager(
             integrityVerified = staged.integrityVerified,
             counts = staged.counts(),
             conflicts = conflicts,
-            manifest = staged.manifest
+            manifest = staged.manifest,
+            attachmentCount = staged.attachments.size,
+            attachmentTotalBytes = staged.attachments.sumOf { it.sizeBytes },
+            unavailableAttachmentCount = attachmentStats
         )
     }
 
@@ -625,189 +763,258 @@ class BackupManager(
             if (plain.isNotBlank()) CryptoManager.encrypt(plain) else ""
         }
 
-        val dbCounts = db.withTransaction {
-            var importedCount = 0
-            var skippedConflicts = 0
-            var overwrittenCount = 0
+        val existingMessagesBeforeRestore = db.playgroundDao().getAllMessagesOnce()
+        val oldReferencedPaths = extractOwnedAttachmentPaths(existingMessagesBeforeRestore)
+        val preExistingMessageIds = if (strategy == RestoreConflictStrategy.REPLACE_ALL) {
+            emptySet()
+        } else {
+            existingMessagesBeforeRestore.map { it.id }.toSet()
+        }
 
-            val existingProviderIds = if (strategy == RestoreConflictStrategy.REPLACE_ALL) emptySet() else db.providerDao().getAllOnce().map { it.id }.toSet()
-            val existingKeyIds = if (strategy == RestoreConflictStrategy.REPLACE_ALL) emptySet() else db.apiKeyDao().getAllOnce().map { it.id }.toSet()
-            val existingModelIds = if (strategy == RestoreConflictStrategy.REPLACE_ALL) emptySet() else db.modelDao().getAllOnce().map { it.id }.toSet()
-            val existingRuleIds = if (strategy == RestoreConflictStrategy.REPLACE_ALL) emptySet() else db.routingRuleDao().getAllOnce().map { it.id }.toSet()
-            val existingAgentIds = if (strategy == RestoreConflictStrategy.REPLACE_ALL) emptySet() else db.codingAgentDao().getAllOnce().map { it.id }.toSet()
-            val existingLocalIds = if (strategy == RestoreConflictStrategy.REPLACE_ALL) emptySet() else db.localAiServerDao().getAllOnce().map { it.id }.toSet()
-            val existingMcpServerIds = if (strategy == RestoreConflictStrategy.REPLACE_ALL) emptySet() else db.mcpDao().getServersOnce().map { it.id }.toSet()
-            val existingMcpToolIds = if (strategy == RestoreConflictStrategy.REPLACE_ALL) emptySet() else db.mcpDao().getServersOnce().flatMap { db.mcpDao().getToolsForServer(it.id) }.map { it.id }.toSet()
-            val existingWorkflowIds = if (strategy == RestoreConflictStrategy.REPLACE_ALL) emptySet() else db.workflowDao().getWorkflowsOnce().map { it.id }.toSet()
-            val existingWorkflowRunIds = if (strategy == RestoreConflictStrategy.REPLACE_ALL) emptySet() else db.workflowDao().getRunsOnce().map { it.id }.toSet()
-            val existingDeviceIds = if (strategy == RestoreConflictStrategy.REPLACE_ALL) emptySet() else db.deviceDao().getAllOnce().map { it.id }.toSet()
-            val existingSessionIds = if (strategy == RestoreConflictStrategy.REPLACE_ALL) emptySet() else db.playgroundDao().getSessionsOnce().map { it.id }.toSet()
-            val existingMessageIds = if (strategy == RestoreConflictStrategy.REPLACE_ALL) emptySet() else db.playgroundDao().getAllMessagesOnce().map { it.id }.toSet()
-            val existingMetricIds = if (strategy == RestoreConflictStrategy.REPLACE_ALL) emptySet() else db.metricAndLogDao().getMetricsOnce().map { it.id }.toSet()
+        val attachmentsDir = context?.let { PlaygroundAttachmentManager.getAttachmentsDir(it).apply { mkdirs() } }
+        val stagingDir = attachmentsDir?.let { File(it, ".restore_staging_${UUID.randomUUID()}").apply { mkdirs() } }
+        val plannedPromotions = mutableListOf<Pair<File, File>>()
+        val promotedFiles = mutableListOf<File>()
+        val reservedTargetPaths = HashSet<String>()
+        val consumedAttachmentIndices = HashSet<Int>()
 
-            if (strategy == RestoreConflictStrategy.REPLACE_ALL) {
-                val templatesToPreserve = db.workflowDao().getWorkflowsOnce().filter { it.isTemplate }
-                db.providerDao().clearAll()
-                db.apiKeyDao().clearAll()
-                db.modelDao().clearAll()
-                db.routingRuleDao().clearAll()
-                db.codingAgentDao().clearAll()
-                db.localAiServerDao().clearAll()
-                db.mcpDao().clearTools()
-                db.mcpDao().clearServers()
-                db.workflowDao().clearRuns()
-                db.workflowDao().clearWorkflows()
-                db.deviceDao().clearAll()
-                db.playgroundDao().clearMessages()
-                db.playgroundDao().clearSessions()
-                db.metricAndLogDao().clearMetrics()
-                templatesToPreserve.forEach { db.workflowDao().upsertWorkflow(it) }
+        var stagedAttachmentCount = 0
+        var stagedAttachmentBytes = 0L
+        var unavailableAttachmentCount = 0
+
+        val preparedMessages = staged.playgroundMessages.map { msg ->
+            val willImport = !(strategy == RestoreConflictStrategy.SKIP_CONFLICTS && msg.id in preExistingMessageIds)
+            if (!willImport) {
+                msg
+            } else {
+                val (rebuiltMetaJson, msgStagedCount, msgStagedBytes, msgUnavailable) = stageMessageAttachments(
+                    rawMetaJson = msg.attachmentsMetadataJson,
+                    stagedAttachments = staged.attachments,
+                    consumedIndices = consumedAttachmentIndices,
+                    attachmentsDir = attachmentsDir,
+                    stagingDir = stagingDir,
+                    reservedTargetPaths = reservedTargetPaths,
+                    plannedPromotions = plannedPromotions
+                )
+                stagedAttachmentCount += msgStagedCount
+                stagedAttachmentBytes += msgStagedBytes
+                unavailableAttachmentCount += msgUnavailable
+                msg.copy(attachmentsMetadataJson = rebuiltMetaJson)
+            }
+        }
+
+        val dbCounts = try {
+            val counts = db.withTransaction {
+                var importedCount = 0
+                var skippedConflicts = 0
+                var overwrittenCount = 0
+
+                val existingProviderIds = if (strategy == RestoreConflictStrategy.REPLACE_ALL) emptySet() else db.providerDao().getAllOnce().map { it.id }.toSet()
+                val existingKeyIds = if (strategy == RestoreConflictStrategy.REPLACE_ALL) emptySet() else db.apiKeyDao().getAllOnce().map { it.id }.toSet()
+                val existingModelIds = if (strategy == RestoreConflictStrategy.REPLACE_ALL) emptySet() else db.modelDao().getAllOnce().map { it.id }.toSet()
+                val existingRuleIds = if (strategy == RestoreConflictStrategy.REPLACE_ALL) emptySet() else db.routingRuleDao().getAllOnce().map { it.id }.toSet()
+                val existingAgentIds = if (strategy == RestoreConflictStrategy.REPLACE_ALL) emptySet() else db.codingAgentDao().getAllOnce().map { it.id }.toSet()
+                val existingLocalIds = if (strategy == RestoreConflictStrategy.REPLACE_ALL) emptySet() else db.localAiServerDao().getAllOnce().map { it.id }.toSet()
+                val existingMcpServerIds = if (strategy == RestoreConflictStrategy.REPLACE_ALL) emptySet() else db.mcpDao().getServersOnce().map { it.id }.toSet()
+                val existingMcpToolIds = if (strategy == RestoreConflictStrategy.REPLACE_ALL) emptySet() else db.mcpDao().getServersOnce().flatMap { db.mcpDao().getToolsForServer(it.id) }.map { it.id }.toSet()
+                val existingWorkflowIds = if (strategy == RestoreConflictStrategy.REPLACE_ALL) emptySet() else db.workflowDao().getWorkflowsOnce().map { it.id }.toSet()
+                val existingWorkflowRunIds = if (strategy == RestoreConflictStrategy.REPLACE_ALL) emptySet() else db.workflowDao().getRunsOnce().map { it.id }.toSet()
+                val existingDeviceIds = if (strategy == RestoreConflictStrategy.REPLACE_ALL) emptySet() else db.deviceDao().getAllOnce().map { it.id }.toSet()
+                val existingSessionIds = if (strategy == RestoreConflictStrategy.REPLACE_ALL) emptySet() else db.playgroundDao().getSessionsOnce().map { it.id }.toSet()
+                val existingMessageIds = if (strategy == RestoreConflictStrategy.REPLACE_ALL) emptySet() else db.playgroundDao().getAllMessagesOnce().map { it.id }.toSet()
+                val existingMetricIds = if (strategy == RestoreConflictStrategy.REPLACE_ALL) emptySet() else db.metricAndLogDao().getMetricsOnce().map { it.id }.toSet()
+
+                if (strategy == RestoreConflictStrategy.REPLACE_ALL) {
+                    val templatesToPreserve = db.workflowDao().getWorkflowsOnce().filter { it.isTemplate }
+                    db.providerDao().clearAll()
+                    db.apiKeyDao().clearAll()
+                    db.modelDao().clearAll()
+                    db.routingRuleDao().clearAll()
+                    db.codingAgentDao().clearAll()
+                    db.localAiServerDao().clearAll()
+                    db.mcpDao().clearTools()
+                    db.mcpDao().clearServers()
+                    db.workflowDao().clearRuns()
+                    db.workflowDao().clearWorkflows()
+                    db.deviceDao().clearAll()
+                    db.playgroundDao().clearMessages()
+                    db.playgroundDao().clearSessions()
+                    db.metricAndLogDao().clearMetrics()
+                    templatesToPreserve.forEach { db.workflowDao().upsertWorkflow(it) }
+                }
+
+                for (p in staged.providers) {
+                    val collides = p.id in existingProviderIds
+                    if (collides && strategy == RestoreConflictStrategy.SKIP_CONFLICTS) {
+                        skippedConflicts++
+                    } else {
+                        if (collides) overwrittenCount++
+                        db.providerDao().upsert(p)
+                        importedCount++
+                    }
+                }
+                for (k in reEncryptedKeys) {
+                    val collides = k.id in existingKeyIds
+                    if (collides && strategy == RestoreConflictStrategy.SKIP_CONFLICTS) {
+                        skippedConflicts++
+                    } else {
+                        if (collides) overwrittenCount++
+                        db.apiKeyDao().upsert(k)
+                        importedCount++
+                    }
+                }
+                for (m in staged.models) {
+                    val collides = m.id in existingModelIds
+                    if (collides && strategy == RestoreConflictStrategy.SKIP_CONFLICTS) {
+                        skippedConflicts++
+                    } else {
+                        if (collides) overwrittenCount++
+                        db.modelDao().upsert(m)
+                        importedCount++
+                    }
+                }
+                for (r in staged.routingRules) {
+                    val collides = r.id in existingRuleIds
+                    if (collides && strategy == RestoreConflictStrategy.SKIP_CONFLICTS) {
+                        skippedConflicts++
+                    } else {
+                        if (collides) overwrittenCount++
+                        db.routingRuleDao().upsert(r)
+                        importedCount++
+                    }
+                }
+                for (a in reEncryptedAgents) {
+                    val collides = a.id in existingAgentIds
+                    if (collides && strategy == RestoreConflictStrategy.SKIP_CONFLICTS) {
+                        skippedConflicts++
+                    } else {
+                        if (collides) overwrittenCount++
+                        db.codingAgentDao().upsert(a)
+                        importedCount++
+                    }
+                }
+                for (s in reEncryptedLocalServers) {
+                    val collides = s.id in existingLocalIds
+                    if (collides && strategy == RestoreConflictStrategy.SKIP_CONFLICTS) {
+                        skippedConflicts++
+                    } else {
+                        if (collides) overwrittenCount++
+                        db.localAiServerDao().upsert(s)
+                        importedCount++
+                    }
+                }
+                for (s in reEncryptedMcpServers) {
+                    val collides = s.id in existingMcpServerIds
+                    if (collides && strategy == RestoreConflictStrategy.SKIP_CONFLICTS) {
+                        skippedConflicts++
+                    } else {
+                        if (collides) overwrittenCount++
+                        db.mcpDao().upsertServer(s)
+                        importedCount++
+                    }
+                }
+                for (t in staged.mcpTools) {
+                    val collides = t.id in existingMcpToolIds
+                    if (collides && strategy == RestoreConflictStrategy.SKIP_CONFLICTS) {
+                        skippedConflicts++
+                    } else {
+                        if (collides) overwrittenCount++
+                        db.mcpDao().upsertTool(t)
+                        importedCount++
+                    }
+                }
+                for (w in staged.workflows) {
+                    val collides = w.id in existingWorkflowIds
+                    if (collides && strategy == RestoreConflictStrategy.SKIP_CONFLICTS) {
+                        skippedConflicts++
+                    } else {
+                        if (collides) overwrittenCount++
+                        db.workflowDao().upsertWorkflow(w)
+                        importedCount++
+                    }
+                }
+                for (run in staged.workflowRuns) {
+                    val collides = run.id in existingWorkflowRunIds
+                    if (collides && strategy == RestoreConflictStrategy.SKIP_CONFLICTS) {
+                        skippedConflicts++
+                    } else {
+                        if (collides) overwrittenCount++
+                        db.workflowDao().upsertRun(run)
+                        importedCount++
+                    }
+                }
+                for (d in reEncryptedDevices) {
+                    val collides = d.id in existingDeviceIds
+                    if (collides && strategy == RestoreConflictStrategy.SKIP_CONFLICTS) {
+                        skippedConflicts++
+                    } else {
+                        if (collides) overwrittenCount++
+                        db.deviceDao().upsert(d)
+                        importedCount++
+                    }
+                }
+                for (sess in staged.playgroundSessions) {
+                    val collides = sess.id in existingSessionIds
+                    if (collides && strategy == RestoreConflictStrategy.SKIP_CONFLICTS) {
+                        skippedConflicts++
+                    } else {
+                        if (collides) overwrittenCount++
+                        db.playgroundDao().upsertSession(sess)
+                        importedCount++
+                    }
+                }
+                for (msg in preparedMessages) {
+                    val collides = msg.id in existingMessageIds
+                    if (collides && strategy == RestoreConflictStrategy.SKIP_CONFLICTS) {
+                        skippedConflicts++
+                    } else {
+                        if (collides) overwrittenCount++
+                        db.playgroundDao().insertMessage(msg)
+                        importedCount++
+                    }
+                }
+                for (metric in staged.requestMetrics) {
+                    val collides = metric.id in existingMetricIds
+                    if (collides && strategy == RestoreConflictStrategy.SKIP_CONFLICTS) {
+                        skippedConflicts++
+                    } else {
+                        if (collides) overwrittenCount++
+                        db.metricAndLogDao().insertMetric(metric)
+                        importedCount++
+                    }
+                }
+
+                beforeCommitHook?.invoke()
+
+                Triple(importedCount, skippedConflicts, overwrittenCount)
             }
 
-            for (p in staged.providers) {
-                val collides = p.id in existingProviderIds
-                if (collides && strategy == RestoreConflictStrategy.SKIP_CONFLICTS) {
-                    skippedConflicts++
-                } else {
-                    if (collides) overwrittenCount++
-                    db.providerDao().upsert(p)
-                    importedCount++
+            // Promote verified staged files only after Room transaction commits cleanly
+            for ((tempFile, finalFile) in plannedPromotions) {
+                check(attachmentsDir != null && PlaygroundAttachmentManager.isChildWithinRoot(attachmentsDir, finalFile)) {
+                    "Refusing to promote attachment outside private attachments root."
                 }
-            }
-            for (k in reEncryptedKeys) {
-                val collides = k.id in existingKeyIds
-                if (collides && strategy == RestoreConflictStrategy.SKIP_CONFLICTS) {
-                    skippedConflicts++
-                } else {
-                    if (collides) overwrittenCount++
-                    db.apiKeyDao().upsert(k)
-                    importedCount++
+                if (!tempFile.renameTo(finalFile)) {
+                    tempFile.copyTo(finalFile, overwrite = false)
+                    tempFile.delete()
                 }
+                promotedFiles += finalFile
             }
-            for (m in staged.models) {
-                val collides = m.id in existingModelIds
-                if (collides && strategy == RestoreConflictStrategy.SKIP_CONFLICTS) {
-                    skippedConflicts++
-                } else {
-                    if (collides) overwrittenCount++
-                    db.modelDao().upsert(m)
-                    importedCount++
-                }
-            }
-            for (r in staged.routingRules) {
-                val collides = r.id in existingRuleIds
-                if (collides && strategy == RestoreConflictStrategy.SKIP_CONFLICTS) {
-                    skippedConflicts++
-                } else {
-                    if (collides) overwrittenCount++
-                    db.routingRuleDao().upsert(r)
-                    importedCount++
-                }
-            }
-            for (a in reEncryptedAgents) {
-                val collides = a.id in existingAgentIds
-                if (collides && strategy == RestoreConflictStrategy.SKIP_CONFLICTS) {
-                    skippedConflicts++
-                } else {
-                    if (collides) overwrittenCount++
-                    db.codingAgentDao().upsert(a)
-                    importedCount++
-                }
-            }
-            for (s in reEncryptedLocalServers) {
-                val collides = s.id in existingLocalIds
-                if (collides && strategy == RestoreConflictStrategy.SKIP_CONFLICTS) {
-                    skippedConflicts++
-                } else {
-                    if (collides) overwrittenCount++
-                    db.localAiServerDao().upsert(s)
-                    importedCount++
-                }
-            }
-            for (s in reEncryptedMcpServers) {
-                val collides = s.id in existingMcpServerIds
-                if (collides && strategy == RestoreConflictStrategy.SKIP_CONFLICTS) {
-                    skippedConflicts++
-                } else {
-                    if (collides) overwrittenCount++
-                    db.mcpDao().upsertServer(s)
-                    importedCount++
-                }
-            }
-            for (t in staged.mcpTools) {
-                val collides = t.id in existingMcpToolIds
-                if (collides && strategy == RestoreConflictStrategy.SKIP_CONFLICTS) {
-                    skippedConflicts++
-                } else {
-                    if (collides) overwrittenCount++
-                    db.mcpDao().upsertTool(t)
-                    importedCount++
-                }
-            }
-            for (w in staged.workflows) {
-                val collides = w.id in existingWorkflowIds
-                if (collides && strategy == RestoreConflictStrategy.SKIP_CONFLICTS) {
-                    skippedConflicts++
-                } else {
-                    if (collides) overwrittenCount++
-                    db.workflowDao().upsertWorkflow(w)
-                    importedCount++
-                }
-            }
-            for (run in staged.workflowRuns) {
-                val collides = run.id in existingWorkflowRunIds
-                if (collides && strategy == RestoreConflictStrategy.SKIP_CONFLICTS) {
-                    skippedConflicts++
-                } else {
-                    if (collides) overwrittenCount++
-                    db.workflowDao().upsertRun(run)
-                    importedCount++
-                }
-            }
-            for (d in reEncryptedDevices) {
-                val collides = d.id in existingDeviceIds
-                if (collides && strategy == RestoreConflictStrategy.SKIP_CONFLICTS) {
-                    skippedConflicts++
-                } else {
-                    if (collides) overwrittenCount++
-                    db.deviceDao().upsert(d)
-                    importedCount++
-                }
-            }
-            for (sess in staged.playgroundSessions) {
-                val collides = sess.id in existingSessionIds
-                if (collides && strategy == RestoreConflictStrategy.SKIP_CONFLICTS) {
-                    skippedConflicts++
-                } else {
-                    if (collides) overwrittenCount++
-                    db.playgroundDao().upsertSession(sess)
-                    importedCount++
-                }
-            }
-            for (msg in staged.playgroundMessages) {
-                val collides = msg.id in existingMessageIds
-                if (collides && strategy == RestoreConflictStrategy.SKIP_CONFLICTS) {
-                    skippedConflicts++
-                } else {
-                    if (collides) overwrittenCount++
-                    db.playgroundDao().insertMessage(msg)
-                    importedCount++
-                }
-            }
-            for (metric in staged.requestMetrics) {
-                val collides = metric.id in existingMetricIds
-                if (collides && strategy == RestoreConflictStrategy.SKIP_CONFLICTS) {
-                    skippedConflicts++
-                } else {
-                    if (collides) overwrittenCount++
-                    db.metricAndLogDao().insertMetric(metric)
-                    importedCount++
-                }
-            }
+            counts
+        } catch (err: Throwable) {
+            runCatching { stagingDir?.deleteRecursively() }
+            promotedFiles.forEach { file -> runCatching { file.delete() } }
+            throw err
+        } finally {
+            runCatching { stagingDir?.deleteRecursively() }
+        }
 
-            beforeCommitHook?.invoke()
-
-            Triple(importedCount, skippedConflicts, overwrittenCount)
+        // Prune obsolete attachment files that are no longer referenced by ANY remaining DB message
+        if (context != null && oldReferencedPaths.isNotEmpty()) {
+            val currentReferencedPaths = extractOwnedAttachmentPaths(db.playgroundDao().getAllMessagesOnce())
+            (oldReferencedPaths - currentReferencedPaths).forEach { unusedPath ->
+                PlaygroundAttachmentManager.deleteFileIfOwned(context, unusedPath)
+            }
         }
 
         var importedCount = dbCounts.first
@@ -833,13 +1040,26 @@ class BackupManager(
             }
         }
 
+        val warnings = buildList {
+            if (unavailableAttachmentCount > 0) {
+                add(
+                    "$unavailableAttachmentCount attachment file(s) unavailable in backup archive; " +
+                        "message metadata was restored without local file access."
+                )
+            }
+        }
+
         return RestoreResult(
             importedCount = importedCount,
             skippedConflicts = skippedConflicts,
             overwrittenCount = overwrittenCount,
             strategy = strategy,
             preferencesRestored = preferencesRestored,
-            nonPortableCategories = staged.manifest.nonPortableCategories
+            nonPortableCategories = staged.manifest.nonPortableCategories,
+            restoredAttachmentCount = stagedAttachmentCount,
+            restoredAttachmentBytes = stagedAttachmentBytes,
+            unavailableAttachmentCount = unavailableAttachmentCount,
+            warnings = warnings
         )
     }
 
@@ -1264,7 +1484,63 @@ class BackupManager(
                             estimatedCostUsd = if (o.isNull("estimatedCostUsd") || !o.has("estimatedCostUsd")) null else o.optDouble("estimatedCostUsd"),
                             isError = o.optBoolean("isError", false),
                             timestamp = o.optLong("timestamp", System.currentTimeMillis()),
-                            attachmentsMetadataJson = sanitizeAttachmentsMetadataForBackup(o.optString("attachmentsMetadataJson", "[]"))
+                            attachmentsMetadataJson = sanitizeAttachmentsMetadataForBackup(
+                                rawJson = o.optString("attachmentsMetadataJson", "[]"),
+                                validateArchiveRefs = true
+                            )
+                        )
+                    )
+                }
+            }
+        }
+
+        val seenArchivePaths = HashSet<String>()
+        var totalAttachmentBytes = 0L
+        val attachments = buildList {
+            dataObj.optJSONArray("playgroundAttachments")?.let { arr ->
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: throw IllegalArgumentException("Invalid playground attachment record at index $i")
+                    val id = o.requireNonBlank("id", "playgroundAttachment")
+                    val archivePath = validateArchiveRelativePath(o.requireNonBlank("archivePath", "playgroundAttachment"))
+                    require(seenArchivePaths.add(archivePath)) {
+                        "Duplicate attachment archivePath '$archivePath' in backup."
+                    }
+                    val declaredSize = o.optLong("sizeBytes", -1L)
+                    require(declaredSize in 1L..maxAttachmentFileBytes) {
+                        "Backup attachment '$archivePath' has invalid or oversized sizeBytes ($declaredSize)."
+                    }
+                    val expectedSha = o.requireNonBlank("sha256", "playgroundAttachment").lowercase().trim()
+                    require(sha256HexRegex.matches(expectedSha)) {
+                        "Backup attachment '$archivePath' has malformed SHA-256 checksum."
+                    }
+                    val b64 = o.requireNonBlank("dataBase64", "playgroundAttachment")
+                    val decoded = runCatching {
+                        Base64.decode(b64, Base64.DEFAULT)
+                    }.getOrElse {
+                        throw IllegalArgumentException("Corrupted Base64 payload for attachment '$archivePath'.")
+                    }
+                    require(decoded.isNotEmpty() && decoded.size.toLong() == declaredSize) {
+                        "Attachment size mismatch for '$archivePath' (expected $declaredSize, got ${decoded.size})."
+                    }
+                    totalAttachmentBytes += decoded.size.toLong()
+                    require(totalAttachmentBytes <= maxBackupAttachmentsTotalBytes) {
+                        "Backup attachments exceed maximum total allowed size ($maxBackupAttachmentsTotalBytes bytes)."
+                    }
+                    val actualSha = sha256HexBytes(decoded)
+                    require(MessageDigest.isEqual(actualSha.toByteArray(Charsets.US_ASCII), expectedSha.toByteArray(Charsets.US_ASCII))) {
+                        "Attachment SHA-256 verification failed for '$archivePath'."
+                    }
+                    add(
+                        StagedAttachment(
+                            id = id,
+                            messageId = o.optString("messageId", ""),
+                            displayName = o.optString("displayName", "file"),
+                            mimeType = o.optString("mimeType", "application/octet-stream"),
+                            category = parseEnum(o.optString("category"), AttachmentCategory.DOCUMENT),
+                            sizeBytes = declaredSize,
+                            sha256 = expectedSha,
+                            archivePath = archivePath,
+                            bytes = decoded
                         )
                     )
                 }
@@ -1383,29 +1659,223 @@ class BackupManager(
             workflowRuns = workflowRuns,
             playgroundSessions = playgroundSessions,
             playgroundMessages = playgroundMessages,
+            attachments = attachments,
             requestMetrics = requestMetrics,
             preferences = preferences
         )
     }
 
-    private fun sanitizeAttachmentsMetadataForBackup(rawJson: String): String {
-        if (rawJson.isBlank() || rawJson == "[]") return "[]"
-        return runCatching {
-            val arr = JSONArray(rawJson)
-            val sanitized = JSONArray()
+    private data class MessageAttachmentStageSummary(
+        val rebuiltMetadataJson: String,
+        val stagedCount: Int,
+        val stagedBytes: Long,
+        val unavailableCount: Int
+    )
+
+    private fun computeAttachmentPreviewStats(staged: StagedArchive): Int {
+        val consumed = HashSet<Int>()
+        var unavailable = 0
+        for (msg in staged.playgroundMessages) {
+            if (msg.attachmentsMetadataJson.isBlank() || msg.attachmentsMetadataJson == "[]") continue
+            val arr = runCatching { JSONArray(msg.attachmentsMetadataJson) }.getOrNull() ?: continue
             for (i in 0 until arr.length()) {
                 val obj = arr.optJSONObject(i) ?: continue
-                sanitized.put(JSONObject().apply {
-                    put("id", obj.optString("id"))
-                    put("displayName", obj.optString("displayName", "file"))
-                    put("mimeType", obj.optString("mimeType", "application/octet-stream"))
-                    put("sizeBytes", obj.optLong("sizeBytes", 0L))
-                    put("category", obj.optString("category", AttachmentCategory.DOCUMENT.name))
-                    put("localFilePath", "")
-                })
+                val idx = findMatchingAttachmentIndex(obj, staged.attachments, consumed)
+                if (idx >= 0) {
+                    consumed += idx
+                } else {
+                    unavailable++
+                }
             }
-            sanitized.toString()
-        }.getOrDefault("[]")
+        }
+        return unavailable
+    }
+
+    private fun findMatchingAttachmentIndex(
+        metaObj: JSONObject,
+        stagedAttachments: List<StagedAttachment>,
+        consumedIndices: Set<Int>
+    ): Int {
+        val archivePath = metaObj.optString("archivePath", "").trim()
+        if (archivePath.isNotBlank()) {
+            val exactIdx = stagedAttachments.indexOfFirst { it.archivePath == archivePath }
+            if (exactIdx >= 0) return exactIdx
+        }
+        val attId = metaObj.optString("id", "").trim()
+        if (attId.isNotBlank()) {
+            val unusedIdx = stagedAttachments.indexOfFirst { idxMatch ->
+                idxMatch.id == attId
+            }.let { firstIdx ->
+                if (firstIdx < 0) -1
+                else stagedAttachments.indices.firstOrNull { i -> i !in consumedIndices && stagedAttachments[i].id == attId }
+                    ?: firstIdx
+            }
+            if (unusedIdx >= 0) return unusedIdx
+        }
+        return -1
+    }
+
+    private fun stageMessageAttachments(
+        rawMetaJson: String,
+        stagedAttachments: List<StagedAttachment>,
+        consumedIndices: MutableSet<Int>,
+        attachmentsDir: File?,
+        stagingDir: File?,
+        reservedTargetPaths: MutableSet<String>,
+        plannedPromotions: MutableList<Pair<File, File>>
+    ): MessageAttachmentStageSummary {
+        if (rawMetaJson.isBlank() || rawMetaJson == "[]") {
+            return MessageAttachmentStageSummary("[]", 0, 0L, 0)
+        }
+        val arr = runCatching { JSONArray(rawMetaJson) }.getOrNull()
+            ?: return MessageAttachmentStageSummary("[]", 0, 0L, 0)
+
+        val rebuiltArr = JSONArray()
+        var stagedCount = 0
+        var stagedBytes = 0L
+        var unavailableCount = 0
+
+        for (i in 0 until arr.length()) {
+            val obj = arr.optJSONObject(i) ?: continue
+            val id = obj.optString("id", "").trim().ifBlank { UUID.randomUUID().toString() }
+            val displayName = obj.optString("displayName", "file").ifBlank { "file" }
+            val mimeType = obj.optString("mimeType", "application/octet-stream").ifBlank { "application/octet-stream" }
+            val category = obj.optString("category", AttachmentCategory.DOCUMENT.name)
+            var sizeBytes = obj.optLong("sizeBytes", 0L).coerceAtLeast(0L)
+            var restoredPath = ""
+
+            val matchedIdx = findMatchingAttachmentIndex(obj, stagedAttachments, consumedIndices)
+            if (matchedIdx >= 0 && attachmentsDir != null && stagingDir != null) {
+                val entry = stagedAttachments[matchedIdx]
+                consumedIndices += matchedIdx
+
+                // Re-verify bytes & SHA-256 right before staging to disk
+                require(entry.bytes.size.toLong() == entry.sizeBytes && sha256HexBytes(entry.bytes) == entry.sha256) {
+                    "Attachment verification failed before staging '${entry.archivePath}'."
+                }
+                val safeId = sanitizeArchiveSegment(id, fallback = "att")
+                val ext = PlaygroundAttachmentManager.extensionForMimeType(mimeType, displayName)
+                var finalFile: File
+                do {
+                    val candidate = File(
+                        attachmentsDir,
+                        "restored_${safeId}_${UUID.randomUUID().toString().take(8)}.$ext"
+                    )
+                    val canonPath = candidate.canonicalPath
+                    if (!candidate.exists() && reservedTargetPaths.add(canonPath)) {
+                        finalFile = candidate
+                        break
+                    }
+                } while (true)
+
+                check(PlaygroundAttachmentManager.isChildWithinRoot(attachmentsDir, finalFile)) {
+                    "Target attachment path escaped approved storage root."
+                }
+                val tempFile = File(stagingDir, "stage_${plannedPromotions.size}_${UUID.randomUUID().toString().take(8)}.tmp")
+                FileOutputStream(tempFile).use { fos ->
+                    fos.write(entry.bytes)
+                    fos.flush()
+                    runCatching { fos.fd.sync() }
+                }
+                plannedPromotions += (tempFile to finalFile)
+                restoredPath = finalFile.canonicalPath
+                sizeBytes = entry.bytes.size.toLong()
+                stagedCount++
+                stagedBytes += sizeBytes
+            } else {
+                unavailableCount++
+            }
+
+            rebuiltArr.put(JSONObject().apply {
+                put("id", id)
+                put("displayName", displayName)
+                put("mimeType", mimeType)
+                put("sizeBytes", sizeBytes)
+                put("category", category)
+                put("localFilePath", restoredPath)
+            })
+        }
+
+        return MessageAttachmentStageSummary(
+            rebuiltMetadataJson = rebuiltArr.toString(),
+            stagedCount = stagedCount,
+            stagedBytes = stagedBytes,
+            unavailableCount = unavailableCount
+        )
+    }
+
+    private fun extractOwnedAttachmentPaths(messages: List<PlaygroundMessageEntity>): Set<String> {
+        val paths = HashSet<String>()
+        for (msg in messages) {
+            PlaygroundAttachmentManager.parseMetadataJson(msg.attachmentsMetadataJson).forEach { meta ->
+                if (meta.localFilePath.isNotBlank()) {
+                    paths += runCatching { File(meta.localFilePath).canonicalPath }.getOrDefault(meta.localFilePath)
+                }
+            }
+        }
+        return paths
+    }
+
+    private fun sanitizeArchiveSegment(raw: String, fallback: String): String {
+        val cleaned = raw.replace(Regex("[^A-Za-z0-9._-]"), "_")
+            .trim('.')
+            .ifBlank { fallback }
+        return cleaned.take(64)
+    }
+
+    private fun validateArchiveRelativePath(rawPath: String): String {
+        val p = rawPath.trim()
+        require(p.isNotEmpty()) { "Attachment archivePath cannot be empty." }
+        require('\u0000' !in p && '\\' !in p && ':' !in p) {
+            "Unsafe characters in attachment archivePath '$p'."
+        }
+        require(!p.startsWith('/') && !p.endsWith('/')) {
+            "Attachment archivePath must be relative: '$p'."
+        }
+        val segments = p.split('/')
+        require(segments.size >= 2 && segments[0] == "attachments") {
+            "Attachment archivePath must reside under 'attachments/': '$p'."
+        }
+        for (seg in segments) {
+            require(seg.isNotEmpty() && seg != "." && seg != "..") {
+                "Path traversal detected in attachment archivePath '$p'."
+            }
+        }
+        val virtualRoot = File("/virtual_backup_root").canonicalFile
+        val virtualAttachments = File(virtualRoot, "attachments").canonicalFile
+        val resolved = File(virtualAttachments, segments.drop(1).joinToString(File.separator)).canonicalFile
+        require(resolved.path.startsWith(virtualAttachments.path + File.separator)) {
+            "Attachment archivePath escapes backup attachments root: '$p'."
+        }
+        return p
+    }
+
+    private fun sanitizeAttachmentsMetadataForBackup(
+        rawJson: String,
+        validateArchiveRefs: Boolean = false
+    ): String {
+        if (rawJson.isBlank() || rawJson == "[]") return "[]"
+        val parsed = runCatching { JSONArray(rawJson) }.getOrNull() ?: return "[]"
+        val sanitized = JSONArray()
+        for (i in 0 until parsed.length()) {
+            val obj = parsed.optJSONObject(i) ?: continue
+            val archivePath = obj.optString("archivePath", "").trim()
+            if (validateArchiveRefs && archivePath.isNotEmpty()) {
+                validateArchiveRelativePath(archivePath)
+            }
+            val sha256 = obj.optString("sha256", "").trim().lowercase()
+            sanitized.put(JSONObject().apply {
+                put("id", obj.optString("id"))
+                put("displayName", obj.optString("displayName", "file"))
+                put("mimeType", obj.optString("mimeType", "application/octet-stream"))
+                put("sizeBytes", obj.optLong("sizeBytes", 0L))
+                put("category", obj.optString("category", AttachmentCategory.DOCUMENT.name))
+                put("localFilePath", "")
+                if (archivePath.isNotEmpty()) put("archivePath", archivePath)
+                if (sha256.isNotEmpty()) put("sha256", sha256)
+            })
+        }
+        return sanitized.toString()
     }
 
     private fun JSONArray.toStringList(): List<String> = buildList {
@@ -1454,7 +1924,11 @@ class BackupManager(
     }
 
     private fun sha256Hex(input: String): String {
-        val digest = MessageDigest.getInstance("SHA-256").digest(input.toByteArray(Charsets.UTF_8))
+        return sha256HexBytes(input.toByteArray(Charsets.UTF_8))
+    }
+
+    private fun sha256HexBytes(bytes: ByteArray): String {
+        val digest = MessageDigest.getInstance("SHA-256").digest(bytes)
         return digest.joinToString("") { "%02x".format(it) }
     }
 }

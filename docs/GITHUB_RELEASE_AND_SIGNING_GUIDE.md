@@ -95,28 +95,23 @@ GitHub-এ আপনার repository খুলে যান:
 
 ওয়ার্কফ্লো ফাইল: `.github/workflows/android-release.yml`
 
-### ক) স্বয়ংক্রিয় রিলিজ (`main` বা `master` ব্রাঞ্চে Push করলেই)
-1. আপনি যখনই কোড `main` (বা `master`) ব্রাঞ্চে push করবেন, `Android CI & Auto Release` ওয়ার্কফ্লো স্বয়ংক্রিয়ভাবে চালু হবে।
-2. **Job 1 (`test`):** প্রথমে পুরো Unit ও Robolectric টেস্ট (`:app:testDebugUnitTest`) এবং Debug build (`:app:assembleDebug`) চালাবে। টেস্ট ফেল করলে রিলিজ তৈরি হবে না।
-3. **Job 2 (`release`):** টেস্ট পাস করলে:
-   - GitHub-এর সর্বশেষ রিলিজ দেখে স্বয়ংক্রিয়ভাবে পরের সেমান্টিক ভার্সন (যেমন `v1.0.1` -> `v1.0.2`) এবং আগের চেয়ে বড় `versionCode` হিসাব করে নেবে।
-   - আপনার GitHub Secrets-এর স্থায়ী Keystore (`upload` alias) ব্যবহার করে `:app:assembleRelease` তৈরি ও সাইন করবে।
-   - `aapt2` ও `apksigner` দিয়ে যাচাই করবে যে APK-র `applicationId`, `versionCode`, `versionName` এবং সার্টিফিকেট SHA-256 একদম ঠিক আছে।
-   - নিচের ৩টি ফাইলসহ নতুন **GitHub Release** পাবলিশ করবে:
-     - `JH-GetWay-vX.Y.Z-release.apk`
-     - `update-manifest.json`
-     - `SHA256SUMS.txt`
+### ক) `main` বা `master` ব্রাঞ্চে Push করলে কী হবে?
+- যখন আপনি কোড `main` (বা `master`) ব্রাঞ্চে push করবেন, কেবল **Job 1 (`test`)** (Unit ও Robolectric টেস্ট এবং Debug compile check) চলবে। সাধারণ ব্রাঞ্চ পুশ থেকে আর স্বয়ংক্রিয়ভাবে Production Release বা Tag তৈরি হবে না।
 
-### খ) ম্যানুয়ালি নির্দিষ্ট ভার্সন রিলিজ করতে চাইলে
-- **GitHub UI থেকে:** `Actions -> Android CI & Auto Release -> Run workflow` ক্লিক করে চাইলে `version_name` (যেমন `1.2.0`) বা `version_code` লিখে রান করতে পারেন (ফাঁকা রাখলে অটো ইনক্রিমেন্ট হবে)।
-- **Tag push করে:**
+### খ) নির্দিষ্ট ভার্সন রিলিজ করার নিয়ম (Tag push অথবা Manual dispatch)
+- **Tag push করে (প্রস্তাবিত):**
   ```bash
   git tag v1.2.0
   git push origin v1.2.0
   ```
+  - `v*` ট্যাগ পুশ করলে `test` জব পাস হওয়ার পর **Job 2 (`release`)** চলবে, স্থায়ী Keystore (`upload` alias) দিয়ে `:app:assembleRelease` সাইন ও `aapt2`/`apksigner` যাচাই করবে এবং নিচের ৩টি ফাইলসহ **GitHub Release** পাবলিশ করবে:
+    - `JH-GetWay-vX.Y.Z-release.apk`
+    - `update-manifest.json`
+    - `SHA256SUMS.txt`
+- **GitHub UI থেকে (`workflow_dispatch`):** `Actions -> Android CI & Auto Release -> Run workflow` থেকে `version_name`, `version_code` ও `publish_release` (`true` সেট করলে Release পাবলিশ হবে; ডিফল্ট `false`) দিয়ে ম্যানুয়ালি রান করা যাবে।
 
 ### গ) Pull Request-এ কী হবে?
-- Pull Request (`pull_request` on `main`/`master`) করলে শুধু `test` জব চলবে—কোনো Release পাবলিশ হবে না।
+- Pull Request (`pull_request` on `main`/`master`) করলে শুধু `test` জব চলবে—কোনো প্রোডাকশন সাইনিং বা Release পাবলিশ হবে না।
 
 ---
 

@@ -2,6 +2,7 @@ package com.example.data.local
 
 import android.content.Context
 import android.net.Uri
+import android.os.Build
 import android.provider.OpenableColumns
 import android.util.Base64
 import androidx.core.content.FileProvider
@@ -10,6 +11,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.nio.file.Files
 import java.util.UUID
 
 enum class AttachmentCategory {
@@ -73,6 +75,64 @@ object PlaygroundAttachmentManager {
     private const val ATTACHMENTS_DIR = "playground_attachments"
     private const val EPHEMERAL_DIR = "playground_ephemeral"
     private const val CAMERA_DIR = "camera_captures"
+
+    fun getAttachmentsDir(context: Context): File = File(context.filesDir, ATTACHMENTS_DIR)
+
+    fun getApprovedStorageRoots(context: Context): List<File> = listOf(
+        File(context.filesDir, ATTACHMENTS_DIR),
+        File(context.cacheDir, EPHEMERAL_DIR),
+        File(context.cacheDir, CAMERA_DIR)
+    )
+
+    fun isSymbolicLinkOrAlias(file: File): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            if (runCatching { Files.isSymbolicLink(file.toPath()) }.getOrDefault(false)) {
+                return true
+            }
+        }
+        return runCatching {
+            val canonParent = file.parentFile?.canonicalFile ?: return@runCatching false
+            val resolvedInCanonParent = File(canonParent, file.name)
+            resolvedInCanonParent.canonicalFile != resolvedInCanonParent.absoluteFile
+        }.getOrDefault(true)
+    }
+
+    fun isChildWithinRoot(root: File, candidate: File): Boolean {
+        return runCatching {
+            val canonRoot = root.canonicalFile
+            val canonCandidate = candidate.canonicalFile
+            if (isSymbolicLinkOrAlias(candidate)) return@runCatching false
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                var current: File? = candidate.absoluteFile
+                while (current != null && current != root.absoluteFile) {
+                    if (Files.isSymbolicLink(current.toPath())) return@runCatching false
+                    current = current.parentFile
+                }
+            }
+            canonCandidate.path.startsWith(canonRoot.path + File.separator)
+        }.getOrDefault(false)
+    }
+
+    fun isFileWithinApprovedRoots(context: Context, file: File): Boolean {
+        return getApprovedStorageRoots(context).any { root -> isChildWithinRoot(root, file) }
+    }
+
+    fun extensionForMimeType(mimeType: String, displayName: String = ""): String = when (mimeType.lowercase()) {
+        "image/jpeg" -> "jpg"
+        "image/png" -> "png"
+        "image/webp" -> "webp"
+        "image/gif" -> "gif"
+        "application/pdf" -> "pdf"
+        "text/markdown" -> "md"
+        "text/csv" -> "csv"
+        "application/json" -> "json"
+        "text/plain" -> "txt"
+        else -> {
+            val rawExt = displayName.substringAfterLast('.', "").lowercase()
+                .replace(Regex("[^a-z0-9]"), "")
+            rawExt.takeIf { it.isNotEmpty() && it.length <= 8 } ?: "bin"
+        }
+    }
 
     fun createCameraCaptureTarget(context: Context): Pair<File, Uri> {
         val dir = File(context.cacheDir, CAMERA_DIR).apply { mkdirs() }
@@ -348,13 +408,10 @@ object PlaygroundAttachmentManager {
     fun deleteFileIfOwned(context: Context, localPath: String) {
         if (localPath.isBlank()) return
         runCatching {
-            val f = File(localPath).canonicalFile
-            val allowedRoots = listOf(
-                File(context.filesDir, ATTACHMENTS_DIR).canonicalPath,
-                File(context.cacheDir, EPHEMERAL_DIR).canonicalPath,
-                File(context.cacheDir, CAMERA_DIR).canonicalPath
-            )
-            if (allowedRoots.any { f.path.startsWith(it) } && f.exists()) {
+            val target = File(localPath)
+            if (!isFileWithinApprovedRoots(context, target)) return
+            val f = target.canonicalFile
+            if (f.exists() && f.isFile) {
                 f.delete()
             }
         }
