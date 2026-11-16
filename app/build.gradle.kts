@@ -36,11 +36,44 @@ android {
   // and updating Android apps in AI Studio.
   signingConfigs {
     create("release") {
-      val keystorePath = System.getenv("KEYSTORE_PATH") ?: "${rootDir}/my-upload-key.jks"
-      storeFile = file(keystorePath)
-      storePassword = System.getenv("STORE_PASSWORD")
+      val envKeystorePath = providers.environmentVariable("KEYSTORE_PATH")
+        .orNull?.trim()?.takeIf { it.isNotEmpty() }
+      val propKeystorePath = providers.gradleProperty("releaseKeystorePath")
+        .orNull?.trim()?.takeIf { it.isNotEmpty() }
+      val keystorePath = propKeystorePath ?: envKeystorePath ?: "${rootDir}/my-upload-key.jks"
+      val resolvedKeystoreFile = java.io.File(keystorePath).let { candidate ->
+        if (candidate.isAbsolute) candidate else rootProject.file(keystorePath)
+      }
+      val releaseStorePassword = providers.environmentVariable("STORE_PASSWORD")
+        .orNull?.takeIf { it.isNotEmpty() }
+      val releaseKeyPassword = providers.environmentVariable("KEY_PASSWORD")
+        .orNull?.takeIf { it.isNotEmpty() }
+
+      val isReleaseSigningTask = gradle.startParameter.taskNames.any { taskName ->
+        val simpleName = taskName.substringAfterLast(':')
+        simpleName.equals("assembleRelease", ignoreCase = true) ||
+          simpleName.equals("bundleRelease", ignoreCase = true) ||
+          simpleName.equals("packageRelease", ignoreCase = true) ||
+          simpleName.equals("signReleaseBundle", ignoreCase = true)
+      }
+      if (isReleaseSigningTask) {
+        check(resolvedKeystoreFile.isFile) {
+          "Permanent release keystore not found at '${resolvedKeystoreFile.absolutePath}'. " +
+            "Set KEYSTORE_PATH or place my-upload-key.jks in rootDir."
+        }
+        check(!releaseStorePassword.isNullOrEmpty()) {
+          "STORE_PASSWORD environment variable is required for Release builds."
+        }
+        check(!releaseKeyPassword.isNullOrEmpty()) {
+          "KEY_PASSWORD environment variable is required for Release builds."
+        }
+      }
+
+      storeFile = resolvedKeystoreFile
+      storeType = "PKCS12"
+      storePassword = releaseStorePassword
       keyAlias = "upload"
-      keyPassword = System.getenv("KEY_PASSWORD")
+      keyPassword = releaseKeyPassword
     }
     create("debugConfig") {
       storeFile = file("${rootDir}/debug.keystore")
