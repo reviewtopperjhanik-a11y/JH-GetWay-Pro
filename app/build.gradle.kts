@@ -1,4 +1,5 @@
 import com.google.gms.googleservices.GoogleServicesPlugin.MissingGoogleServicesStrategy
+import java.io.File
 
 plugins {
   alias(libs.plugins.android.application)
@@ -41,7 +42,7 @@ android {
       val propKeystorePath = providers.gradleProperty("releaseKeystorePath")
         .orNull?.trim()?.takeIf { it.isNotEmpty() }
       val keystorePath = propKeystorePath ?: envKeystorePath ?: "${rootDir}/my-upload-key.jks"
-      val resolvedKeystoreFile = java.io.File(keystorePath).let { candidate ->
+      val resolvedKeystoreFile = File(keystorePath).let { candidate ->
         if (candidate.isAbsolute) candidate else rootProject.file(keystorePath)
       }
       val releaseStorePassword = providers.environmentVariable("STORE_PASSWORD")
