@@ -49,6 +49,7 @@ fun SettingsScreen(
     var showPinDialog by remember { mutableStateOf(false) }
     var showBackupExportDialog by remember { mutableStateOf(false) }
     var showBackupRestoreDialog by remember { mutableStateOf(false) }
+    var showResetSettingsConfirm by remember { mutableStateOf(false) }
     var showClearConfirm by remember { mutableStateOf(false) }
     var infoModalTitle by remember { mutableStateOf<String?>(null) }
     var infoModalBody by remember { mutableStateOf("") }
@@ -242,6 +243,28 @@ fun SettingsScreen(
             }
         }
 
+        // Reset App Settings (Non-Destructive)
+        item {
+            GatewayCard {
+                Text(s.resetAppSettingsTitle, style = MaterialTheme.typography.titleMedium)
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    text = s.resetAppSettingsDescription,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(Modifier.height(10.dp))
+                OutlinedButton(
+                    onClick = { showResetSettingsConfirm = true },
+                    modifier = Modifier.fillMaxWidth().testTag("settings_reset_app_settings_btn")
+                ) {
+                    Icon(Icons.Default.RestartAlt, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text(s.resetAppSettingsAction)
+                }
+            }
+        }
+
         // Data & Encrypted Backup
         item {
             GatewayCard {
@@ -262,7 +285,7 @@ fun SettingsScreen(
                 OutlinedButton(
                     onClick = { showClearConfirm = true },
                     colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error),
-                    modifier = Modifier.fillMaxWidth()
+                    modifier = Modifier.fillMaxWidth().testTag("settings_clear_local_data_btn")
                 ) {
                     Icon(Icons.Default.DeleteForever, contentDescription = null)
                     Spacer(Modifier.width(6.dp))
@@ -735,6 +758,33 @@ fun SettingsScreen(
                 ) { Text(s.importLabel) }
             },
             dismissButton = { TextButton(onClick = { showBackupRestoreDialog = false }) { Text(s.cancel) } }
+        )
+    }
+
+    if (showResetSettingsConfirm) {
+        AlertDialog(
+            onDismissRequest = { showResetSettingsConfirm = false },
+            title = { Text(s.resetAppSettingsConfirmTitle) },
+            text = { Text(s.resetAppSettingsConfirmMessage) },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        viewModel.resetSafeAppSettings()
+                        showResetSettingsConfirm = false
+                    },
+                    modifier = Modifier.testTag("settings_reset_confirm_btn")
+                ) {
+                    Text(s.resetAppSettingsConfirmButton)
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = { showResetSettingsConfirm = false },
+                    modifier = Modifier.testTag("settings_reset_cancel_btn")
+                ) {
+                    Text(s.cancel)
+                }
+            }
         )
     }
 

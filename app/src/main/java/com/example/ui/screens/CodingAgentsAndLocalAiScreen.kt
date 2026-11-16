@@ -25,54 +25,18 @@ import com.example.ui.GatewayViewModel
 import com.example.ui.components.*
 import com.example.ui.theme.MonoTextStyle
 
-private fun buildCodingAgentSnippet(agent: CodingAgentEntity, baseV1: String, tokenValue: String): String {
-    return when (agent.agentType) {
-        CodingAgentType.CODEX -> """
-            export OPENAI_BASE_URL="$baseV1"
-            export OPENAI_API_KEY="$tokenValue"
-            # ~/.codex/config.toml
-            model = "${agent.modelAlias}"
-            wire_api = "responses"
-        """.trimIndent()
-        CodingAgentType.OPENCODE -> """
-            {
-              "provider": {
-                "jhgetway": {
-                  "options": { "baseURL": "$baseV1", "apiKey": "$tokenValue" },
-                  "models": { "${agent.modelAlias}": { "name": "${agent.modelAlias}" } }
-                }
-              }
-            }
-        """.trimIndent()
-        CodingAgentType.CLINE -> """
-            API Provider: OpenAI Compatible
-            Base URL: $baseV1
-            API Key: $tokenValue
-            Model ID: ${agent.modelAlias}
-        """.trimIndent()
-        CodingAgentType.CONTINUE -> """
-            models:
-              - title: ${agent.name}
-                provider: openai
-                model: ${agent.modelAlias}
-                apiBase: $baseV1
-                apiKey: $tokenValue
-        """.trimIndent()
-        CodingAgentType.AIDER -> """
-            export OPENAI_API_BASE="$baseV1"
-            export OPENAI_API_KEY="$tokenValue"
-            aider --model openai/${agent.modelAlias}
-        """.trimIndent()
-        CodingAgentType.OTHER -> "Base URL: $baseV1\nAPI Key: $tokenValue\nModel: ${agent.modelAlias}"
-    }
-}
-
 @Composable
 fun CodingAgentsScreen(viewModel: GatewayViewModel) {
     val s = LocalStrings.current
     val agents by viewModel.codingAgents.collectAsState()
     val runtime by viewModel.gatewayRuntime.collectAsState()
+    val settings by viewModel.settings.collectAsState()
+    val agentStatuses by viewModel.agentConnectionStatuses.collectAsState()
     val clipboard = LocalClipboardManager.current
+
+    val endpointResolution = remember(settings, runtime) {
+        com.example.gateway.CodingAgentConfigBuilder.resolveGatewayEndpoint(settings, runtime)
+    }
 
     var showDialog by remember { mutableStateOf(false) }
     var editingAgent by remember { mutableStateOf<CodingAgentEntity?>(null) }
@@ -89,11 +53,78 @@ fun CodingAgentsScreen(viewModel: GatewayViewModel) {
         }
     ) { padding ->
         LazyColumn(
-            modifier = Modifier.fillMaxSize().padding(padding),
+            modifier = Modifier.fillMaxSize().padding(padding).testTag("coding_agents_list"),
             contentPadding = PaddingValues(16.dp, 16.dp, 16.dp, 96.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             item { Text(s.codingAgentsTitle, style = MaterialTheme.typography.headlineSmall) }
+
+            item {
+                GatewayCard {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(s.agentGatewayEndpointLabel, style = MaterialTheme.typography.titleMedium)
+                            Text(
+                                text = settings.gatewayMode.name,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        StatusPill(
+                            text = if (endpointResolution.isGatewayActive) s.agentGatewayActiveBadge else s.agentGatewayInactiveBadge,
+                            tone = if (endpointResolution.isGatewayActive) StatusTone.SUCCESS else StatusTone.WARNING
+                        )
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        text = "${s.agentBaseUrlLabel}: ${endpointResolution.baseV1Url.ifBlank { s.offline }}",
+                        style = MonoTextStyle,
+                        color = if (endpointResolution.isUrlValid) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
+                        modifier = Modifier.testTag("agents_base_url_text")
+                    )
+                    endpointResolution.errorMessage?.let { errMsg ->
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            text = errMsg,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (!endpointResolution.isUrlValid) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.tertiary,
+                            modifier = Modifier.testTag("agents_endpoint_notice")
+                        )
+                    }
+                    if (settings.gatewayMode != GatewayMode.LOCAL) {
+                        Spacer(Modifier.height(8.dp))
+                        Surface(
+                            color = MaterialTheme.colorScheme.secondaryContainer,
+                            shape = MaterialTheme.shapes.small,
+                            modifier = Modifier.fillMaxWidth().testTag("agents_remote_boundary_note")
+                        ) {
+                            Text(
+                                text = s.agentRemoteAuthBoundaryNote,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSecondaryContainer,
+                                modifier = Modifier.padding(10.dp)
+                            )
+                        }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedButton(
+                        enabled = endpointResolution.isUrlValid,
+                        onClick = {
+                            clipboard.setText(AnnotatedString(endpointResolution.baseV1Url))
+                            viewModel.postBanner(s.copied)
+                        },
+                        modifier = Modifier.testTag("agents_copy_base_url_btn")
+                    ) {
+                        Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text(s.agentCopyBaseUrlAction)
+                    }
+                }
+            }
 
             if (agents.isEmpty()) {
                 item {
@@ -107,10 +138,18 @@ fun CodingAgentsScreen(viewModel: GatewayViewModel) {
                 }
             } else {
                 items(agents, key = { it.id }) { agent ->
-                    val baseV1 = "${runtime.boundAddress.trimEnd('/')}/v1"
-                    val previewSnippet = remember(agent, baseV1) {
-                        buildCodingAgentSnippet(agent, baseV1, agent.tokenPreview)
+                    val resolvedModelId = remember(agent, settings) {
+                        com.example.gateway.CodingAgentConfigBuilder.resolveAgentModelId(agent, settings)
                     }
+                    val previewSnippet = remember(agent, endpointResolution.baseV1Url, settings) {
+                        com.example.gateway.CodingAgentConfigBuilder.buildPreviewSnippet(
+                            agent = agent,
+                            baseV1Url = endpointResolution.baseV1Url,
+                            settings = settings
+                        )
+                    }
+                    val testStatus = agentStatuses[agent.id]
+
                     GatewayCard {
                         Row(
                             modifier = Modifier.fillMaxWidth(),
@@ -119,7 +158,11 @@ fun CodingAgentsScreen(viewModel: GatewayViewModel) {
                         ) {
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(agent.name, style = MaterialTheme.typography.titleMedium)
-                                Text("${agent.agentType.name} • ${agent.modelAlias}", style = MonoTextStyle, color = MaterialTheme.colorScheme.primary)
+                                Text(
+                                    text = "${agent.agentType.name} • ${s.modelId}: $resolvedModelId",
+                                    style = MonoTextStyle,
+                                    color = MaterialTheme.colorScheme.primary
+                                )
                             }
                             StatusPill(
                                 text = if (agent.enabled) s.enabled else s.disabled,
@@ -127,6 +170,11 @@ fun CodingAgentsScreen(viewModel: GatewayViewModel) {
                             )
                         }
                         Spacer(Modifier.height(6.dp))
+                        Text(
+                            text = "${s.agentBaseUrlLabel}: ${endpointResolution.baseV1Url.ifBlank { s.offline }}",
+                            style = MonoTextStyle,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
                         Text(
                             text = "${s.tokenLabel}: ${agent.tokenPreview} • ${s.requestsUnit}: ${agent.requestCount}",
                             style = MonoTextStyle,
@@ -160,6 +208,54 @@ fun CodingAgentsScreen(viewModel: GatewayViewModel) {
                         if (agent.allowedModelsCsv.isNotBlank()) {
                             Text("${s.allowedModelsShortLabel}: ${agent.allowedModelsCsv}", style = MonoTextStyle, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
+
+                        if (testStatus != null) {
+                            Spacer(Modifier.height(6.dp))
+                            Surface(
+                                color = when {
+                                    testStatus.isTesting -> MaterialTheme.colorScheme.surfaceVariant
+                                    testStatus.success == true -> MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f)
+                                    else -> MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.6f)
+                                },
+                                shape = MaterialTheme.shapes.small,
+                                modifier = Modifier.fillMaxWidth().testTag("agent_test_status_${agent.id}")
+                            ) {
+                                Column(modifier = Modifier.padding(8.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        val badgeLabel = when {
+                                            testStatus.isTesting -> s.agentTestRunningLabel
+                                            testStatus.success == true -> s.agentTestPassedLabel + (testStatus.httpCode?.let { " (HTTP $it)" } ?: "")
+                                            else -> s.agentTestFailedLabel + (testStatus.httpCode?.let { " (HTTP $it)" } ?: "")
+                                        }
+                                        val tone = when {
+                                            testStatus.isTesting -> StatusTone.INFO
+                                            testStatus.success == true -> StatusTone.SUCCESS
+                                            else -> StatusTone.ERROR
+                                        }
+                                        StatusPill(text = badgeLabel, tone = tone)
+                                        testStatus.testedAtMs?.let { ts ->
+                                            Text(
+                                                text = formatTimestamp(ts),
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                        }
+                                    }
+                                    if (testStatus.message.isNotBlank()) {
+                                        Text(
+                                            text = testStatus.message,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = if (testStatus.success == false) MaterialTheme.colorScheme.onErrorContainer else MaterialTheme.colorScheme.onSurface
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
                         Spacer(Modifier.height(8.dp))
                         Surface(color = MaterialTheme.colorScheme.surfaceVariant, shape = MaterialTheme.shapes.small, modifier = Modifier.fillMaxWidth()) {
                             Text(
@@ -169,34 +265,90 @@ fun CodingAgentsScreen(viewModel: GatewayViewModel) {
                             )
                         }
                         Spacer(Modifier.height(8.dp))
-                        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            FilledTonalButton(onClick = { viewModel.testCodingAgentGateway(agent) }) { Text(s.testConnection) }
-                            OutlinedButton(onClick = {
-                                viewModel.decryptAgentTokenResult(agent).fold(
-                                    onSuccess = { plainTok ->
-                                        val configSnippet = buildCodingAgentSnippet(agent, baseV1, plainTok)
-                                        clipboard.setText(AnnotatedString(configSnippet))
-                                        viewModel.postBanner(s.copied)
-                                    },
-                                    onFailure = { err ->
-                                        viewModel.postBanner(err.message ?: s.error)
+                        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            FilledTonalButton(
+                                enabled = testStatus?.isTesting != true,
+                                onClick = { viewModel.testCodingAgentGateway(agent) },
+                                modifier = Modifier.testTag("agent_test_btn_${agent.id}")
+                            ) {
+                                Text(if (testStatus?.isTesting == true) s.agentTestRunningLabel else s.testConnection)
+                            }
+
+                            val copyButtonLabel = when (agent.agentType) {
+                                CodingAgentType.OPENCODE -> s.agentCopyOpenCodeConfigAction
+                                CodingAgentType.CODEX -> s.agentCopyCodexConfigAction
+                                else -> s.copyConfigSnippet
+                            }
+                            OutlinedButton(
+                                onClick = {
+                                    if (!endpointResolution.isUrlValid) {
+                                        viewModel.postBanner(endpointResolution.errorMessage ?: s.error)
+                                        return@OutlinedButton
                                     }
-                                )
-                            }) {
+                                    viewModel.decryptAgentTokenResult(agent).fold(
+                                        onSuccess = { plainTok ->
+                                            val configSnippet = com.example.gateway.CodingAgentConfigBuilder.buildCopyConfigForAgent(
+                                                agent = agent,
+                                                baseV1Url = endpointResolution.baseV1Url,
+                                                decryptedToken = plainTok,
+                                                settings = settings
+                                            )
+                                            clipboard.setText(AnnotatedString(configSnippet))
+                                            viewModel.postBanner(s.copied)
+                                        },
+                                        onFailure = { err ->
+                                            viewModel.postBanner(err.message ?: s.error)
+                                        }
+                                    )
+                                },
+                                modifier = Modifier.testTag("agent_copy_config_btn_${agent.id}")
+                            ) {
                                 Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
                                 Spacer(Modifier.width(4.dp))
-                                Text(s.copyConfigSnippet)
+                                Text(copyButtonLabel)
                             }
-                            IconButton(onClick = { viewModel.toggleAgentEnabled(agent) }) {
+
+                            if (agent.agentType == CodingAgentType.CODEX) {
+                                OutlinedButton(
+                                    onClick = {
+                                        viewModel.decryptAgentTokenResult(agent).fold(
+                                            onSuccess = { plainTok ->
+                                                val envCmd = com.example.gateway.CodingAgentConfigBuilder.buildCodexEnvCommand(plainTok)
+                                                clipboard.setText(AnnotatedString(envCmd))
+                                                viewModel.postBanner(s.copied)
+                                            },
+                                            onFailure = { err ->
+                                                viewModel.postBanner(err.message ?: s.error)
+                                            }
+                                        )
+                                    },
+                                    modifier = Modifier.testTag("agent_copy_codex_env_btn_${agent.id}")
+                                ) {
+                                    Icon(Icons.Default.Terminal, contentDescription = null, modifier = Modifier.size(16.dp))
+                                    Spacer(Modifier.width(4.dp))
+                                    Text(s.agentCopyCodexEnvAction)
+                                }
+                            }
+
+                            IconButton(
+                                onClick = { viewModel.toggleAgentEnabled(agent) },
+                                modifier = Modifier.testTag("agent_toggle_btn_${agent.id}")
+                            ) {
                                 Icon(
                                     imageVector = if (agent.enabled) Icons.Default.ToggleOn else Icons.Default.ToggleOff,
                                     contentDescription = if (agent.enabled) s.disable else s.enable
                                 )
                             }
-                            IconButton(onClick = { editingAgent = agent; showDialog = true }) {
+                            IconButton(
+                                onClick = { editingAgent = agent; showDialog = true },
+                                modifier = Modifier.testTag("agent_edit_btn_${agent.id}")
+                            ) {
                                 Icon(Icons.Default.Edit, contentDescription = s.edit)
                             }
-                            IconButton(onClick = { deletingAgent = agent }) {
+                            IconButton(
+                                onClick = { deletingAgent = agent },
+                                modifier = Modifier.testTag("agent_delete_btn_${agent.id}")
+                            ) {
                                 Icon(Icons.Default.DeleteOutline, contentDescription = s.delete, tint = MaterialTheme.colorScheme.error)
                             }
                         }
@@ -225,10 +377,10 @@ fun CodingAgentsScreen(viewModel: GatewayViewModel) {
                             FilterChip(selected = type == t, onClick = { type = t; if (editingAgent == null) name = t.name }, label = { Text(t.name) })
                         }
                     }
-                    OutlinedTextField(value = name, onValueChange = { name = it }, label = { Text(s.agentName) }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                    OutlinedTextField(value = alias, onValueChange = { alias = it }, label = { Text(s.modelOrAliasLabel) }, textStyle = MonoTextStyle, singleLine = true, modifier = Modifier.fillMaxWidth())
-                    OutlinedTextField(value = allowedModelsCsv, onValueChange = { allowedModelsCsv = it }, label = { Text(s.modelAllowlistLabel) }, placeholder = { Text(s.modelAllowlistHint) }, textStyle = MonoTextStyle, singleLine = true, modifier = Modifier.fillMaxWidth())
-                    OutlinedTextField(value = limitText, onValueChange = { limitText = it.filter { c -> c.isDigit() } }, label = { Text("${s.dailyTokenLimit} (${s.optional})") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                    OutlinedTextField(value = name, onValueChange = { name = it }, label = { Text(s.agentName) }, singleLine = true, modifier = Modifier.fillMaxWidth().testTag("agent_dialog_name_input"))
+                    OutlinedTextField(value = alias, onValueChange = { alias = it }, label = { Text(s.modelOrAliasLabel) }, textStyle = MonoTextStyle, singleLine = true, modifier = Modifier.fillMaxWidth().testTag("agent_dialog_alias_input"))
+                    OutlinedTextField(value = allowedModelsCsv, onValueChange = { allowedModelsCsv = it }, label = { Text(s.modelAllowlistLabel) }, placeholder = { Text(s.modelAllowlistHint) }, textStyle = MonoTextStyle, singleLine = true, modifier = Modifier.fillMaxWidth().testTag("agent_dialog_allowlist_input"))
+                    OutlinedTextField(value = limitText, onValueChange = { limitText = it.filter { c -> c.isDigit() } }, label = { Text("${s.dailyTokenLimit} (${s.optional})") }, singleLine = true, modifier = Modifier.fillMaxWidth().testTag("agent_dialog_limit_input"))
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Checkbox(checked = streaming, onCheckedChange = { streaming = it }); Text(s.streamingLabel)
                         Spacer(Modifier.width(12.dp))
@@ -237,12 +389,15 @@ fun CodingAgentsScreen(viewModel: GatewayViewModel) {
                 }
             },
             confirmButton = {
-                Button(onClick = {
-                    if (name.isNotBlank()) {
-                        viewModel.saveCodingAgent(editingAgent?.id, name, type, alias, streaming, toolCalling, limitText.toLongOrNull(), allowedModelsCsv)
-                        showDialog = false
-                    }
-                }) { Text(s.save) }
+                Button(
+                    onClick = {
+                        if (name.isNotBlank()) {
+                            viewModel.saveCodingAgent(editingAgent?.id, name, type, alias, streaming, toolCalling, limitText.toLongOrNull(), allowedModelsCsv)
+                            showDialog = false
+                        }
+                    },
+                    modifier = Modifier.testTag("agent_dialog_save_btn")
+                ) { Text(s.save) }
             },
             dismissButton = { TextButton(onClick = { showDialog = false }) { Text(s.cancel) } }
         )

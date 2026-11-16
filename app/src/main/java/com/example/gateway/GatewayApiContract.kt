@@ -813,7 +813,8 @@ object GatewayApiContract {
                                     HttpStatusCode.BadRequest, "invalid_request_error", "missing_call_id", "function_call_output item requires 'call_id'"
                                 )
                             }
-                            val outputStr = item.opt("output")?.toString().orEmpty()
+                            val rawOutput = item.opt("output")
+                            val outputStr = if (rawOutput == null || rawOutput == JSONObject.NULL) "" else rawOutput.toString()
                             parsedMessages += ChatMessagePayload(
                                 role = "tool",
                                 content = outputStr,
@@ -1107,33 +1108,51 @@ object GatewayApiContract {
                         )
                     }
                     event.result.toolCalls.forEach { tc ->
-                        val pair = openFunctionItems[tc.index]
-                        if (pair != null) {
+                        val pair = openFunctionItems[tc.index] ?: run {
+                            val idx = nextOutputIndex++
+                            val id = "fc_${tc.id.ifBlank { UUID.randomUUID().toString() }.take(12)}"
                             emit(
-                                "response.function_call_arguments.done",
+                                "response.output_item.added",
                                 JSONObject()
-                                    .put("type", "response.function_call_arguments.done")
-                                    .put("item_id", pair.second)
-                                    .put("output_index", pair.first)
-                                    .put("arguments", tc.argumentsJson)
-                            )
-                            emit(
-                                "response.output_item.done",
-                                JSONObject()
-                                    .put("type", "response.output_item.done")
-                                    .put("output_index", pair.first)
+                                    .put("type", "response.output_item.added")
+                                    .put("output_index", idx)
                                     .put(
                                         "item",
                                         JSONObject()
-                                            .put("id", pair.second)
+                                            .put("id", id)
                                             .put("type", "function_call")
-                                            .put("status", "completed")
+                                            .put("status", "in_progress")
                                             .put("call_id", tc.id)
                                             .put("name", tc.name)
-                                            .put("arguments", tc.argumentsJson)
+                                            .put("arguments", "")
                                     )
                             )
+                            idx to id
                         }
+                        emit(
+                            "response.function_call_arguments.done",
+                            JSONObject()
+                                .put("type", "response.function_call_arguments.done")
+                                .put("item_id", pair.second)
+                                .put("output_index", pair.first)
+                                .put("arguments", tc.argumentsJson)
+                        )
+                        emit(
+                            "response.output_item.done",
+                            JSONObject()
+                                .put("type", "response.output_item.done")
+                                .put("output_index", pair.first)
+                                .put(
+                                    "item",
+                                    JSONObject()
+                                        .put("id", pair.second)
+                                        .put("type", "function_call")
+                                        .put("status", "completed")
+                                        .put("call_id", tc.id)
+                                        .put("name", tc.name)
+                                        .put("arguments", tc.argumentsJson)
+                                )
+                        )
                     }
                     val fullResp = formatOpenAiResponsesResponse(responseId, model, event.result)
                     emit("response.completed", JSONObject().put("type", "response.completed").put("response", fullResp))

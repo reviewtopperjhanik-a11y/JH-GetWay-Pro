@@ -776,21 +776,64 @@ class LocalGatewayHttpServer(
     private suspend fun handleAuthenticatedModels(call: ApplicationCall) {
         val settings = preferences.settingsFlow.first()
         val client = authenticateAndAuthorize(call, settings, DeviceScope.MODELS_READ) ?: return
-        val models = db.modelDao().getAllOnce().filter { it.enabled }.filter { m ->
-            DeviceScopePolicy.isModelAllowed(
+        val seenIds = linkedSetOf<String>()
+        val data = JSONArray()
+
+        fun addModelEntry(id: String, ownedBy: String) {
+            val clean = id.trim()
+            if (clean.isBlank()) return
+            if (seenIds.add(clean.lowercase())) {
+                data.put(JSONObject().apply {
+                    put("id", clean)
+                    put("object", "model")
+                    put("owned_by", ownedBy)
+                })
+            }
+        }
+
+        val enabledModels = db.modelDao().getAllOnce().filter { it.enabled }
+        enabledModels.forEach { m ->
+            val primaryId = m.alias.ifBlank { m.modelId }
+            val primaryAllowed = DeviceScopePolicy.isModelAllowed(
                 allowedModelsCsv = client.allowedModelsCsv,
-                requestedModelOrAlias = m.alias.ifBlank { m.modelId },
+                requestedModelOrAlias = primaryId,
                 resolvedModelId = m.modelId
             )
+            if (primaryAllowed) {
+                addModelEntry(primaryId, m.providerName)
+            }
+            if (m.alias.isNotBlank() && !m.alias.equals(m.modelId, ignoreCase = true)) {
+                val rawAllowed = DeviceScopePolicy.isModelAllowed(
+                    allowedModelsCsv = client.allowedModelsCsv,
+                    requestedModelOrAlias = m.modelId,
+                    resolvedModelId = m.modelId
+                )
+                if (rawAllowed) {
+                    addModelEntry(m.modelId, m.providerName)
+                }
+            }
         }
-        val data = JSONArray()
-        models.forEach { m ->
-            data.put(JSONObject().apply {
-                put("id", m.alias.ifBlank { m.modelId })
-                put("object", "model")
-                put("owned_by", m.providerName)
-            })
+
+        db.routingRuleDao().getAllOnce().filter { it.enabled }.forEach { rule ->
+            val ruleAlias = rule.modelAlias.trim()
+            if (ruleAlias.isNotBlank() && DeviceScopePolicy.isModelAllowed(client.allowedModelsCsv, ruleAlias, null)) {
+                addModelEntry(ruleAlias, "jhgetway-router")
+            }
         }
+
+        client.codingAgentId?.let { agentId ->
+            db.codingAgentDao().getById(agentId)?.let { agent ->
+                val agentPrimary = agent.modelAlias.trim()
+                if (agentPrimary.isNotBlank() && DeviceScopePolicy.isModelAllowed(client.allowedModelsCsv, agentPrimary, null)) {
+                    addModelEntry(agentPrimary, "jhgetway")
+                }
+                val agentDefault = agent.defaultModelId.trim()
+                if (agentDefault.isNotBlank() && DeviceScopePolicy.isModelAllowed(client.allowedModelsCsv, agentDefault, agentDefault)) {
+                    addModelEntry(agentDefault, "jhgetway")
+                }
+            }
+        }
+
         respondJson(call, HttpStatusCode.OK, JSONObject().put("object", "list").put("data", data).toString())
     }
 

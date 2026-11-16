@@ -339,8 +339,86 @@ class AppPreferences(private val context: Context) {
         p[Keys.AUTO_FREE_INCLUDE_LOCAL] = snapshot.autoFreeIncludeLocal
     }
 
+    suspend fun resetSafeAppSettings() {
+        context.dataStore.edit { p ->
+            // Explicitly reset ONLY non-destructive UI, notification, updater-UI, and default routing toggle preferences.
+            // Never call p.clear(), and never reset onboarding, language, gateway connection/auth/remote config,
+            // app lock, retention policies, chat privacy, default model/provider, or update repository.
+            p[Keys.THEME_MODE] = ThemeMode.SYSTEM.name
+            p[Keys.ANALYTICS_CURRENCY] = "USD"
+            p[Keys.NOTIFY_PROVIDER_FAILURE] = true
+            p[Keys.NOTIFY_GATEWAY_DISC] = true
+            p[Keys.NOTIFY_RATE_LIMIT] = true
+            p[Keys.NOTIFY_WORKFLOW_DONE] = true
+            p[Keys.NOTIFY_SECURITY] = true
+            p[Keys.AUTO_CHECK_UPDATES] = true
+            p[Keys.SKIPPED_UPDATE_TAG] = ""
+            p[Keys.GATEWAY_LOGGING_LEVEL] = LoggingLevel.METADATA_ONLY.name
+            p[Keys.DEFAULT_ROUTING_MODE] = RoutingMode.AUTOMATIC.name
+            p[Keys.FALLBACK_ENABLED] = true
+            p[Keys.MAX_RETRIES] = 2
+            p[Keys.MANUAL_MODEL_FALLBACK] = false
+            p[Keys.AUTO_FREE_INCLUDE_LOCAL] = false
+        }
+    }
+
     suspend fun clearAll() {
         context.dataStore.edit { it.clear() }
     }
+
+    companion object {
+        val SAFE_RESET_KEY_NAMES: Set<String> = setOf(
+            "theme_mode",
+            "analytics_currency",
+            "notify_provider_failure",
+            "notify_gateway_disc",
+            "notify_rate_limit",
+            "notify_workflow_done",
+            "notify_security",
+            "auto_check_updates",
+            "skipped_update_tag",
+            "gateway_logging_level",
+            "default_routing_mode",
+            "fallback_enabled",
+            "max_retries",
+            "manual_model_fallback_enabled",
+            "auto_free_include_local"
+        )
+
+        val PROTECTED_KEY_NAMES: Set<String> = setOf(
+            "language",
+            "onboarding_completed",
+            "gateway_name",
+            "gateway_mode",
+            "gateway_host",
+            "gateway_port",
+            "gateway_remote_url",
+            "gateway_auth_required",
+            "gateway_timeout_sec",
+            "gateway_max_req_kb",
+            "gateway_streaming",
+            "gateway_rate_limit",
+            "gateway_allow_lan",
+            "gateway_remote_token_enc",
+            "default_model_id",
+            "default_provider_id",
+            "local_routing_policy",
+            "allow_cloud_fallback",
+            "local_network_allowed",
+            "save_chat_history",
+            "app_lock_enabled",
+            "app_lock_pin_hash",
+            "app_lock_failed_attempts",
+            "app_lock_locked_until_ms",
+            "app_lock_auto_lock_bg",
+            "app_lock_biometric",
+            "gateway_service_desired_running",
+            "log_retention_days",
+            "usage_retention_days",
+            "playground_retention_days",
+            "github_update_repo"
+        )
+    }
 }
+
 

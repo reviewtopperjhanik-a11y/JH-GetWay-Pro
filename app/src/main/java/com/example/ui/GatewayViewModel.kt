@@ -280,6 +280,10 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
     private val _playgroundTarget = MutableStateFlow<PlaygroundTarget?>(null)
     val playgroundTarget: StateFlow<PlaygroundTarget?> = _playgroundTarget.asStateFlow()
 
+    private val _agentConnectionStatuses = MutableStateFlow<Map<String, CodingAgentTestStatus>>(emptyMap())
+    val agentConnectionStatuses: StateFlow<Map<String, CodingAgentTestStatus>> = _agentConnectionStatuses.asStateFlow()
+
+    private val agentGatewayTester = CodingAgentGatewayTester()
     private val appLockManager = AppLockManager()
     private var streamingJob: Job? = null
     private val compareJobs = mutableMapOf<String, Job>()
@@ -856,19 +860,28 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
         dailyTokenLimit: Long?,
         allowedModelsCsv: String = ""
     ) = viewModelScope.launch {
-        val rawToken = CryptoManager.generateGatewayToken("jhgw_ag")
-        val existing = existingId?.let { id -> codingAgents.value.firstOrNull { it.id == id } }
-        val encToken = existing?.encryptedToken ?: runCatching { CryptoManager.encrypt(rawToken) }.getOrElse { err ->
-            val msg = MaskingUtils.sanitizeErrorMessage(err.message, listOf(rawToken))
-            logEvent(ActivityCategory.KEY_UPDATE, name.trim(), "ENCRYPTION_FAILED", msg)
-            postBanner(msg)
-            return@launch
+        val existing = existingId?.let { id ->
+            codingAgents.value.firstOrNull { it.id == id } ?: db.codingAgentDao().getById(id)
         }
+        val (encToken, tokenPreview) = if (existing != null) {
+            existing.encryptedToken to existing.tokenPreview
+        } else {
+            val rawToken = CryptoManager.generateGatewayToken("jhgw_ag")
+            val encrypted = runCatching { CryptoManager.encrypt(rawToken) }.getOrElse { err ->
+                val msg = MaskingUtils.sanitizeErrorMessage(err.message, listOf(rawToken))
+                logEvent(ActivityCategory.KEY_UPDATE, name.trim(), "ENCRYPTION_FAILED", msg)
+                postBanner(msg)
+                return@launch
+            }
+            encrypted to MaskingUtils.maskSecret(rawToken)
+        }
+        val cleanAlias = modelAlias.trim().ifBlank { "jh-coder" }
         val agent = CodingAgentEntity(
             id = existing?.id ?: UUID.randomUUID().toString(),
             name = name.trim(),
             agentType = type,
-            modelAlias = modelAlias.trim().ifBlank { "jh-coder" },
+            modelAlias = cleanAlias,
+            defaultModelId = existing?.defaultModelId ?: "",
             allowedModelsCsv = allowedModelsCsv.trim(),
             streaming = streaming,
             toolCalling = toolCalling,
@@ -880,24 +893,63 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
             requestCount = existing?.requestCount ?: 0,
             enabled = existing?.enabled ?: true,
             encryptedToken = encToken,
-            tokenPreview = existing?.tokenPreview ?: MaskingUtils.maskSecret(rawToken)
+            tokenPreview = tokenPreview,
+            lastActiveAt = existing?.lastActiveAt,
+            createdAt = existing?.createdAt ?: System.currentTimeMillis()
         )
         db.codingAgentDao().upsert(agent)
+        if (existing != null) {
+            _agentConnectionStatuses.update { it - agent.id }
+        }
     }
 
     fun decryptAgentTokenResult(agent: CodingAgentEntity): Result<String> =
         CryptoManager.decryptResult(agent.encryptedToken)
-    fun toggleAgentEnabled(agent: CodingAgentEntity) = viewModelScope.launch { db.codingAgentDao().upsert(agent.copy(enabled = !agent.enabled)) }
-    fun deleteAgent(agent: CodingAgentEntity) = viewModelScope.launch { db.codingAgentDao().deleteById(agent.id) }
+
+    fun toggleAgentEnabled(agent: CodingAgentEntity) = viewModelScope.launch {
+        db.codingAgentDao().upsert(agent.copy(enabled = !agent.enabled))
+    }
+
+    fun deleteAgent(agent: CodingAgentEntity) = viewModelScope.launch {
+        db.codingAgentDao().deleteById(agent.id)
+        _agentConnectionStatuses.update { it - agent.id }
+    }
 
     fun testCodingAgentGateway(agent: CodingAgentEntity) = viewModelScope.launch {
-        val res = router.executeRoutedChat(
-            requestedModelOrAlias = agent.modelAlias,
-            messages = listOf(ChatMessagePayload("user", "Reply with OK if coding agent gateway route is working.")),
-            settings = settings.value,
-            deviceName = "Agent: ${agent.name}"
+        val currentSettings = settings.value
+        val currentRuntime = gatewayRuntime.value
+        _agentConnectionStatuses.update {
+            it + (agent.id to CodingAgentTestStatus(isTesting = true))
+        }
+        val plainToken = CryptoManager.decryptResult(agent.encryptedToken).getOrElse { err ->
+            val msg = MaskingUtils.sanitizeErrorMessage(err.message)
+            val failed = CodingAgentTestStatus(
+                isTesting = false,
+                success = false,
+                message = msg,
+                testedAtMs = System.currentTimeMillis()
+            )
+            _agentConnectionStatuses.update { it + (agent.id to failed) }
+            logEvent(ActivityCategory.KEY_UPDATE, agent.name, "DECRYPT_FAILED", msg)
+            postBanner("${agent.name}: $msg")
+            return@launch
+        }
+        val status = agentGatewayTester.testConnection(
+            agent = agent,
+            decryptedAgentToken = plainToken,
+            settings = currentSettings,
+            runtime = currentRuntime
         )
-        postBanner(if (res.execution.success) "${agent.name}: Connected via ${res.decision.selectedProvider} (${res.execution.latencyMs}ms)" else "${agent.name}: ${res.execution.safeErrorMessage}")
+        val safeMsg = MaskingUtils.sanitizeErrorMessage(status.message, listOf(plainToken))
+        val safeStatus = status.copy(message = safeMsg)
+        _agentConnectionStatuses.update { it + (agent.id to safeStatus) }
+        logEvent(
+            ActivityCategory.AUTH_EVENT,
+            agent.name,
+            if (safeStatus.success == true) "AGENT_TEST_OK" else "AGENT_TEST_FAILED",
+            safeMsg
+        )
+        postBanner("${agent.name}: $safeMsg")
     }
 
     // Local AI Bridge
@@ -2258,6 +2310,19 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun clearLogs() = viewModelScope.launch { db.metricAndLogDao().clearLogs() }
+
+    fun resetSafeAppSettings() = viewModelScope.launch {
+        runCatching {
+            prefs.resetSafeAppSettings()
+        }.fold(
+            onSuccess = {
+                postBanner("App settings reset to defaults. User data, providers, keys, models, agents, and chats were preserved.")
+            },
+            onFailure = { err ->
+                postBanner(MaskingUtils.sanitizeErrorMessage(err.message))
+            }
+        )
+    }
 
     fun clearAllLocalData() = viewModelScope.launch {
         prefs.setGatewayServiceDesiredRunning(false)

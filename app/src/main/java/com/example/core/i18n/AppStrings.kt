@@ -591,6 +591,26 @@ interface AppStrings {
     val compareDetailFinishReason: String
     val compareDetailHttpStatus: String
     val compareDetailErrorInfo: String
+
+    // Coding Agent Integration & Safe Reset Settings
+    val agentGatewayEndpointLabel: String
+    val agentBaseUrlLabel: String
+    val agentCopyBaseUrlAction: String
+    val agentCopyOpenCodeConfigAction: String
+    val agentCopyCodexConfigAction: String
+    val agentCopyCodexEnvAction: String
+    val agentRemoteAuthBoundaryNote: String
+    val agentGatewayActiveBadge: String
+    val agentGatewayInactiveBadge: String
+    val agentTestRunningLabel: String
+    val agentTestPassedLabel: String
+    val agentTestFailedLabel: String
+    val resetAppSettingsTitle: String
+    val resetAppSettingsDescription: String
+    val resetAppSettingsAction: String
+    val resetAppSettingsConfirmTitle: String
+    val resetAppSettingsConfirmMessage: String
+    val resetAppSettingsConfirmButton: String
 }
 
 val LocalStrings = staticCompositionLocalOf<AppStrings> { EnglishStrings }
