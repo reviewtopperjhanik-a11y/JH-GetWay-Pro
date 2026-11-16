@@ -75,8 +75,7 @@ fun PlaygroundScreen(
     val ephemeralMessages by viewModel.ephemeralMessages.collectAsState()
     val streamingBuffer by viewModel.streamingBuffer.collectAsState()
     val isStreaming by viewModel.isStreaming.collectAsState()
-    val compareResults by viewModel.compareResults.collectAsState()
-    val isComparing by viewModel.isComparing.collectAsState()
+    val compareState by viewModel.compareState.collectAsState()
 
     val messages = if (settings.saveChatHistoryAllowed) savedMessages else ephemeralMessages
 
@@ -103,12 +102,46 @@ fun PlaygroundScreen(
     var stopSeqText by rememberSaveable { mutableStateOf("") }
     var streamingEnabled by rememberSaveable { mutableStateOf(true) }
     var jsonOutput by rememberSaveable { mutableStateOf(false) }
-    var compareSelection by remember { mutableStateOf<Set<String>>(emptySet()) }
 
     val enabledProviderIds = remember(providers, localServers) {
         buildSet {
             providers.filter { it.enabled }.forEach { add(it.id) }
             localServers.filter { it.enabled }.forEach { add("local:${it.id}") }
+        }
+    }
+
+    val compareAvailableModels = remember(models, localServers, enabledProviderIds) {
+        val dbModels = models.filter { it.enabled && it.supportsChat && it.providerId in enabledProviderIds }
+        val localFallbacks = localServers.filter { it.enabled && it.defaultModel.isNotBlank() }.mapNotNull { srv ->
+            val lid = "local:${srv.id}"
+            val hasDbLocal = dbModels.any { it.providerId == lid }
+            if (hasDbLocal) null
+            else ModelEntity(
+                id = "$lid::${srv.defaultModel}",
+                modelId = srv.defaultModel,
+                displayName = srv.defaultModel,
+                providerId = lid,
+                providerName = srv.name,
+                isLocal = true,
+                accessTier = AccessTier.LOCAL
+            )
+        }
+        dbModels + localFallbacks
+    }
+    val compareAvailableById = remember(compareAvailableModels) { compareAvailableModels.associateBy { it.id } }
+    val compareSelectedSet = remember(compareState.selectedModelKeys) { compareState.selectedModelKeys.toSet() }
+    val compareSelectedModels = remember(compareState.selectedModelKeys, compareAvailableById, compareState.entries) {
+        compareState.selectedModelKeys.mapNotNull { key ->
+            compareAvailableById[key] ?: compareState.entries.firstOrNull { it.entryKey == key }?.let { entry ->
+                ModelEntity(
+                    id = entry.entryKey,
+                    modelId = entry.modelId,
+                    displayName = entry.displayName,
+                    providerId = entry.providerId,
+                    providerName = entry.providerName,
+                    supportsStreaming = entry.supportsStreaming
+                )
+            }
         }
     }
 
@@ -578,61 +611,30 @@ fun PlaygroundScreen(
                 }
             }
         } else {
-            // Multi-Model Compare Mode
-            LazyColumn(
+            // Multi-Model Compare Mode — Swipe-Based Model Comparison Workspace
+            PlaygroundCompareWorkspace(
+                compareState = compareState,
+                availableModels = compareAvailableModels,
+                currency = settings.analyticsCurrency,
                 modifier = Modifier
                     .weight(1f)
                     .fillMaxWidth(),
-                contentPadding = PaddingValues(16.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                item {
-                    Text("${s.selectModelsToCompareLabel} (${compareSelection.size})", style = MaterialTheme.typography.titleSmall)
-                    Spacer(Modifier.height(6.dp))
-                    FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                        models.filter { it.enabled }.forEach { m ->
-                            val picked = m.id in compareSelection
-                            FilterChip(
-                                selected = picked,
-                                onClick = {
-                                    compareSelection = if (picked) compareSelection - m.id else compareSelection + m.id
-                                },
-                                label = { Text("${m.providerName}: ${m.modelId}") }
-                            )
-                        }
+                onToggleModel = { model ->
+                    val nextList = if (model.id in compareSelectedSet) {
+                        compareSelectedModels.filterNot { it.id == model.id }
+                    } else {
+                        compareSelectedModels + model
                     }
-                }
-                if (isComparing) {
-                    item { LinearProgressIndicator(modifier = Modifier.fillMaxWidth()) }
-                }
-                items(compareResults) { itemRes ->
-                    GatewayCard {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text("${itemRes.providerName} • ${itemRes.modelId}", style = MaterialTheme.typography.titleSmall)
-                            StatusPill(
-                                text = if (itemRes.error == null) "${itemRes.latencyMs}ms" else s.error,
-                                tone = if (itemRes.error == null) StatusTone.SUCCESS else StatusTone.ERROR
-                            )
-                        }
-                        Spacer(Modifier.height(6.dp))
-                        Text(
-                            text = itemRes.error ?: itemRes.responseText,
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = if (itemRes.error != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface
-                        )
-                        Spacer(Modifier.height(6.dp))
-                        Text(
-                            text = "${itemRes.inputTokens} in / ${itemRes.outputTokens} out • ${formatCurrency(itemRes.estimatedCostUsd, settings.analyticsCurrency, s.unknown)}",
-                            style = MonoTextStyle,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                }
-            }
+                    viewModel.syncCompareModelSelection(nextList)
+                },
+                onClearSelection = { viewModel.syncCompareModelSelection(emptyList()) },
+                onSelectEntry = { entryKey -> viewModel.selectCompareEntry(entryKey) },
+                onToggleDetails = { entryKey -> viewModel.toggleCompareDetails(entryKey) },
+                onRetryModel = { entryKey -> viewModel.retryCompareModel(entryKey) },
+                onStopModel = { entryKey -> viewModel.stopCompareModel(entryKey) },
+                onStopAll = { viewModel.stopAllCompareRequests() },
+                onShowBanner = { msg -> viewModel.postBanner(msg) }
+            )
         }
 
         // Inline Error Banner above Composer
@@ -741,9 +743,16 @@ fun PlaygroundScreen(
                         )
                     }
 
-                    if (isStreaming) {
+                    val isActiveGeneration = if (compareMode) compareState.isRunning else isStreaming
+                    if (isActiveGeneration) {
                         FilledIconButton(
-                            onClick = { viewModel.stopPlaygroundStreaming() },
+                            onClick = {
+                                if (compareMode) {
+                                    viewModel.stopAllCompareRequests()
+                                } else {
+                                    viewModel.stopPlaygroundStreaming()
+                                }
+                            },
                             colors = IconButtonDefaults.filledIconButtonColors(
                                 containerColor = MaterialTheme.colorScheme.errorContainer,
                                 contentColor = MaterialTheme.colorScheme.onErrorContainer
@@ -756,17 +765,30 @@ fun PlaygroundScreen(
                         }
                     } else {
                         FilledIconButton(
-                            enabled = !isComparing,
                             onClick = {
-                                if (promptInput.isBlank() && pendingAttachments.isEmpty()) {
+                                if (promptInput.isBlank() && (compareMode || pendingAttachments.isEmpty())) {
                                     inlineError = s.emptyPromptError
                                     return@FilledIconButton
                                 }
                                 if (compareMode) {
-                                    val chosen = models.filter { it.id in compareSelection }
+                                    if (compareSelectedModels.isEmpty()) {
+                                        inlineError = s.compareSelectModelsHint
+                                        return@FilledIconButton
+                                    }
+                                    inlineError = null
                                     val textToCompare = promptInput
                                     promptInput = ""
-                                    viewModel.runModelComparison(textToCompare, systemPrompt, chosen)
+                                    viewModel.runModelComparison(
+                                        prompt = textToCompare,
+                                        systemPrompt = systemPrompt,
+                                        selectedModels = compareSelectedModels,
+                                        temperature = temperature,
+                                        topP = topP,
+                                        maxTokens = maxTokensText.toIntOrNull() ?: 1024,
+                                        stopSequences = stopSeqText.split(",").map { it.trim() }.filter { it.isNotBlank() },
+                                        jsonOutput = jsonOutput,
+                                        streaming = streamingEnabled
+                                    )
                                 } else {
                                     dispatchChatSend(promptInput, pendingAttachments)
                                 }

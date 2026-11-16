@@ -550,6 +550,47 @@ interface AppStrings {
     val pinnedProviderLabel: String
     val backupNonPortableDisclosure: String
     val backupRestoreDetailsFormat: String
+
+    // Compare Mode Workspace
+    val compareChooseModelsAction: String
+    val compareEmptyTitle: String
+    val compareSelectModelsHint: String
+    val compareReadyHint: String
+    val comparePromptLabel: String
+    val compareDetailsAction: String
+    val compareCopyResponseAction: String
+    val compareResponseCopied: String
+    val comparePreviousAction: String
+    val compareNextAction: String
+    val compareRetryAction: String
+    val compareStopAction: String
+    val compareDoneAction: String
+    val compareClearSelectionAction: String
+    val compareNotAvailable: String
+    val compareEmptyResponse: String
+    val compareModelIndexPrefix: String
+    val compareProgressOfFormat: String
+    val compareStatusPending: String
+    val compareStatusQueued: String
+    val compareStatusRunning: String
+    val compareStatusStreaming: String
+    val compareStatusCompleted: String
+    val compareStatusFailed: String
+    val compareStatusCancelled: String
+    val compareDetailModelName: String
+    val compareDetailProvider: String
+    val compareDetailModelId: String
+    val compareDetailStatus: String
+    val compareDetailLatency: String
+    val compareDetailTtft: String
+    val compareDetailPromptTokens: String
+    val compareDetailCompletionTokens: String
+    val compareDetailTotalTokens: String
+    val compareDetailEstimatedCost: String
+    val compareDetailActualCost: String
+    val compareDetailFinishReason: String
+    val compareDetailHttpStatus: String
+    val compareDetailErrorInfo: String
 }
 
 val LocalStrings = staticCompositionLocalOf<AppStrings> { EnglishStrings }

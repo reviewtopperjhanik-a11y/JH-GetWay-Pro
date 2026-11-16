@@ -50,6 +50,53 @@ data class CompareModelOutput(
     val error: String?
 )
 
+enum class CompareRequestStatus {
+    PENDING,
+    QUEUED,
+    RUNNING,
+    STREAMING,
+    COMPLETED,
+    FAILED,
+    CANCELLED;
+
+    val isActive: Boolean
+        get() = this == PENDING || this == QUEUED || this == RUNNING || this == STREAMING
+}
+
+data class CompareModelEntry(
+    val entryKey: String,
+    val modelId: String,
+    val displayName: String,
+    val providerId: String,
+    val providerName: String,
+    val supportsStreaming: Boolean = true,
+    val requestId: String? = null,
+    val status: CompareRequestStatus = CompareRequestStatus.PENDING,
+    val responseText: String = "",
+    val isStreaming: Boolean = false,
+    val errorMessage: String? = null,
+    val latencyMs: Long? = null,
+    val ttftMs: Long? = null,
+    val inputTokens: Int? = null,
+    val outputTokens: Int? = null,
+    val totalTokens: Int? = null,
+    val usageEstimated: Boolean = false,
+    val estimatedCostUsd: Double? = null,
+    val actualCostUsd: Double? = null,
+    val finishReason: String? = null,
+    val httpStatus: Int? = null
+)
+
+data class CompareWorkspaceState(
+    val selectedModelKeys: List<String> = emptyList(),
+    val prompt: String = "",
+    val systemPrompt: String = "",
+    val entries: List<CompareModelEntry> = emptyList(),
+    val activeEntryKey: String? = null,
+    val expandedDetailsKeys: Set<String> = emptySet(),
+    val isRunning: Boolean = false
+)
+
 data class PendingMcpApproval(
     val server: McpServerEntity,
     val tool: McpToolEntity,
@@ -176,11 +223,29 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
     private val _isStreaming = MutableStateFlow(false)
     val isStreaming: StateFlow<Boolean> = _isStreaming.asStateFlow()
 
-    private val _compareResults = MutableStateFlow<List<CompareModelOutput>>(emptyList())
-    val compareResults: StateFlow<List<CompareModelOutput>> = _compareResults.asStateFlow()
+    private val _compareState = MutableStateFlow(CompareWorkspaceState())
+    val compareState: StateFlow<CompareWorkspaceState> = _compareState.asStateFlow()
 
-    private val _isComparing = MutableStateFlow(false)
-    val isComparing: StateFlow<Boolean> = _isComparing.asStateFlow()
+    val compareResults: StateFlow<List<CompareModelOutput>> = _compareState
+        .map { ws ->
+            ws.entries.map { entry ->
+                CompareModelOutput(
+                    modelId = entry.modelId,
+                    providerName = entry.providerName,
+                    responseText = entry.responseText,
+                    latencyMs = entry.latencyMs ?: 0L,
+                    inputTokens = entry.inputTokens ?: 0,
+                    outputTokens = entry.outputTokens ?: 0,
+                    estimatedCostUsd = entry.estimatedCostUsd,
+                    error = entry.errorMessage
+                )
+            }
+        }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    val isComparing: StateFlow<Boolean> = _compareState
+        .map { it.isRunning }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, false)
 
     private val _workflowNodeProgress = MutableStateFlow<List<NodeExecutionResult>>(emptyList())
     val workflowNodeProgress: StateFlow<List<NodeExecutionResult>> = _workflowNodeProgress.asStateFlow()
@@ -217,8 +282,20 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
 
     private val appLockManager = AppLockManager()
     private var streamingJob: Job? = null
+    private val compareJobs = mutableMapOf<String, Job>()
+    private val compareRunCounter = java.util.concurrent.atomic.AtomicLong(0L)
+    private var lastCompareRequestConfig = CompareRequestConfig()
     private var workflowJob: Job? = null
     private var updateJob: Job? = null
+
+    private data class CompareRequestConfig(
+        val temperature: Float? = null,
+        val topP: Float? = null,
+        val maxTokens: Int? = null,
+        val stopSequences: List<String> = emptyList(),
+        val jsonOutput: Boolean = false,
+        val streaming: Boolean = true
+    )
 
     init {
         viewModelScope.launch {
@@ -1423,45 +1500,428 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    fun runModelComparison(prompt: String, systemPrompt: String, selectedModels: List<ModelEntity>) {
-        if (prompt.isBlank() || selectedModels.isEmpty()) return
-        viewModelScope.launch {
-            _isComparing.value = true
-            _compareResults.value = emptyList()
-            val msgs = buildList {
-                if (systemPrompt.isNotBlank()) add(ChatMessagePayload("system", systemPrompt))
-                add(ChatMessagePayload("user", prompt))
+    fun syncCompareModelSelection(selectedModels: List<ModelEntity>) {
+        val uniqueModels = selectedModels.distinctBy { it.id }
+        val selectedKeys = uniqueModels.map { it.id }
+        val selectedKeySet = selectedKeys.toSet()
+
+        val cancelledKeys = compareJobs.keys.filter { it !in selectedKeySet }
+        cancelledKeys.forEach { key -> compareJobs.remove(key)?.cancel() }
+
+        _compareState.update { prev ->
+            val existingByKey = prev.entries.associateBy { it.entryKey }
+            val reconciledEntries = uniqueModels.map { model ->
+                existingByKey[model.id]?.copy(
+                    displayName = model.displayName.ifBlank { model.modelId },
+                    providerName = model.providerName,
+                    supportsStreaming = model.supportsStreaming
+                ) ?: CompareModelEntry(
+                    entryKey = model.id,
+                    modelId = model.modelId,
+                    displayName = model.displayName.ifBlank { model.modelId },
+                    providerId = model.providerId,
+                    providerName = model.providerName,
+                    supportsStreaming = model.supportsStreaming,
+                    status = CompareRequestStatus.PENDING
+                )
             }
-            val results = coroutineScope {
-                selectedModels.map { m ->
-                    async {
-                        val routed = router.executeRoutedChat(
-                            requestedModelOrAlias = m.modelId,
-                            messages = msgs,
-                            settings = settings.value,
-                            explicitProviderId = m.providerId,
-                            deviceName = "Playground Compare"
+            val prevActiveIdx = prev.entries.indexOfFirst { it.entryKey == prev.activeEntryKey }
+            val reconciledActive = when {
+                reconciledEntries.isEmpty() -> null
+                prev.activeEntryKey != null && reconciledEntries.any { it.entryKey == prev.activeEntryKey } -> prev.activeEntryKey
+                prevActiveIdx >= 0 -> reconciledEntries[prevActiveIdx.coerceIn(0, reconciledEntries.lastIndex)].entryKey
+                else -> reconciledEntries.first().entryKey
+            }
+            val activeRunExists = prev.prompt.isNotBlank() && reconciledEntries.any { it.entryKey in compareJobs && it.status.isActive }
+            prev.copy(
+                selectedModelKeys = selectedKeys,
+                entries = reconciledEntries,
+                activeEntryKey = reconciledActive,
+                expandedDetailsKeys = prev.expandedDetailsKeys.intersect(selectedKeySet),
+                isRunning = activeRunExists
+            )
+        }
+    }
+
+    fun selectCompareEntry(entryKey: String) {
+        _compareState.update { prev ->
+            if (prev.entries.none { it.entryKey == entryKey } || prev.activeEntryKey == entryKey) prev
+            else prev.copy(activeEntryKey = entryKey)
+        }
+    }
+
+    fun toggleCompareDetails(entryKey: String) {
+        _compareState.update { prev ->
+            if (prev.entries.none { it.entryKey == entryKey }) prev
+            else {
+                val next = if (entryKey in prev.expandedDetailsKeys) {
+                    prev.expandedDetailsKeys - entryKey
+                } else {
+                    prev.expandedDetailsKeys + entryKey
+                }
+                prev.copy(expandedDetailsKeys = next)
+            }
+        }
+    }
+
+    fun stopAllCompareRequests() {
+        val jobs = compareJobs.values.toList()
+        compareJobs.clear()
+        compareRunCounter.incrementAndGet()
+        jobs.forEach { it.cancel() }
+        _compareState.update { prev ->
+            prev.copy(
+                entries = prev.entries.map { entry ->
+                    if (entry.status.isActive) {
+                        entry.copy(status = CompareRequestStatus.CANCELLED, isStreaming = false)
+                    } else entry
+                },
+                isRunning = false
+            )
+        }
+    }
+
+    fun stopCompareModel(entryKey: String) {
+        compareJobs.remove(entryKey)?.cancel()
+        _compareState.update { prev ->
+            val updated = prev.entries.map { entry ->
+                if (entry.entryKey == entryKey && entry.status.isActive) {
+                    entry.copy(status = CompareRequestStatus.CANCELLED, isStreaming = false)
+                } else entry
+            }
+            val stillRunning = updated.any { it.entryKey in compareJobs && it.status.isActive }
+            prev.copy(entries = updated, isRunning = stillRunning)
+        }
+    }
+
+    fun retryCompareModel(entryKey: String) {
+        val state = _compareState.value
+        val prompt = state.prompt
+        if (prompt.isBlank()) return
+        val existing = state.entries.firstOrNull { it.entryKey == entryKey } ?: return
+        val matchedModel = models.value.firstOrNull { it.id == entryKey } ?: ModelEntity(
+            id = existing.entryKey,
+            modelId = existing.modelId,
+            displayName = existing.displayName,
+            providerId = existing.providerId,
+            providerName = existing.providerName,
+            supportsStreaming = existing.supportsStreaming
+        )
+        compareJobs.remove(entryKey)?.cancel()
+        val currentRunId = compareRunCounter.get()
+        _compareState.update { prev ->
+            prev.copy(
+                entries = prev.entries.map { entry ->
+                    if (entry.entryKey == entryKey) {
+                        entry.copy(
+                            status = CompareRequestStatus.QUEUED,
+                            responseText = "",
+                            isStreaming = false,
+                            errorMessage = null,
+                            latencyMs = null,
+                            ttftMs = null,
+                            inputTokens = null,
+                            outputTokens = null,
+                            totalTokens = null,
+                            usageEstimated = false,
+                            estimatedCostUsd = null,
+                            actualCostUsd = null,
+                            finishReason = null,
+                            httpStatus = null,
+                            requestId = null
                         )
-                        val pricing = ProviderPresets.lookupPricing(m.modelId)
-                        val cost = pricing?.let {
-                            (routed.execution.inputTokens / 1_000_000.0) * it.inputPer1M +
-                                (routed.execution.outputTokens / 1_000_000.0) * it.outputPer1M
+                    } else entry
+                },
+                isRunning = true
+            )
+        }
+        launchCompareModelJob(
+            entryKey = entryKey,
+            model = matchedModel,
+            prompt = prompt,
+            systemPrompt = state.systemPrompt,
+            config = lastCompareRequestConfig,
+            runId = currentRunId
+        )
+    }
+
+    fun runModelComparison(
+        prompt: String,
+        systemPrompt: String,
+        selectedModels: List<ModelEntity>,
+        temperature: Float? = null,
+        topP: Float? = null,
+        maxTokens: Int? = null,
+        stopSequences: List<String> = emptyList(),
+        jsonOutput: Boolean = false,
+        streaming: Boolean = true
+    ) {
+        val uniqueModels = selectedModels.distinctBy { it.id }
+        if (prompt.isBlank() || uniqueModels.isEmpty()) return
+
+        compareJobs.values.toList().forEach { it.cancel() }
+        compareJobs.clear()
+
+        val runId = compareRunCounter.incrementAndGet()
+        val config = CompareRequestConfig(
+            temperature = temperature,
+            topP = topP,
+            maxTokens = maxTokens,
+            stopSequences = stopSequences,
+            jsonOutput = jsonOutput,
+            streaming = streaming
+        )
+        lastCompareRequestConfig = config
+
+        val initialEntries = uniqueModels.map { m ->
+            CompareModelEntry(
+                entryKey = m.id,
+                modelId = m.modelId,
+                displayName = m.displayName.ifBlank { m.modelId },
+                providerId = m.providerId,
+                providerName = m.providerName,
+                supportsStreaming = m.supportsStreaming,
+                status = CompareRequestStatus.QUEUED
+            )
+        }
+        _compareState.update { prev ->
+            val keptActive = prev.activeEntryKey?.takeIf { key -> initialEntries.any { it.entryKey == key } }
+                ?: initialEntries.first().entryKey
+            prev.copy(
+                selectedModelKeys = uniqueModels.map { it.id },
+                prompt = prompt,
+                systemPrompt = systemPrompt,
+                entries = initialEntries,
+                activeEntryKey = keptActive,
+                expandedDetailsKeys = emptySet(),
+                isRunning = true
+            )
+        }
+
+        uniqueModels.forEach { m ->
+            launchCompareModelJob(
+                entryKey = m.id,
+                model = m,
+                prompt = prompt,
+                systemPrompt = systemPrompt,
+                config = config,
+                runId = runId
+            )
+        }
+    }
+
+    private fun launchCompareModelJob(
+        entryKey: String,
+        model: ModelEntity,
+        prompt: String,
+        systemPrompt: String,
+        config: CompareRequestConfig,
+        runId: Long
+    ) {
+        val msgs = buildList {
+            if (systemPrompt.isNotBlank()) add(ChatMessagePayload("system", systemPrompt))
+            add(ChatMessagePayload("user", prompt))
+        }
+        val job = viewModelScope.launch {
+            val requestStartNs = System.nanoTime()
+            var firstTokenMs: Long? = null
+            updateCompareEntryIfActiveRun(runId, entryKey) {
+                it.copy(status = CompareRequestStatus.RUNNING, isStreaming = false, errorMessage = null)
+            }
+            try {
+                if (config.streaming && model.supportsStreaming) {
+                    router.streamRoutedChat(
+                        requestedModelOrAlias = model.modelId,
+                        messages = msgs,
+                        settings = settings.value,
+                        explicitProviderId = model.providerId,
+                        deviceName = "Playground Compare",
+                        temperature = config.temperature,
+                        topP = config.topP,
+                        maxTokens = config.maxTokens,
+                        stopSequences = config.stopSequences,
+                        jsonOutput = config.jsonOutput
+                    ).collect { (event, decision) ->
+                        when (event) {
+                            is StreamEvent.Delta -> {
+                                if (event.text.isNotEmpty() || event.toolCallDeltas.isNotEmpty()) {
+                                    if (firstTokenMs == null) {
+                                        firstTokenMs = ((System.nanoTime() - requestStartNs) / 1_000_000L).coerceAtLeast(0L)
+                                    }
+                                    updateCompareEntryIfActiveRun(runId, entryKey) { current ->
+                                        current.copy(
+                                            status = CompareRequestStatus.STREAMING,
+                                            isStreaming = true,
+                                            ttftMs = firstTokenMs,
+                                            responseText = current.responseText + event.text,
+                                            finishReason = event.finishReason ?: current.finishReason
+                                        )
+                                    }
+                                }
+                            }
+                            is StreamEvent.Completed -> {
+                                val resolvedModel = decision?.selectedModel?.ifBlank { model.modelId } ?: model.modelId
+                                val resolvedUsage = decision?.resolvedUsage
+                                val usageKnown = event.result.usageReported ||
+                                    (resolvedUsage != null && resolvedUsage.source != com.example.core.security.UsageSource.UNKNOWN)
+                                val inTok = if (usageKnown) (resolvedUsage?.inputTokens ?: event.result.inputTokens) else null
+                                val outTok = if (usageKnown) (resolvedUsage?.outputTokens ?: event.result.outputTokens) else null
+                                val totalTok = if (inTok != null && outTok != null) inTok + outTok else null
+                                val isEstUsage = !event.result.usageReported &&
+                                    resolvedUsage?.source == com.example.core.security.UsageSource.ESTIMATED
+                                val pricing = ProviderPresets.lookupPricing(resolvedModel)
+                                val estCost = if (pricing != null && inTok != null && outTok != null) {
+                                    (inTok / 1_000_000.0) * pricing.inputPer1M +
+                                        (outTok / 1_000_000.0) * pricing.outputPer1M
+                                } else null
+                                updateCompareEntryIfActiveRun(runId, entryKey) { current ->
+                                    current.copy(
+                                        requestId = decision?.requestId ?: current.requestId,
+                                        status = CompareRequestStatus.COMPLETED,
+                                        isStreaming = false,
+                                        responseText = event.result.content.ifEmpty { current.responseText },
+                                        errorMessage = null,
+                                        latencyMs = event.result.latencyMs,
+                                        ttftMs = firstTokenMs,
+                                        inputTokens = inTok,
+                                        outputTokens = outTok,
+                                        totalTokens = totalTok,
+                                        usageEstimated = isEstUsage,
+                                        estimatedCostUsd = estCost,
+                                        actualCostUsd = event.result.actualBilledCostUsd,
+                                        finishReason = event.result.finishReason.ifBlank { null },
+                                        httpStatus = event.result.statusCode
+                                    )
+                                }
+                            }
+                            is StreamEvent.Failed -> {
+                                updateCompareEntryIfActiveRun(runId, entryKey) { current ->
+                                    current.copy(
+                                        requestId = decision?.requestId ?: current.requestId,
+                                        status = CompareRequestStatus.FAILED,
+                                        isStreaming = false,
+                                        errorMessage = event.error.safeErrorMessage ?: "Request failed",
+                                        latencyMs = event.error.latencyMs.takeIf { it > 0L },
+                                        ttftMs = firstTokenMs,
+                                        httpStatus = event.error.statusCode.takeIf { it > 0 },
+                                        finishReason = event.error.finishReason.ifBlank { null }
+                                    )
+                                }
+                            }
                         }
-                        CompareModelOutput(
-                            modelId = m.modelId,
-                            providerName = m.providerName,
-                            responseText = routed.execution.content,
-                            latencyMs = routed.execution.latencyMs,
-                            inputTokens = routed.execution.inputTokens,
-                            outputTokens = routed.execution.outputTokens,
-                            estimatedCostUsd = cost,
-                            error = if (routed.execution.success) null else routed.execution.safeErrorMessage
-                        )
                     }
-                }.awaitAll()
+                } else {
+                    val routed = router.executeRoutedChat(
+                        requestedModelOrAlias = model.modelId,
+                        messages = msgs,
+                        settings = settings.value,
+                        explicitProviderId = model.providerId,
+                        deviceName = "Playground Compare",
+                        temperature = config.temperature,
+                        topP = config.topP,
+                        maxTokens = config.maxTokens,
+                        stopSequences = config.stopSequences,
+                        jsonOutput = config.jsonOutput
+                    )
+                    if (routed.execution.success) {
+                        val resolvedUsage = routed.decision.resolvedUsage
+                        val usageKnown = routed.execution.usageReported ||
+                            resolvedUsage.source != com.example.core.security.UsageSource.UNKNOWN
+                        val inTok = if (usageKnown) resolvedUsage.inputTokens else null
+                        val outTok = if (usageKnown) resolvedUsage.outputTokens else null
+                        val totalTok = if (inTok != null && outTok != null) inTok + outTok else null
+                        val isEstUsage = !routed.execution.usageReported &&
+                            resolvedUsage.source == com.example.core.security.UsageSource.ESTIMATED
+                        val pricing = ProviderPresets.lookupPricing(model.modelId)
+                        val estCost = if (pricing != null && inTok != null && outTok != null) {
+                            (inTok / 1_000_000.0) * pricing.inputPer1M +
+                                (outTok / 1_000_000.0) * pricing.outputPer1M
+                        } else null
+                        updateCompareEntryIfActiveRun(runId, entryKey) { current ->
+                            current.copy(
+                                requestId = routed.decision.requestId,
+                                status = CompareRequestStatus.COMPLETED,
+                                isStreaming = false,
+                                responseText = routed.execution.content,
+                                errorMessage = null,
+                                latencyMs = routed.execution.latencyMs,
+                                ttftMs = null,
+                                inputTokens = inTok,
+                                outputTokens = outTok,
+                                totalTokens = totalTok,
+                                usageEstimated = isEstUsage,
+                                estimatedCostUsd = estCost,
+                                actualCostUsd = routed.execution.actualBilledCostUsd,
+                                finishReason = routed.execution.finishReason.ifBlank { null },
+                                httpStatus = routed.execution.statusCode
+                            )
+                        }
+                    } else {
+                        updateCompareEntryIfActiveRun(runId, entryKey) { current ->
+                            current.copy(
+                                requestId = routed.decision.requestId,
+                                status = CompareRequestStatus.FAILED,
+                                isStreaming = false,
+                                errorMessage = routed.execution.safeErrorMessage ?: "Request failed",
+                                latencyMs = routed.execution.latencyMs.takeIf { it > 0L },
+                                httpStatus = routed.execution.statusCode.takeIf { it > 0 },
+                                finishReason = routed.execution.finishReason.ifBlank { null }
+                            )
+                        }
+                    }
+                }
+            } catch (ce: CancellationException) {
+                updateCompareEntryIfActiveRun(runId, entryKey) { current ->
+                    if (current.status.isActive) {
+                        current.copy(status = CompareRequestStatus.CANCELLED, isStreaming = false)
+                    } else current
+                }
+                throw ce
+            } catch (e: Exception) {
+                val safeMsg = MaskingUtils.sanitizeErrorMessage(e.message)
+                updateCompareEntryIfActiveRun(runId, entryKey) { current ->
+                    current.copy(
+                        status = CompareRequestStatus.FAILED,
+                        isStreaming = false,
+                        errorMessage = safeMsg
+                    )
+                }
+            } finally {
+                if (compareRunCounter.get() == runId && compareJobs[entryKey]?.isActive != true) {
+                    compareJobs.remove(entryKey)
+                    refreshCompareRunningState()
+                }
             }
-            _compareResults.value = results
-            _isComparing.value = false
+        }
+        compareJobs[entryKey] = job
+        refreshCompareRunningState()
+    }
+
+    private fun updateCompareEntryIfActiveRun(
+        runId: Long,
+        entryKey: String,
+        transform: (CompareModelEntry) -> CompareModelEntry
+    ) {
+        if (compareRunCounter.get() != runId) return
+        _compareState.update { prev ->
+            var changed = false
+            val updated = prev.entries.map { entry ->
+                if (entry.entryKey == entryKey) {
+                    changed = true
+                    transform(entry)
+                } else entry
+            }
+            if (!changed) prev else prev.copy(
+                entries = updated,
+                isRunning = updated.any { it.status.isActive && it.entryKey in compareJobs }
+            )
+        }
+    }
+
+    private fun refreshCompareRunningState() {
+        _compareState.update { prev ->
+            val active = prev.entries.any { it.status.isActive && it.entryKey in compareJobs }
+            if (prev.isRunning == active) prev else prev.copy(isRunning = active)
         }
     }
 
