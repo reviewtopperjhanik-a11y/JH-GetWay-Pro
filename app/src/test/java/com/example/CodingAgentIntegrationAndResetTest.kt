@@ -652,7 +652,7 @@ class CodingAgentIntegrationAndResetTest {
     fun resetSafeAppSettings_resetsOnlyUiAndGeneralPrefsAndPreservesAllDbAndProtectedSettingsIdempotently() {
         // Check complete classification coverage between SAFE_RESET_KEY_NAMES & PROTECTED_KEY_NAMES
         assertTrue(AppPreferences.SAFE_RESET_KEY_NAMES.intersect(AppPreferences.PROTECTED_KEY_NAMES).isEmpty())
-        assertEquals(46, AppPreferences.SAFE_RESET_KEY_NAMES.size + AppPreferences.PROTECTED_KEY_NAMES.size)
+        assertEquals(49, AppPreferences.SAFE_RESET_KEY_NAMES.size + AppPreferences.PROTECTED_KEY_NAMES.size)
 
         val vmStore = ViewModelStore()
         val vm = ViewModelProvider(vmStore, ViewModelProvider.AndroidViewModelFactory.getInstance(app))[GatewayViewModel::class.java]
@@ -736,6 +736,11 @@ class CodingAgentIntegrationAndResetTest {
                 app.preferences.updateRoutingSettings(RoutingMode.LOWEST_COST, fallbackEnabled = false, maxRetries = 5)
                 app.preferences.setManualModelFallbackEnabled(true)
                 app.preferences.setAutoFreeIncludeLocal(true)
+                app.preferences.updateSmartAutoPreferences(
+                    openCodeSelectionMode = "best-coding",
+                    autoAllowPaidModels = false,
+                    preferConfiguredDefaultInAuto = false
+                )
             }
 
             awaitCondition {
@@ -774,6 +779,9 @@ class CodingAgentIntegrationAndResetTest {
                 assertEquals(2, after.maxRetries)
                 assertFalse(after.manualModelFallbackEnabled)
                 assertFalse(after.autoFreeIncludeLocal)
+                assertEquals(OpenCodeSelectorIds.AUTO, after.openCodeSelectionMode)
+                assertTrue(after.autoAllowPaidModels)
+                assertTrue(after.preferConfiguredDefaultInAuto)
 
                 // Verify protected preferences were 100% preserved
                 assertEquals(AppLanguage.BENGALI, after.language)

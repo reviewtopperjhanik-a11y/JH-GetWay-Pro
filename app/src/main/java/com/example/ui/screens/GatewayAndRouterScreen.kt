@@ -26,6 +26,7 @@ import androidx.core.content.ContextCompat
 import com.example.core.i18n.LocalStrings
 import com.example.data.local.*
 import com.example.gateway.GatewayRunStatus
+import com.example.gateway.OpenCodeSelectorIds
 import com.example.ui.GatewayViewModel
 import com.example.ui.components.*
 import com.example.ui.theme.MonoTextStyle
@@ -300,6 +301,7 @@ fun SmartRouterScreen(viewModel: GatewayViewModel) {
     val rules by viewModel.routingRules.collectAsState()
     val providers by viewModel.providers.collectAsState()
     val decisions by viewModel.recentRouterDecisions.collectAsState()
+    val curatedCatalog by viewModel.openCodeCuratedCatalog.collectAsState()
 
     var showRuleDialog by remember { mutableStateOf(false) }
 
@@ -380,6 +382,95 @@ fun SmartRouterScreen(viewModel: GatewayViewModel) {
                         )
                     }
                 }
+                HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+                Text(s.openCodeSelectorTitle, style = MaterialTheme.typography.titleSmall)
+                Spacer(Modifier.height(6.dp))
+                val selectorOptions = listOf(
+                    OpenCodeSelectorIds.AUTO to s.openCodeModeAuto,
+                    OpenCodeSelectorIds.DEFAULT to s.openCodeModeDefault,
+                    OpenCodeSelectorIds.BEST_CODING to s.openCodeModeBestCoding,
+                    OpenCodeSelectorIds.FREE to s.openCodeModeFree
+                )
+                val activeSelector = OpenCodeSelectorIds.normalizeSelectorId(settings.openCodeSelectionMode)
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    selectorOptions.forEach { (selId, label) ->
+                        FilterChip(
+                            selected = activeSelector == selId,
+                            onClick = {
+                                viewModel.updateSmartAutoPreferences(
+                                    openCodeSelectionMode = selId,
+                                    autoAllowPaidModels = settings.autoAllowPaidModels,
+                                    preferConfiguredDefaultInAuto = settings.preferConfiguredDefaultInAuto
+                                )
+                            },
+                            label = { Text(label) },
+                            modifier = Modifier
+                                .minimumInteractiveComponentSize()
+                                .testTag("opencode_selector_chip_$selId")
+                        )
+                    }
+                }
+                Spacer(Modifier.height(6.dp))
+                val selectorTargetText = when (activeSelector) {
+                    OpenCodeSelectorIds.DEFAULT -> curatedCatalog.defaultResolvedTarget ?: "—"
+                    OpenCodeSelectorIds.BEST_CODING -> curatedCatalog.bestCodingResolvedTarget ?: (curatedCatalog.codingUnavailableReason ?: "—")
+                    OpenCodeSelectorIds.FREE -> "${curatedCatalog.verifiedFreeCount}"
+                    else -> curatedCatalog.autoResolvedTarget ?: "—"
+                }
+                Text(
+                    text = String.format(
+                        s.openCodeCuratedCountFormat,
+                        curatedCatalog.entries.size,
+                        curatedCatalog.totalEligibleModelsCount,
+                        curatedCatalog.totalStoredModelsCount
+                    ),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Text(
+                    text = "${s.openCodeResolvedTargetPrefix}: $selectorTargetText",
+                    style = MonoTextStyle,
+                    color = MaterialTheme.colorScheme.primary
+                )
+                Spacer(Modifier.height(6.dp))
+                val paidSwitchEffective = settings.autoAllowPaidModels && settings.defaultRoutingMode != RoutingMode.AUTO_FREE
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(s.openCodeAllowPaidInAuto, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+                    Switch(
+                        checked = paidSwitchEffective,
+                        enabled = settings.defaultRoutingMode != RoutingMode.AUTO_FREE,
+                        onCheckedChange = {
+                            viewModel.updateSmartAutoPreferences(
+                                openCodeSelectionMode = settings.openCodeSelectionMode,
+                                autoAllowPaidModels = it,
+                                preferConfiguredDefaultInAuto = settings.preferConfiguredDefaultInAuto
+                            )
+                        },
+                        modifier = Modifier.testTag("switch_auto_allow_paid")
+                    )
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(s.openCodePreferDefaultInAuto, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+                    Switch(
+                        checked = settings.preferConfiguredDefaultInAuto,
+                        onCheckedChange = {
+                            viewModel.updateSmartAutoPreferences(
+                                openCodeSelectionMode = settings.openCodeSelectionMode,
+                                autoAllowPaidModels = settings.autoAllowPaidModels,
+                                preferConfiguredDefaultInAuto = it
+                            )
+                        },
+                        modifier = Modifier.testTag("switch_prefer_default_auto")
+                    )
+                }
             }
         }
 
@@ -444,13 +535,24 @@ fun SmartRouterScreen(viewModel: GatewayViewModel) {
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text("${d.selectedProvider} → ${d.selectedModel}", style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
-                        StatusPill(
-                            text = d.finalStatus,
-                            tone = if (d.finalStatus.startsWith("SUCCESS")) StatusTone.SUCCESS else StatusTone.ERROR
-                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                            if (d.usedDefaultModel) {
+                                StatusPill(text = s.openCodeDefaultBadge, tone = StatusTone.INFO)
+                            }
+                            StatusPill(
+                                text = d.finalStatus,
+                                tone = if (d.finalStatus.startsWith("SUCCESS")) StatusTone.SUCCESS else StatusTone.ERROR
+                            )
+                        }
                     }
                     Spacer(Modifier.height(4.dp))
+                    if (d.requestedModelOrAlias.isNotBlank()) {
+                        Text("${s.modelOrAliasLabel}: ${d.requestedModelOrAlias}", style = MonoTextStyle, color = MaterialTheme.colorScheme.primary)
+                    }
                     Text("${s.routingReason}: ${d.routingReason}", style = MaterialTheme.typography.bodySmall)
+                    d.fallbackReason?.takeIf { it.isNotBlank() }?.let { fb ->
+                        Text(fb, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.tertiary)
+                    }
                     Text("${s.attemptCount}: ${d.attemptCount} • ${s.fallbackUsed}: ${d.fallbackUsed} • ${d.latencyMs}ms", style = MonoTextStyle, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }

@@ -13,6 +13,7 @@ import com.example.network.adapters.ProviderAdapterRegistry
 import com.example.network.adapters.ProviderCapabilities
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.*
+import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -26,7 +27,10 @@ data class RouterDecisionSnapshot(
     val latencyMs: Long,
     val finalStatus: String,
     val resolvedUsage: ResolvedTokenUsage = ResolvedTokenUsage(0, 0, UsageSource.UNKNOWN),
-    val timestamp: Long = System.currentTimeMillis()
+    val timestamp: Long = System.currentTimeMillis(),
+    val requestedModelOrAlias: String = "",
+    val usedDefaultModel: Boolean = false,
+    val fallbackReason: String? = null
 )
 
 data class RouteCandidate(
@@ -45,7 +49,21 @@ data class RouteCandidate(
     val capabilities: ProviderCapabilities = ProviderCapabilities(),
     val providerStatus: ProviderStatus = ProviderStatus.UNKNOWN,
     val accessTier: AccessTier = if (isLocal) AccessTier.LOCAL else AccessTier.UNKNOWN,
-    val freeTierVerified: Boolean = false
+    val freeTierVerified: Boolean = false,
+    val isCanonicalDefault: Boolean = false,
+    val isCodingCapable: Boolean = false,
+    val codingScore: Int = 0
+)
+
+data class RoutingRequestContext(
+    val messages: List<ChatMessagePayload> = emptyList(),
+    val tools: List<NormalizedToolDefinition> = emptyList(),
+    val toolChoice: NormalizedToolChoice? = null,
+    val jsonOutput: Boolean = false,
+    val responseFormat: NormalizedResponseFormat? = null,
+    val stream: Boolean = false,
+    val requireVision: Boolean = false,
+    val requiredDocumentMimeTypes: Set<String> = emptySet()
 )
 
 data class RoutedChatResult(
@@ -59,6 +77,12 @@ class SmartRouterEngine(
 ) {
     companion object {
         const val COOLDOWN_WINDOW_MS = 60_000L
+
+        private val codingToolKeywords = setOf(
+            "read", "write", "edit", "patch", "apply_patch", "bash", "shell", "exec",
+            "run_command", "grep", "glob", "find", "lsp", "git", "test", "lint", "compile",
+            "read_file", "write_file", "edit_file", "list_dir"
+        )
     }
 
     private val roundRobinCounter = AtomicInteger(0)
@@ -66,6 +90,15 @@ class SmartRouterEngine(
 
     private val _recentDecisions = MutableStateFlow<List<RouterDecisionSnapshot>>(emptyList())
     val recentDecisions: StateFlow<List<RouterDecisionSnapshot>> = _recentDecisions.asStateFlow()
+
+    private data class AnalyzedIntent(
+        val needsVision: Boolean,
+        val requiredDocMimes: Set<String>,
+        val needsTools: Boolean,
+        val needsJsonOutput: Boolean,
+        val needsStreaming: Boolean,
+        val isCodingIntent: Boolean
+    )
 
     private fun extractMessageCapabilities(
         messages: List<ChatMessagePayload>,
@@ -88,6 +121,48 @@ class SmartRouterEngine(
         return needsVision to docMimes
     }
 
+    private fun analyzeIntent(ctx: RoutingRequestContext): AnalyzedIntent {
+        val (needsVision, docMimes) = extractMessageCapabilities(
+            ctx.messages,
+            ctx.requireVision,
+            ctx.requiredDocumentMimeTypes
+        )
+        val needsTools = ctx.tools.isNotEmpty() ||
+            (ctx.toolChoice != null && ctx.toolChoice !is NormalizedToolChoice.None)
+        val needsJsonOutput = ctx.jsonOutput ||
+            (ctx.responseFormat != null && !ctx.responseFormat.type.equals("text", ignoreCase = true))
+
+        val hasCodingTools = ctx.tools.any { t ->
+            val lowerName = t.name.lowercase(Locale.US)
+            codingToolKeywords.any { kw -> lowerName.contains(kw) }
+        }
+        val joinedText = ctx.messages.takeLast(6).joinToString("\n") { it.content }.lowercase(Locale.US)
+        val hasCodingTextSignals = joinedText.contains("```") ||
+            joinedText.contains("stacktrace") ||
+            joinedText.contains("refactor") ||
+            joinedText.contains("compile") ||
+            joinedText.contains("unit test") ||
+            joinedText.contains("function ") ||
+            joinedText.contains("class ") ||
+            joinedText.contains(".kt") ||
+            joinedText.contains(".ts") ||
+            joinedText.contains(".py") ||
+            joinedText.contains(".go") ||
+            joinedText.contains(".rs") ||
+            joinedText.contains("debug ") ||
+            joinedText.contains("fix the bug") ||
+            joinedText.contains("opencode")
+
+        return AnalyzedIntent(
+            needsVision = needsVision,
+            requiredDocMimes = docMimes,
+            needsTools = needsTools,
+            needsJsonOutput = needsJsonOutput,
+            needsStreaming = ctx.stream,
+            isCodingIntent = hasCodingTools || hasCodingTextSignals
+        )
+    }
+
     private fun candidateSupportsAttachments(
         capabilities: ProviderCapabilities,
         needsVision: Boolean,
@@ -100,11 +175,31 @@ class SmartRouterEngine(
         return true
     }
 
+    private fun candidateSupportsIntent(
+        capabilities: ProviderCapabilities,
+        intent: AnalyzedIntent,
+        enforceStrictToolsAndJson: Boolean
+    ): Boolean {
+        if (!candidateSupportsAttachments(capabilities, intent.needsVision, intent.requiredDocMimes)) {
+            return false
+        }
+        if (enforceStrictToolsAndJson) {
+            if (intent.needsTools && !capabilities.supportsTools) return false
+            if (intent.needsJsonOutput && !capabilities.supportsJsonOutput) return false
+        }
+        return true
+    }
+
     private fun isProviderCoolingDown(provider: ProviderEntity, nowMs: Long): Boolean {
         if (provider.status != ProviderStatus.ERROR && provider.status != ProviderStatus.RATE_LIMITED) return false
         val checkedAt = provider.lastCheckedAt ?: return false
         return (nowMs - checkedAt) in 0 until COOLDOWN_WINDOW_MS
     }
+
+    private fun isLocalServerCoolingDown(server: LocalAiServerEntity): Boolean =
+        server.status == ProviderStatus.ERROR ||
+            server.status == ProviderStatus.RATE_LIMITED ||
+            server.status == ProviderStatus.DISCONNECTED
 
     private fun healthRank(status: ProviderStatus): Int = when (status) {
         ProviderStatus.CONNECTED -> 0
@@ -156,14 +251,24 @@ class SmartRouterEngine(
     ): RoutedChatResult {
         val requestId = UUID.randomUUID().toString().take(12)
         val effectiveMode = routingModeOverride ?: settings.defaultRoutingMode
-        val (needsVision, needsDocs) = extractMessageCapabilities(messages, requireVision, requiredDocumentMimeTypes)
-        val (candidates, reason) = resolveCandidates(
+        val reqContext = RoutingRequestContext(
+            messages = messages,
+            tools = tools,
+            toolChoice = toolChoice,
+            jsonOutput = jsonOutput,
+            responseFormat = responseFormat,
+            stream = false,
+            requireVision = requireVision,
+            requiredDocumentMimeTypes = requiredDocumentMimeTypes
+        )
+        val normalizedSelector = OpenCodeSelectorIds.normalizeSelectorId(requestedModelOrAlias)
+        val intent = analyzeIntent(reqContext)
+        val (candidates, reason) = resolveCandidatesWithContext(
             requestedModelOrAlias = requestedModelOrAlias,
             settings = settings,
             mode = effectiveMode,
             explicitProviderId = explicitProviderId,
-            requireVision = needsVision,
-            requiredDocumentMimeTypes = needsDocs
+            requestContext = reqContext
         )
 
         if (candidates.isEmpty()) {
@@ -172,26 +277,35 @@ class SmartRouterEngine(
                 settings = settings,
                 mode = effectiveMode,
                 explicitProviderId = explicitProviderId,
-                requireVision = needsVision,
-                requiredDocumentMimeTypes = needsDocs
+                requireVision = intent.needsVision,
+                requiredDocumentMimeTypes = intent.requiredDocMimes
             )
             val err = ChatExecutionResult(
                 success = false,
                 statusCode = 503,
-                errorCode = "NO_ELIGIBLE_PROVIDER",
+                errorCode = if (normalizedSelector == OpenCodeSelectorIds.BEST_CODING) {
+                    "NO_ELIGIBLE_CODING_MODEL"
+                } else {
+                    "NO_ELIGIBLE_PROVIDER"
+                },
                 safeErrorMessage = diagnostic
             )
             val resolved = TokenUsageAccounting.resolveUsage(0, 0, false, messages, "", false)
             val decision = RouterDecisionSnapshot(
                 requestId = requestId,
                 selectedProvider = "None",
-                selectedModel = requestedModelOrAlias.ifBlank { if (effectiveMode == RoutingMode.AUTO_FREE) "Auto-Free" else "Unassigned" },
+                selectedModel = requestedModelOrAlias.ifBlank {
+                    if (effectiveMode == RoutingMode.AUTO_FREE) "Auto-Free" else "Unassigned"
+                },
                 routingReason = reason,
                 fallbackUsed = false,
                 attemptCount = 0,
                 latencyMs = 0,
                 finalStatus = "FAILED (NO_PROVIDER)",
-                resolvedUsage = resolved
+                resolvedUsage = resolved,
+                requestedModelOrAlias = requestedModelOrAlias.ifBlank { effectiveMode.name },
+                usedDefaultModel = false,
+                fallbackReason = diagnostic
             )
             recordDecision(decision, err, null, deviceName, endpoint, effectiveMode.name, resolved)
             return RoutedChatResult(err, decision)
@@ -200,15 +314,22 @@ class SmartRouterEngine(
         val allowFallback = fallbackOverride ?: if (explicitProviderId != null) {
             settings.manualModelFallbackEnabled && settings.fallbackEnabled
         } else {
-            settings.fallbackEnabled || effectiveMode == RoutingMode.AUTO_FREE
+            settings.fallbackEnabled ||
+                effectiveMode == RoutingMode.AUTO_FREE ||
+                OpenCodeSelectorIds.isVirtualSelector(normalizedSelector)
         }
         val maxAttempts = if (allowFallback) (1 + settings.maxRetries).coerceAtMost(candidates.size) else 1
         var attemptCount = 0
         var lastResult = ChatExecutionResult(false, errorCode = "UNKNOWN", safeErrorMessage = "No attempts made")
         var winningCandidate = candidates.first()
+        var triggeredFallbackReason: String? = null
 
         for (i in 0 until maxAttempts) {
             val candidate = candidates[i]
+            // Protocol safety invariant: never forward Gateway virtual IDs upstream
+            check(!OpenCodeSelectorIds.isVirtualSelector(candidate.modelId)) {
+                "Virtual selector ID '${candidate.modelId}' cannot be sent upstream"
+            }
             winningCandidate = candidate
             attemptCount++
 
@@ -234,22 +355,29 @@ class SmartRouterEngine(
                 allowLocalHttp = settings.localNetworkAccessAllowed,
                 timeoutSec = settings.gatewayTimeoutSec
             )
-            lastResult = res
+            val normalizedRes = if (res.success && res.modelUsed.isNullOrBlank()) {
+                res.copy(modelUsed = candidate.modelId)
+            } else {
+                res
+            }
+            lastResult = normalizedRes
 
-            updateProviderAndKeyHealth(candidate, res)
-            if (res.success) break
+            updateProviderAndKeyHealth(candidate, normalizedRes)
+            if (normalizedRes.success) break
 
-            if (attemptCount > 1 || (res.retryable && i + 1 < maxAttempts)) {
+            val failCategory = normalizedRes.errorCode ?: "HTTP_${normalizedRes.statusCode}"
+            if (attemptCount > 1 || (normalizedRes.retryable && i + 1 < maxAttempts)) {
+                triggeredFallbackReason = "$failCategory on ${candidate.displayName}/${candidate.modelId}"
                 db.metricAndLogDao().insertLog(
                     ActivityLogEntity(
                         category = ActivityCategory.FALLBACK_EVENT,
                         relatedEntity = candidate.displayName,
-                        status = res.errorCode ?: "ERROR",
-                        safeMessage = "Fallback triggered from ${candidate.displayName} (${res.safeErrorMessage})"
+                        status = failCategory,
+                        safeMessage = "Fallback triggered from ${candidate.displayName} (${normalizedRes.safeErrorMessage})"
                     )
                 )
             }
-            if (!res.retryable) break
+            if (!normalizedRes.retryable) break
         }
 
         val fallbackUsed = attemptCount > 1
@@ -275,7 +403,10 @@ class SmartRouterEngine(
             attemptCount = attemptCount,
             latencyMs = lastResult.latencyMs,
             finalStatus = finalStatus,
-            resolvedUsage = resolved
+            resolvedUsage = resolved,
+            requestedModelOrAlias = requestedModelOrAlias.ifBlank { effectiveMode.name },
+            usedDefaultModel = winningCandidate.isCanonicalDefault,
+            fallbackReason = triggeredFallbackReason
         )
         recordDecision(decision, lastResult, winningCandidate, deviceName, endpoint, effectiveMode.name, resolved)
         return RoutedChatResult(lastResult, decision)
@@ -303,14 +434,24 @@ class SmartRouterEngine(
     ): Flow<Pair<StreamEvent, RouterDecisionSnapshot?>> = flow {
         val requestId = UUID.randomUUID().toString().take(12)
         val effectiveMode = routingModeOverride ?: settings.defaultRoutingMode
-        val (needsVision, needsDocs) = extractMessageCapabilities(messages, requireVision, requiredDocumentMimeTypes)
-        val (candidates, reason) = resolveCandidates(
+        val reqContext = RoutingRequestContext(
+            messages = messages,
+            tools = tools,
+            toolChoice = toolChoice,
+            jsonOutput = jsonOutput,
+            responseFormat = responseFormat,
+            stream = true,
+            requireVision = requireVision,
+            requiredDocumentMimeTypes = requiredDocumentMimeTypes
+        )
+        val normalizedSelector = OpenCodeSelectorIds.normalizeSelectorId(requestedModelOrAlias)
+        val intent = analyzeIntent(reqContext)
+        val (candidates, reason) = resolveCandidatesWithContext(
             requestedModelOrAlias = requestedModelOrAlias,
             settings = settings,
             mode = effectiveMode,
             explicitProviderId = explicitProviderId,
-            requireVision = needsVision,
-            requiredDocumentMimeTypes = needsDocs
+            requestContext = reqContext
         )
 
         if (candidates.isEmpty()) {
@@ -319,21 +460,35 @@ class SmartRouterEngine(
                 settings = settings,
                 mode = effectiveMode,
                 explicitProviderId = explicitProviderId,
-                requireVision = needsVision,
-                requiredDocumentMimeTypes = needsDocs
+                requireVision = intent.needsVision,
+                requiredDocumentMimeTypes = intent.requiredDocMimes
             )
-            val err = ChatExecutionResult(false, statusCode = 503, errorCode = "NO_ELIGIBLE_PROVIDER", safeErrorMessage = diagnostic)
+            val err = ChatExecutionResult(
+                success = false,
+                statusCode = 503,
+                errorCode = if (normalizedSelector == OpenCodeSelectorIds.BEST_CODING) {
+                    "NO_ELIGIBLE_CODING_MODEL"
+                } else {
+                    "NO_ELIGIBLE_PROVIDER"
+                },
+                safeErrorMessage = diagnostic
+            )
             val resolved = TokenUsageAccounting.resolveUsage(0, 0, false, messages, "", false)
             val decision = RouterDecisionSnapshot(
-                requestId,
-                "None",
-                requestedModelOrAlias.ifBlank { if (effectiveMode == RoutingMode.AUTO_FREE) "Auto-Free" else "Unassigned" },
-                reason,
-                false,
-                0,
-                0,
-                "FAILED",
-                resolved
+                requestId = requestId,
+                selectedProvider = "None",
+                selectedModel = requestedModelOrAlias.ifBlank {
+                    if (effectiveMode == RoutingMode.AUTO_FREE) "Auto-Free" else "Unassigned"
+                },
+                routingReason = reason,
+                fallbackUsed = false,
+                attemptCount = 0,
+                latencyMs = 0,
+                finalStatus = "FAILED",
+                resolvedUsage = resolved,
+                requestedModelOrAlias = requestedModelOrAlias.ifBlank { effectiveMode.name },
+                usedDefaultModel = false,
+                fallbackReason = diagnostic
             )
             recordDecision(decision, err, null, deviceName, endpoint, effectiveMode.name, resolved)
             emit(StreamEvent.Failed(err, false) to decision)
@@ -343,13 +498,19 @@ class SmartRouterEngine(
         val allowFallback = fallbackOverride ?: if (explicitProviderId != null) {
             settings.manualModelFallbackEnabled && settings.fallbackEnabled
         } else {
-            settings.fallbackEnabled || effectiveMode == RoutingMode.AUTO_FREE
+            settings.fallbackEnabled ||
+                effectiveMode == RoutingMode.AUTO_FREE ||
+                OpenCodeSelectorIds.isVirtualSelector(normalizedSelector)
         }
         val maxAttempts = if (allowFallback) (1 + settings.maxRetries).coerceAtMost(candidates.size) else 1
         var attempt = 0
+        var triggeredFallbackReason: String? = null
 
         for (i in 0 until maxAttempts) {
             val candidate = candidates[i]
+            check(!OpenCodeSelectorIds.isVirtualSelector(candidate.modelId)) {
+                "Virtual selector ID '${candidate.modelId}' cannot be sent upstream"
+            }
             attempt++
             var finishedCleanly = false
             var canRetryNext = false
@@ -382,15 +543,20 @@ class SmartRouterEngine(
                         is StreamEvent.Delta -> emit(event to null)
                         is StreamEvent.Completed -> {
                             finishedCleanly = true
-                            latestResult = event.result
-                            updateProviderAndKeyHealth(candidate, event.result)
+                            val stampedResult = if (event.result.modelUsed.isNullOrBlank()) {
+                                event.result.copy(modelUsed = candidate.modelId)
+                            } else {
+                                event.result
+                            }
+                            latestResult = stampedResult
+                            updateProviderAndKeyHealth(candidate, stampedResult)
                             val resolved = TokenUsageAccounting.resolveUsage(
-                                reportedInputTokens = event.result.inputTokens,
-                                reportedOutputTokens = event.result.outputTokens,
-                                usageReported = event.result.usageReported,
+                                reportedInputTokens = stampedResult.inputTokens,
+                                reportedOutputTokens = stampedResult.outputTokens,
+                                usageReported = stampedResult.usageReported,
                                 promptMessages = messages,
-                                completionText = event.result.content,
-                                requestSucceeded = event.result.success
+                                completionText = stampedResult.content,
+                                requestSucceeded = stampedResult.success
                             )
                             val decision = RouterDecisionSnapshot(
                                 requestId = requestId,
@@ -399,12 +565,15 @@ class SmartRouterEngine(
                                 routingReason = reason,
                                 fallbackUsed = attempt > 1,
                                 attemptCount = attempt,
-                                latencyMs = event.result.latencyMs,
+                                latencyMs = stampedResult.latencyMs,
                                 finalStatus = if (attempt > 1) "SUCCESS (FALLBACK)" else "SUCCESS",
-                                resolvedUsage = resolved
+                                resolvedUsage = resolved,
+                                requestedModelOrAlias = requestedModelOrAlias.ifBlank { effectiveMode.name },
+                                usedDefaultModel = candidate.isCanonicalDefault,
+                                fallbackReason = triggeredFallbackReason
                             )
-                            recordDecision(decision, event.result, candidate, deviceName, endpoint, effectiveMode.name, resolved)
-                            emit(event to decision)
+                            recordDecision(decision, stampedResult, candidate, deviceName, endpoint, effectiveMode.name, resolved)
+                            emit(StreamEvent.Completed(stampedResult) to decision)
                         }
                         is StreamEvent.Failed -> {
                             latestResult = event.error
@@ -412,11 +581,13 @@ class SmartRouterEngine(
                             // Rule 7.3: Never restart mid-stream after chunks have been emitted
                             if (!event.emittedAnyChunk && event.error.retryable && i + 1 < maxAttempts) {
                                 canRetryNext = true
+                                val failCode = event.error.errorCode ?: "STREAM_FAIL"
+                                triggeredFallbackReason = "$failCode on ${candidate.displayName}/${candidate.modelId}"
                                 db.metricAndLogDao().insertLog(
                                     ActivityLogEntity(
                                         category = ActivityCategory.FALLBACK_EVENT,
                                         relatedEntity = candidate.displayName,
-                                        status = event.error.errorCode ?: "STREAM_FAIL",
+                                        status = failCode,
                                         safeMessage = "Pre-stream fallback from ${candidate.displayName}: ${event.error.safeErrorMessage}"
                                     )
                                 )
@@ -438,7 +609,10 @@ class SmartRouterEngine(
                                     attemptCount = attempt,
                                     latencyMs = event.error.latencyMs,
                                     finalStatus = "FAILED (${event.error.errorCode ?: event.error.statusCode})",
-                                    resolvedUsage = resolved
+                                    resolvedUsage = resolved,
+                                    requestedModelOrAlias = requestedModelOrAlias.ifBlank { effectiveMode.name },
+                                    usedDefaultModel = candidate.isCanonicalDefault,
+                                    fallbackReason = triggeredFallbackReason
                                 )
                                 recordDecision(decision, event.error, candidate, deviceName, endpoint, effectiveMode.name, resolved)
                                 emit(event to decision)
@@ -464,28 +638,81 @@ class SmartRouterEngine(
         requiredDocumentMimeTypes: Set<String> = emptySet(),
         nowMs: Long = System.currentTimeMillis()
     ): Pair<List<RouteCandidate>, String> {
-        val providers = db.providerDao().getAllOnce().filter { it.enabled }
-        val localServers = db.localAiServerDao().getAllOnce().filter { it.enabled }
-        val allModels = db.modelDao().getAllOnce().filter { it.enabled }
+        return resolveCandidatesWithContext(
+            requestedModelOrAlias = requestedModelOrAlias,
+            settings = settings,
+            mode = mode,
+            explicitProviderId = explicitProviderId,
+            requestContext = RoutingRequestContext(
+                requireVision = requireVision,
+                requiredDocumentMimeTypes = requiredDocumentMimeTypes
+            ),
+            nowMs = nowMs
+        )
+    }
+
+    suspend fun resolveCandidatesWithContext(
+        requestedModelOrAlias: String,
+        settings: GatewaySettingsState,
+        mode: RoutingMode,
+        explicitProviderId: String? = null,
+        requestContext: RoutingRequestContext = RoutingRequestContext(),
+        nowMs: Long = System.currentTimeMillis()
+    ): Pair<List<RouteCandidate>, String> {
+        val allProviders = db.providerDao().getAllOnce()
+        val allLocalServers = db.localAiServerDao().getAllOnce()
+        val allStoredModels = db.modelDao().getAllOnce()
         val rules = db.routingRuleDao().getAllOnce().filter { it.enabled }
         val allKeys = db.apiKeyDao().getAllOnce().filter { it.enabled }
 
-        if (mode == RoutingMode.AUTO_FREE && explicitProviderId == null) {
+        val intent = analyzeIntent(requestContext)
+        val normalizedRequest = OpenCodeSelectorIds.normalizeSelectorId(requestedModelOrAlias)
+        val isVirtualFree = normalizedRequest == OpenCodeSelectorIds.FREE ||
+            (mode == RoutingMode.AUTO_FREE && explicitProviderId == null && (normalizedRequest.isBlank() || normalizedRequest == OpenCodeSelectorIds.AUTO))
+
+        if (isVirtualFree && explicitProviderId == null) {
             return resolveAutoFreeCandidates(
-                providers = providers,
-                localServers = localServers,
-                allModels = allModels,
+                providers = allProviders.filter { it.enabled },
+                localServers = allLocalServers.filter { it.enabled },
+                allModels = allStoredModels,
                 allKeys = allKeys,
                 settings = settings,
-                requireVision = requireVision,
-                requiredDocumentMimeTypes = requiredDocumentMimeTypes,
+                intent = intent,
                 nowMs = nowMs
             )
         }
 
-        val targetAliasOrModel = requestedModelOrAlias.ifBlank { settings.defaultModelId }.trim()
+        // Handle logical selectors: auto, default, best-coding
+        if (explicitProviderId == null && (
+                normalizedRequest == OpenCodeSelectorIds.AUTO ||
+                    normalizedRequest == OpenCodeSelectorIds.DEFAULT ||
+                    normalizedRequest == OpenCodeSelectorIds.BEST_CODING
+                )
+        ) {
+            return resolveLogicalSelectorCandidates(
+                selector = normalizedRequest,
+                providers = allProviders,
+                localServers = allLocalServers,
+                allModels = allStoredModels,
+                allKeys = allKeys,
+                settings = settings,
+                mode = mode,
+                intent = intent,
+                nowMs = nowMs
+            )
+        }
+
+        val providers = allProviders.filter { it.enabled }
+        val localServers = allLocalServers.filter { it.enabled }
+        val disabledModelKeys = allStoredModels
+            .filter { !it.enabled }
+            .map { "${it.providerId}::${it.modelId.lowercase(Locale.US)}" }
+            .toSet()
+        val enabledModels = allStoredModels.filter { it.enabled }
+
+        val targetAliasOrModel = normalizedRequest.ifBlank { settings.defaultModelId.trim() }
         val matchedRule = rules.firstOrNull { it.modelAlias.equals(targetAliasOrModel, ignoreCase = true) }
-        val aliasedModels = allModels.filter {
+        val aliasedModels = enabledModels.filter {
             it.alias.equals(targetAliasOrModel, ignoreCase = true) ||
                 it.modelId.equals(targetAliasOrModel, ignoreCase = true)
         }
@@ -495,14 +722,35 @@ class SmartRouterEngine(
             aliasedModels.any { it.alias.equals(targetAliasOrModel, ignoreCase = true) }
         val isSpecificModelRequest = !isAliasRequest
 
-        // Identify which enabled & credentialed providers/local servers explicitly host targetAliasOrModel
+        // Identify canonical default so diagnostics can note it cleanly
+        val (_, canonicalDefaultRec) = OpenCodeModelCatalogResolver.resolveEligibleRecords(
+            providers = providers,
+            localServers = localServers,
+            allModels = allStoredModels,
+            allKeys = allKeys,
+            settings = settings,
+            nowMs = nowMs
+        )
+
         val matchedProviderIds = buildSet {
             aliasedModels.forEach { add(it.providerId) }
             providers.forEach { p ->
-                if (p.defaultModel.equals(targetAliasOrModel, ignoreCase = true)) add(p.id)
+                val def = p.defaultModel.trim()
+                if (def.isNotBlank() &&
+                    def.equals(targetAliasOrModel, ignoreCase = true) &&
+                    !disabledModelKeys.contains("${p.id}::${def.lowercase(Locale.US)}")
+                ) {
+                    add(p.id)
+                }
             }
             localServers.forEach { srv ->
-                if (srv.defaultModel.equals(targetAliasOrModel, ignoreCase = true)) add("local:${srv.id}")
+                val def = srv.defaultModel.trim()
+                if (def.isNotBlank() &&
+                    def.equals(targetAliasOrModel, ignoreCase = true) &&
+                    !disabledModelKeys.contains("local:${srv.id}::${def.lowercase(Locale.US)}")
+                ) {
+                    add("local:${srv.id}")
+                }
             }
         }
         val hasEligibleCatalogMatch = isSpecificModelRequest && (
@@ -514,9 +762,14 @@ class SmartRouterEngine(
             }
         )
 
-        val candidates = mutableListOf<RouteCandidate>()
+        // Strict safeguard: if user explicitly requested a disabled model in catalog and NO enabled provider/model matches, do not ghost-route it
+        if (isSpecificModelRequest && !hasEligibleCatalogMatch && explicitProviderId == null &&
+            allStoredModels.any { it.modelId.equals(targetAliasOrModel, ignoreCase = true) && !it.enabled }
+        ) {
+            return emptyList<RouteCandidate>() to "Requested model '$targetAliasOrModel' is disabled."
+        }
 
-        // Cloud providers
+        val candidates = mutableListOf<RouteCandidate>()
         for (provider in providers) {
             if (explicitProviderId != null && provider.id != explicitProviderId) continue
             if (matchedRule != null && matchedRule.allowedProviderIdsCsv.isNotBlank()) {
@@ -526,22 +779,32 @@ class SmartRouterEngine(
             if (explicitProviderId == null && hasEligibleCatalogMatch && provider.id !in matchedProviderIds) {
                 continue
             }
+            if (explicitProviderId == null &&
+                mode != RoutingMode.PRIORITY &&
+                mode != RoutingMode.MANUAL &&
+                isProviderCoolingDown(provider, nowMs)
+            ) {
+                continue
+            }
 
             val selectedKeys = selectKeysForProvider(allKeys.filter { it.providerId == provider.id })
             if (selectedKeys.isEmpty()) continue
 
-            val providerModels = allModels.filter { it.providerId == provider.id }
+            val providerModels = enabledModels.filter { it.providerId == provider.id }
             val matchedCatalogModel = aliasedModels.firstOrNull { it.providerId == provider.id }
+            val defaultAllowed = provider.defaultModel.trim().let { def ->
+                def.isNotBlank() && !disabledModelKeys.contains("${provider.id}::${def.lowercase(Locale.US)}")
+            }
             val resolvedModel = when {
                 explicitProviderId != null && isSpecificModelRequest -> matchedCatalogModel
                 isSpecificModelRequest -> matchedCatalogModel
                 else -> matchedCatalogModel
                     ?: providerModels.firstOrNull { it.isDefault }
-                    ?: provider.defaultModel.takeIf { it.isNotBlank() }?.let { defId ->
+                    ?: provider.defaultModel.takeIf { defaultAllowed }?.let { defId ->
                         providerModels.firstOrNull { it.modelId.equals(defId, ignoreCase = true) }
                     }
                     ?: providerModels.firstOrNull {
-                        it.modelType != ModelType.EMBEDDING && it.modelType != ModelType.IMAGE_GENERATION
+                        !ModelCapabilityRegistry.isNonChatModel(it.modelType, it.modelId, it.supportsChat)
                     }
                     ?: providerModels.firstOrNull()
             }
@@ -550,18 +813,25 @@ class SmartRouterEngine(
                     resolvedModel?.modelId?.ifBlank { null } ?: targetAliasOrModel
                 else ->
                     resolvedModel?.modelId?.ifBlank { null }
-                        ?: provider.defaultModel.ifBlank { null }
-                        ?: targetAliasOrModel.takeIf { it.isNotBlank() && !it.startsWith("jh-", ignoreCase = true) }
+                        ?: provider.defaultModel.takeIf { defaultAllowed }
+                        ?: targetAliasOrModel.takeIf {
+                            it.isNotBlank() && !it.startsWith("jh-", ignoreCase = true) && !OpenCodeSelectorIds.isVirtualSelector(it)
+                        }
                         ?: ""
             }
 
-            if (modelId.isBlank()) continue
+            if (modelId.isBlank() || OpenCodeSelectorIds.isVirtualSelector(modelId)) continue
+            if (explicitProviderId == null && disabledModelKeys.contains("${provider.id}::${modelId.lowercase(Locale.US)}")) {
+                continue
+            }
             val caps = ProviderAdapterRegistry.adapterFor(provider.apiFormat).capabilitiesForModel(modelId, resolvedModel)
-            if (explicitProviderId == null && !candidateSupportsAttachments(caps, requireVision, requiredDocumentMimeTypes)) {
+            if (explicitProviderId == null && !candidateSupportsAttachments(caps, intent.needsVision, intent.requiredDocMimes)) {
                 continue
             }
             val pricing = ProviderPresets.lookupPricing(modelId)
             val estCost = pricing?.let { (it.inputPer1M + it.outputPer1M) / 2.0 }
+            val codingProfile = resolvedModel?.let { ModelCapabilityRegistry.assessCodingCapability(it) }
+                ?: CodingCapabilityProfile(false, 0, "")
 
             for (key in selectedKeys) {
                 val decrypted = CryptoManager.decryptResult(key.encryptedKey).getOrNull().orEmpty()
@@ -582,7 +852,11 @@ class SmartRouterEngine(
                     capabilities = caps,
                     providerStatus = provider.status,
                     accessTier = resolvedModel?.accessTier ?: AccessTier.UNKNOWN,
-                    freeTierVerified = resolvedModel?.freeTierVerified ?: false
+                    freeTierVerified = resolvedModel?.freeTierVerified ?: false,
+                    isCanonicalDefault = canonicalDefaultRec?.providerId == provider.id &&
+                        canonicalDefaultRec.model.modelId.equals(modelId, ignoreCase = true),
+                    isCodingCapable = codingProfile.isCodingCapable,
+                    codingScore = codingProfile.tierScore
                 )
             }
         }
@@ -595,18 +869,21 @@ class SmartRouterEngine(
             if (explicitProviderId == null && hasEligibleCatalogMatch && localKey !in matchedProviderIds) {
                 continue
             }
-            val srvModels = allModels.filter { it.providerId == localKey }
+            val srvModels = enabledModels.filter { it.providerId == localKey }
             val matchedLocalModel = aliasedModels.firstOrNull { it.providerId == localKey }
+            val localDefAllowed = srv.defaultModel.trim().let { def ->
+                def.isNotBlank() && !disabledModelKeys.contains("$localKey::${def.lowercase(Locale.US)}")
+            }
             val resolvedModel = when {
                 explicitProviderId != null && isSpecificModelRequest -> matchedLocalModel
                 isSpecificModelRequest -> matchedLocalModel
                 else -> matchedLocalModel
                     ?: srvModels.firstOrNull { it.isDefault }
-                    ?: srv.defaultModel.takeIf { it.isNotBlank() }?.let { defId ->
+                    ?: srv.defaultModel.takeIf { localDefAllowed }?.let { defId ->
                         srvModels.firstOrNull { it.modelId.equals(defId, ignoreCase = true) }
                     }
                     ?: srvModels.firstOrNull {
-                        it.modelType != ModelType.EMBEDDING && it.modelType != ModelType.IMAGE_GENERATION
+                        !ModelCapabilityRegistry.isNonChatModel(it.modelType, it.modelId, it.supportsChat)
                     }
                     ?: srvModels.firstOrNull()
             }
@@ -615,16 +892,19 @@ class SmartRouterEngine(
                     resolvedModel?.modelId?.ifBlank { null } ?: targetAliasOrModel
                 else ->
                     resolvedModel?.modelId?.ifBlank { null }
-                        ?: srv.defaultModel.ifBlank { null }
+                        ?: srv.defaultModel.takeIf { localDefAllowed }
                         ?: ""
             }
-            if (modelId.isBlank()) continue
+            if (modelId.isBlank() || OpenCodeSelectorIds.isVirtualSelector(modelId)) continue
+            if (explicitProviderId == null && disabledModelKeys.contains("$localKey::${modelId.lowercase(Locale.US)}")) {
+                continue
+            }
             val authToken = if (srv.hasAuth) {
                 CryptoManager.decryptResult(srv.encryptedAuthToken).getOrNull() ?: continue
             } else ""
             val format = if (srv.engineType == LocalEngineType.OLLAMA) ApiFormat.OLLAMA else ApiFormat.OPENAI
             val localCaps = ProviderAdapterRegistry.adapterFor(format).capabilitiesForModel(modelId, resolvedModel)
-            if (explicitProviderId == null && !candidateSupportsAttachments(localCaps, requireVision, requiredDocumentMimeTypes)) {
+            if (explicitProviderId == null && !candidateSupportsAttachments(localCaps, intent.needsVision, intent.requiredDocMimes)) {
                 continue
             }
 
@@ -644,7 +924,9 @@ class SmartRouterEngine(
                 capabilities = localCaps,
                 providerStatus = srv.status,
                 accessTier = AccessTier.LOCAL,
-                freeTierVerified = false
+                freeTierVerified = false,
+                isCanonicalDefault = canonicalDefaultRec?.providerId == localKey &&
+                    canonicalDefaultRec.model.modelId.equals(modelId, ignoreCase = true)
             )
         }
 
@@ -662,9 +944,11 @@ class SmartRouterEngine(
             combinedBase.filter { it.isLocal }
         } else {
             combinedBase
-        }
+        }.distinctBy { Triple(it.id, it.keyEntityId, it.modelId.lowercase(Locale.US)) }
 
-        val baseComparator = compareBy<RouteCandidate> { it.priority }.thenBy { it.lastLatencyMs }
+        val baseComparator = compareBy<RouteCandidate> { healthRank(it.providerStatus) }
+            .thenBy { it.priority }
+            .thenBy { it.lastLatencyMs }
         val sorted = when (mode) {
             RoutingMode.MANUAL -> combined
             RoutingMode.AUTO_FREE -> combined
@@ -717,17 +1001,301 @@ class SmartRouterEngine(
         return sorted to reason
     }
 
+    private fun resolveLogicalSelectorCandidates(
+        selector: String,
+        providers: List<ProviderEntity>,
+        localServers: List<LocalAiServerEntity>,
+        allModels: List<ModelEntity>,
+        allKeys: List<ApiKeyEntity>,
+        settings: GatewaySettingsState,
+        mode: RoutingMode,
+        intent: AnalyzedIntent,
+        nowMs: Long
+    ): Pair<List<RouteCandidate>, String> {
+        val (eligibleRecords, canonicalDefaultRec) = OpenCodeModelCatalogResolver.resolveEligibleRecords(
+            providers = providers,
+            localServers = localServers,
+            allModels = allModels,
+            allKeys = allKeys,
+            settings = settings,
+            nowMs = nowMs
+        )
+
+        val enforceFreeOnly = selector == OpenCodeSelectorIds.FREE ||
+            mode == RoutingMode.AUTO_FREE ||
+            (selector == OpenCodeSelectorIds.AUTO && !settings.autoAllowPaidModels)
+
+        val providerMap = providers.associateBy { it.id }
+        val localMap = localServers.associateBy { "local:${it.id}" }
+
+        // Apply cooldown & capability & local policy & free-only gating across all eligible records
+        val gatedRecords = eligibleRecords.filter { rec ->
+            if (OpenCodeSelectorIds.isVirtualSelector(rec.model.modelId)) return@filter false
+            if (OpenCodeModelCatalogResolver.isRecordCoolingDown(rec, nowMs)) return@filter false
+            if (rec.isLocal) {
+                val srv = localMap[rec.providerId] ?: return@filter false
+                if (isLocalServerCoolingDown(srv)) return@filter false
+                if (enforceFreeOnly && !settings.autoFreeIncludeLocal) return@filter false
+            } else {
+                if (settings.localRoutingPolicy == LocalRoutingPolicy.LOCAL_ONLY) return@filter false
+                if (settings.localRoutingPolicy == LocalRoutingPolicy.LOCAL_FIRST && !settings.allowCloudFallbackForLocal) {
+                    if (eligibleRecords.any { it.isLocal }) return@filter false
+                }
+                if (enforceFreeOnly && !OpenCodeModelCatalogResolver.isVerifiedFree(rec.model, settings.autoFreeIncludeLocal, false)) {
+                    return@filter false
+                }
+            }
+            if (enforceFreeOnly && !OpenCodeModelCatalogResolver.isVerifiedFree(rec.model, settings.autoFreeIncludeLocal, rec.isLocal)) {
+                return@filter false
+            }
+            candidateSupportsIntent(rec.capabilities, intent, enforceStrictToolsAndJson = intent.needsTools || intent.needsJsonOutput)
+        }.ifEmpty {
+            // Relax strict tool/json check ONLY if no model supports optional json flag while keeping strict attachments, free-only, & cooldowns
+            if (intent.needsTools || intent.needsJsonOutput) {
+                eligibleRecords.filter { rec ->
+                    if (OpenCodeSelectorIds.isVirtualSelector(rec.model.modelId)) return@filter false
+                    if (OpenCodeModelCatalogResolver.isRecordCoolingDown(rec, nowMs)) return@filter false
+                    if (rec.isLocal && isLocalServerCoolingDown(localMap[rec.providerId] ?: return@filter false)) return@filter false
+                    if (enforceFreeOnly && !OpenCodeModelCatalogResolver.isVerifiedFree(rec.model, settings.autoFreeIncludeLocal, rec.isLocal)) {
+                        return@filter false
+                    }
+                    candidateSupportsAttachments(rec.capabilities, intent.needsVision, intent.requiredDocMimes) &&
+                        (!intent.needsTools || rec.capabilities.supportsTools)
+                }
+            } else emptyList()
+        }
+
+        if (gatedRecords.isEmpty()) {
+            val emptyReason = when {
+                selector == OpenCodeSelectorIds.BEST_CODING -> "Best Coding: no compatible eligible model available"
+                enforceFreeOnly -> "Auto (Free-Only): no verified free models available"
+                else -> "Auto: no eligible healthy models available"
+            }
+            return emptyList<RouteCandidate>() to emptyReason
+        }
+
+        val orderedRecords: List<EligibleModelRecord>
+        val reason: String
+
+        when (selector) {
+            OpenCodeSelectorIds.DEFAULT -> {
+                val hasConfiguredDefault = settings.defaultModelId.isNotBlank() ||
+                    allModels.any { it.isDefault } ||
+                    providers.any { it.enabled && it.defaultModel.isNotBlank() }
+                val defaultInPool = canonicalDefaultRec?.let { def ->
+                    gatedRecords.firstOrNull {
+                        it.providerId == def.providerId && it.model.modelId.equals(def.model.modelId, ignoreCase = true)
+                    }
+                }
+                val rankedOthers = gatedRecords
+                    .filter { rec -> defaultInPool == null || rec.providerId != defaultInPool.providerId || !rec.model.modelId.equals(defaultInPool.model.modelId, true) }
+                    .sortedWith(smartAutoComparator(settings, mode, intent, canonicalDefaultRec))
+
+                if (defaultInPool != null) {
+                    orderedRecords = listOf(defaultInPool) + rankedOthers
+                    reason = "Default Model (${defaultInPool.providerName}/${defaultInPool.model.modelId})"
+                } else {
+                    orderedRecords = rankedOthers
+                    val note = if (hasConfiguredDefault) {
+                        "Configured default unavailable/disabled; fell back to ${rankedOthers.first().providerName}/${rankedOthers.first().model.modelId}"
+                    } else {
+                        "No explicit default configured; routed via fallback to ${rankedOthers.first().providerName}/${rankedOthers.first().model.modelId}"
+                    }
+                    reason = "Default Fallback: $note"
+                }
+            }
+
+            OpenCodeSelectorIds.BEST_CODING -> {
+                val codingCapable = gatedRecords.filter { it.codingProfile.isCodingCapable }
+                    .sortedWith(
+                        compareByDescending<EligibleModelRecord> { it.codingScore }
+                            .thenBy { healthRank(it.providerStatus) }
+                            .thenBy { it.providerPriority }
+                            .thenBy { it.lastLatencyMs }
+                            .thenBy { it.model.modelId.lowercase(Locale.US) }
+                    )
+                if (codingCapable.isNotEmpty()) {
+                    val nonCodingCompatible = gatedRecords
+                        .filter { !it.codingProfile.isCodingCapable }
+                        .sortedWith(smartAutoComparator(settings, mode, intent, canonicalDefaultRec))
+                    orderedRecords = codingCapable + nonCodingCompatible
+                    val top = codingCapable.first()
+                    reason = "Best Coding: ${top.providerName}/${top.model.modelId} (${top.codingProfile.provenance}, score=${top.codingScore})"
+                } else {
+                    // No verified coding metadata found -> documented compatible general-purpose fallback
+                    orderedRecords = gatedRecords.sortedWith(smartAutoComparator(settings, mode, intent, canonicalDefaultRec))
+                    val top = orderedRecords.first()
+                    reason = "Best Coding (Documented General Fallback): ${top.providerName}/${top.model.modelId}"
+                }
+            }
+
+            else -> { // OpenCodeSelectorIds.AUTO
+                val defaultInPool = canonicalDefaultRec?.let { def ->
+                    gatedRecords.firstOrNull {
+                        it.providerId == def.providerId && it.model.modelId.equals(def.model.modelId, ignoreCase = true)
+                    }
+                }
+                val preferDefault = settings.preferConfiguredDefaultInAuto && defaultInPool != null && (
+                    !intent.isCodingIntent ||
+                        defaultInPool.codingProfile.isCodingCapable ||
+                        gatedRecords.none { it.codingProfile.isCodingCapable }
+                    )
+                val explicitLocalFirst = mode == RoutingMode.LOCAL_FIRST ||
+                    settings.localRoutingPolicy == LocalRoutingPolicy.LOCAL_FIRST
+                val explicitCloudFirst = mode == RoutingMode.CLOUD_FIRST ||
+                    settings.localRoutingPolicy == LocalRoutingPolicy.CLOUD_FIRST
+                val ranked = gatedRecords.sortedWith(
+                    compareBy<EligibleModelRecord> {
+                        when {
+                            explicitLocalFirst -> !it.isLocal
+                            explicitCloudFirst -> it.isLocal
+                            else -> false
+                        }
+                    }.thenByDescending { rec ->
+                        preferDefault && defaultInPool != null &&
+                            rec.providerId == defaultInPool.providerId &&
+                            rec.model.modelId.equals(defaultInPool.model.modelId, ignoreCase = true)
+                    }.then(smartAutoComparator(settings, mode, intent, canonicalDefaultRec))
+                )
+                orderedRecords = ranked
+                val top = ranked.first()
+                val usedDefault = defaultInPool != null &&
+                    top.providerId == defaultInPool.providerId &&
+                    top.model.modelId.equals(defaultInPool.model.modelId, ignoreCase = true)
+                reason = buildString {
+                    append("Auto (")
+                    if (enforceFreeOnly) append("free-only, ")
+                    if (usedDefault) {
+                        append("configured default")
+                    } else if (intent.isCodingIntent && top.codingProfile.isCodingCapable) {
+                        append("coding intent")
+                    } else {
+                        append(mode.name.lowercase(Locale.US))
+                    }
+                    append(") → ${top.providerName}/${top.model.modelId}")
+                }
+            }
+        }
+
+        // Expand each ordered EligibleModelRecord to RouteCandidate(s) using active provider keys
+        val expanded = mutableListOf<RouteCandidate>()
+        for (rec in orderedRecords) {
+            if (rec.isLocal) {
+                val srv = localMap[rec.providerId] ?: continue
+                val authToken = if (srv.hasAuth) {
+                    CryptoManager.decryptResult(srv.encryptedAuthToken).getOrNull() ?: continue
+                } else ""
+                expanded += RouteCandidate(
+                    id = rec.providerId,
+                    displayName = rec.providerName,
+                    baseUrl = srv.serverUrl,
+                    apiFormat = rec.apiFormat,
+                    apiKey = authToken,
+                    keyEntityId = null,
+                    customHeadersJson = "",
+                    modelId = rec.model.modelId,
+                    isLocal = true,
+                    priority = rec.providerPriority,
+                    lastLatencyMs = rec.lastLatencyMs,
+                    estimatedCostPer1M = 0.0,
+                    capabilities = rec.capabilities,
+                    providerStatus = rec.providerStatus,
+                    accessTier = AccessTier.LOCAL,
+                    freeTierVerified = false,
+                    isCanonicalDefault = canonicalDefaultRec?.providerId == rec.providerId &&
+                        canonicalDefaultRec.model.modelId.equals(rec.model.modelId, ignoreCase = true),
+                    isCodingCapable = rec.codingProfile.isCodingCapable,
+                    codingScore = rec.codingScore
+                )
+            } else {
+                val prov = providerMap[rec.providerId] ?: continue
+                val selectedKeys = selectKeysForProvider(allKeys.filter { it.providerId == prov.id })
+                for (key in selectedKeys) {
+                    val decrypted = CryptoManager.decryptResult(key.encryptedKey).getOrNull().orEmpty()
+                    if (decrypted.isBlank()) continue
+                    expanded += RouteCandidate(
+                        id = prov.id,
+                        displayName = prov.name,
+                        baseUrl = prov.baseUrl,
+                        apiFormat = prov.apiFormat,
+                        apiKey = decrypted,
+                        keyEntityId = key.id,
+                        customHeadersJson = prov.customHeadersJson,
+                        modelId = rec.model.modelId,
+                        isLocal = false,
+                        priority = prov.priority,
+                        lastLatencyMs = rec.lastLatencyMs,
+                        estimatedCostPer1M = rec.effectiveCostPer1M,
+                        capabilities = rec.capabilities,
+                        providerStatus = prov.status,
+                        accessTier = rec.model.accessTier,
+                        freeTierVerified = rec.model.freeTierVerified,
+                        isCanonicalDefault = canonicalDefaultRec?.providerId == prov.id &&
+                            canonicalDefaultRec.model.modelId.equals(rec.model.modelId, ignoreCase = true),
+                        isCodingCapable = rec.codingProfile.isCodingCapable,
+                        codingScore = rec.codingScore
+                    )
+                }
+            }
+        }
+
+        val deduped = expanded.distinctBy { Triple(it.id, it.keyEntityId, it.modelId.lowercase(Locale.US)) }
+        return deduped to reason
+    }
+
+    private fun smartAutoComparator(
+        settings: GatewaySettingsState,
+        mode: RoutingMode,
+        intent: AnalyzedIntent,
+        canonicalDefault: EligibleModelRecord?
+    ): Comparator<EligibleModelRecord> {
+        return compareBy<EligibleModelRecord> { healthRank(it.providerStatus) }
+            .thenBy {
+                when {
+                    mode == RoutingMode.LOCAL_FIRST -> !it.isLocal
+                    mode == RoutingMode.CLOUD_FIRST -> it.isLocal
+                    settings.localRoutingPolicy == LocalRoutingPolicy.CLOUD_FIRST -> it.isLocal
+                    settings.localRoutingPolicy == LocalRoutingPolicy.LOCAL_FIRST -> !it.isLocal
+                    else -> false
+                }
+            }
+            .thenByDescending {
+                if (intent.isCodingIntent && it.codingProfile.isCodingCapable) it.codingScore else 0
+            }
+            .thenByDescending { it.capabilities.supportsTools }
+            .thenBy {
+                if (mode == RoutingMode.LOWEST_COST) (it.effectiveCostPer1M ?: Double.MAX_VALUE) else 0.0
+            }
+            .thenBy {
+                if (mode == RoutingMode.LOWEST_LATENCY) it.lastLatencyMs else 0L
+            }
+            .thenByDescending {
+                canonicalDefault != null &&
+                    it.providerId == canonicalDefault.providerId &&
+                    it.model.modelId.equals(canonicalDefault.model.modelId, ignoreCase = true)
+            }
+            .thenByDescending { it.model.isDefault }
+            .thenByDescending { it.codingScore }
+            .thenBy { it.providerPriority }
+            .thenBy { it.lastLatencyMs }
+            .thenBy { it.providerName.lowercase(Locale.US) }
+            .thenBy { it.model.modelId.lowercase(Locale.US) }
+    }
+
     private fun resolveAutoFreeCandidates(
         providers: List<ProviderEntity>,
         localServers: List<LocalAiServerEntity>,
         allModels: List<ModelEntity>,
         allKeys: List<ApiKeyEntity>,
         settings: GatewaySettingsState,
-        requireVision: Boolean,
-        requiredDocumentMimeTypes: Set<String>,
+        intent: AnalyzedIntent,
         nowMs: Long
     ): Pair<List<RouteCandidate>, String> {
         val candidates = mutableListOf<RouteCandidate>()
+        val disabledModelKeys = allModels
+            .filter { !it.enabled }
+            .map { "${it.providerId}::${it.modelId.lowercase(Locale.US)}" }
+            .toSet()
 
         for (provider in providers) {
             if (isProviderCoolingDown(provider, nowMs)) continue
@@ -743,16 +1311,16 @@ class SmartRouterEngine(
                 m.providerId == provider.id &&
                     m.enabled &&
                     m.supportsChat &&
-                    m.modelType != ModelType.EMBEDDING &&
-                    m.modelType != ModelType.IMAGE_GENERATION &&
+                    !ModelCapabilityRegistry.isNonChatModel(m.modelType, m.modelId, m.supportsChat) &&
                     m.accessTier == AccessTier.FREE_TIER &&
                     m.freeTierVerified
-            }
+            }.distinctBy { it.modelId.lowercase(Locale.US) }
 
             val adapter = ProviderAdapterRegistry.adapterFor(provider.apiFormat)
             for (model in freeModels) {
                 val caps = adapter.capabilitiesForModel(model.modelId, model)
-                if (!candidateSupportsAttachments(caps, requireVision, requiredDocumentMimeTypes)) continue
+                if (!candidateSupportsAttachments(caps, intent.needsVision, intent.requiredDocMimes)) continue
+                val codingProfile = ModelCapabilityRegistry.assessCodingCapability(model)
                 candidates += RouteCandidate(
                     id = provider.id,
                     displayName = provider.name,
@@ -769,14 +1337,17 @@ class SmartRouterEngine(
                     capabilities = caps,
                     providerStatus = provider.status,
                     accessTier = model.accessTier,
-                    freeTierVerified = model.freeTierVerified
+                    freeTierVerified = model.freeTierVerified,
+                    isCanonicalDefault = model.isDefault,
+                    isCodingCapable = codingProfile.isCodingCapable,
+                    codingScore = codingProfile.tierScore
                 )
             }
         }
 
         if (settings.autoFreeIncludeLocal) {
             for (srv in localServers) {
-                if (srv.status == ProviderStatus.ERROR || srv.status == ProviderStatus.DISCONNECTED) continue
+                if (isLocalServerCoolingDown(srv)) continue
                 val localKey = "local:${srv.id}"
                 val authToken = if (srv.hasAuth) {
                     CryptoManager.decryptResult(srv.encryptedAuthToken).getOrNull() ?: continue
@@ -787,13 +1358,14 @@ class SmartRouterEngine(
                     m.providerId == localKey &&
                         m.enabled &&
                         m.supportsChat &&
-                        m.modelType != ModelType.EMBEDDING &&
-                        m.modelType != ModelType.IMAGE_GENERATION &&
+                        !ModelCapabilityRegistry.isNonChatModel(m.modelType, m.modelId, m.supportsChat) &&
                         m.accessTier == AccessTier.LOCAL
-                }
+                }.distinctBy { it.modelId.lowercase(Locale.US) }
+                val defAllowed = srv.defaultModel.isNotBlank() &&
+                    !disabledModelKeys.contains("$localKey::${srv.defaultModel.lowercase(Locale.US)}")
                 val modelsToEvaluate = if (srvModels.isNotEmpty()) {
                     srvModels
-                } else if (srv.defaultModel.isNotBlank()) {
+                } else if (defAllowed) {
                     listOf(
                         ModelEntity(
                             id = "$localKey::${srv.defaultModel}",
@@ -809,7 +1381,8 @@ class SmartRouterEngine(
 
                 for (model in modelsToEvaluate) {
                     val caps = adapter.capabilitiesForModel(model.modelId, model)
-                    if (!candidateSupportsAttachments(caps, requireVision, requiredDocumentMimeTypes)) continue
+                    if (!candidateSupportsAttachments(caps, intent.needsVision, intent.requiredDocMimes)) continue
+                    val codingProfile = ModelCapabilityRegistry.assessCodingCapability(model)
                     candidates += RouteCandidate(
                         id = localKey,
                         displayName = srv.name,
@@ -826,7 +1399,10 @@ class SmartRouterEngine(
                         capabilities = caps,
                         providerStatus = srv.status,
                         accessTier = AccessTier.LOCAL,
-                        freeTierVerified = false
+                        freeTierVerified = false,
+                        isCanonicalDefault = model.isDefault,
+                        isCodingCapable = codingProfile.isCodingCapable,
+                        codingScore = codingProfile.tierScore
                     )
                 }
             }
@@ -838,7 +1414,7 @@ class SmartRouterEngine(
                 .thenBy { it.lastLatencyMs }
                 .thenBy { it.displayName }
                 .thenBy { it.modelId }
-        )
+        ).distinctBy { Triple(it.id, it.keyEntityId, it.modelId.lowercase(Locale.US)) }
         return sorted to "Auto — Verified Free Models"
     }
 
@@ -853,11 +1429,15 @@ class SmartRouterEngine(
         val enabledProviders = db.providerDao().getAllOnce().filter { it.enabled }
         val enabledLocal = db.localAiServerDao().getAllOnce().filter { it.enabled }
         val allKeys = db.apiKeyDao().getAllOnce().filter { it.enabled }
+        val normalizedSelector = OpenCodeSelectorIds.normalizeSelectorId(requestedModelOrAlias)
+        val isFreeRestricted = normalizedSelector == OpenCodeSelectorIds.FREE ||
+            mode == RoutingMode.AUTO_FREE ||
+            (normalizedSelector == OpenCodeSelectorIds.AUTO && !settings.autoAllowPaidModels)
 
-        if (mode == RoutingMode.AUTO_FREE && explicitProviderId == null) {
+        if (isFreeRestricted && explicitProviderId == null) {
             if (requireVision || requiredDocumentMimeTypes.isNotEmpty()) {
                 val (unfiltered, _) = resolveCandidates(
-                    requestedModelOrAlias = "",
+                    requestedModelOrAlias = OpenCodeSelectorIds.FREE,
                     settings = settings,
                     mode = RoutingMode.AUTO_FREE,
                     explicitProviderId = null,
@@ -869,6 +1449,10 @@ class SmartRouterEngine(
                 }
             }
             return "No verified free models available. Configure a free-tier provider, confirm free access in Models, or pick a specific model."
+        }
+
+        if (normalizedSelector == OpenCodeSelectorIds.BEST_CODING && enabledProviders.isNotEmpty()) {
+            return "No eligible coding-capable model available with active credentials or required capabilities."
         }
 
         if (enabledProviders.isEmpty() && enabledLocal.isEmpty()) {
@@ -913,26 +1497,31 @@ class SmartRouterEngine(
     }
 
     private suspend fun updateProviderAndKeyHealth(candidate: RouteCandidate, res: ChatExecutionResult) {
+        // Non-retryable client validation/schema errors (e.g. HTTP 400 malformed request) must NOT poison healthy providers
+        val isClientMalformed = !res.success && !res.retryable && res.statusCode in 400..499 && res.statusCode != 401 && res.statusCode != 403 && res.statusCode != 429
         if (!candidate.isLocal) {
-            db.providerDao().getById(candidate.id)?.let { p ->
-                val newStatus = when {
-                    res.success -> ProviderStatus.CONNECTED
-                    res.statusCode == 429 -> ProviderStatus.RATE_LIMITED
-                    else -> ProviderStatus.ERROR
-                }
-                db.providerDao().upsert(
-                    p.copy(
-                        status = newStatus,
-                        lastLatencyMs = res.latencyMs,
-                        lastError = if (res.success) null else res.safeErrorMessage,
-                        lastCheckedAt = System.currentTimeMillis()
+            if (!isClientMalformed) {
+                db.providerDao().getById(candidate.id)?.let { p ->
+                    val newStatus = when {
+                        res.success -> ProviderStatus.CONNECTED
+                        res.statusCode == 429 -> ProviderStatus.RATE_LIMITED
+                        else -> ProviderStatus.ERROR
+                    }
+                    db.providerDao().upsert(
+                        p.copy(
+                            status = newStatus,
+                            lastLatencyMs = res.latencyMs,
+                            lastError = if (res.success) null else res.safeErrorMessage,
+                            lastCheckedAt = System.currentTimeMillis()
+                        )
                     )
-                )
+                }
             }
             candidate.keyEntityId?.let { kid ->
                 db.apiKeyDao().getAllOnce().firstOrNull { it.id == kid }?.let { k ->
                     val kStatus = when {
                         res.success -> KeyStatus.ACTIVE
+                        isClientMalformed -> k.status
                         res.statusCode == 429 -> KeyStatus.RATE_LIMITED
                         res.statusCode == 401 || res.statusCode == 403 -> KeyStatus.INVALID
                         else -> k.status
@@ -946,7 +1535,7 @@ class SmartRouterEngine(
                     )
                 }
             }
-        } else {
+        } else if (!isClientMalformed) {
             val srvId = candidate.id.removePrefix("local:")
             db.localAiServerDao().getAllOnce().firstOrNull { it.id == srvId }?.let { srv ->
                 db.localAiServerDao().upsert(
@@ -985,6 +1574,20 @@ class SmartRouterEngine(
             else -> "Unknown"
         }
 
+        val enrichedReason = buildString {
+            if (decision.requestedModelOrAlias.isNotBlank()) {
+                append("[req=")
+                append(decision.requestedModelOrAlias)
+                append("] ")
+            }
+            append(decision.routingReason)
+            if (decision.usedDefaultModel) append(" [default]")
+            decision.fallbackReason?.takeIf { it.isNotBlank() }?.let {
+                append(" | fallback: ")
+                append(it)
+            }
+        }
+
         db.metricAndLogDao().insertMetric(
             RequestMetricEntity(
                 requestId = decision.requestId,
@@ -1005,7 +1608,7 @@ class SmartRouterEngine(
                 pricingUpdatedAt = pricing?.updatedAt,
                 fallbackAttempts = (decision.attemptCount - 1).coerceAtLeast(0),
                 routingMode = routingModeName,
-                routingReason = decision.routingReason,
+                routingReason = enrichedReason,
                 errorCode = result.errorCode,
                 safeErrorMessage = result.safeErrorMessage
             )
@@ -1017,9 +1620,9 @@ class SmartRouterEngine(
                 relatedEntity = "${decision.selectedProvider} (${decision.selectedModel})",
                 status = decision.finalStatus,
                 safeMessage = if (result.success) {
-                    "$endpoint completed in ${result.latencyMs}ms (${resolvedUsage.inputTokens}+${resolvedUsage.outputTokens} tok, ${resolvedUsage.source.name})"
+                    "$endpoint completed [req=${decision.requestedModelOrAlias.ifBlank { routingModeName }} -> ${decision.selectedProvider}/${decision.selectedModel}] in ${result.latencyMs}ms (${resolvedUsage.inputTokens}+${resolvedUsage.outputTokens} tok, ${resolvedUsage.source.name})"
                 } else {
-                    "$endpoint failed: ${result.safeErrorMessage ?: result.errorCode}"
+                    "$endpoint failed [req=${decision.requestedModelOrAlias.ifBlank { routingModeName }}]: ${result.safeErrorMessage ?: result.errorCode}"
                 }
             )
         )

@@ -69,7 +69,10 @@ data class GatewaySettingsState(
     val autoCheckUpdates: Boolean = true,
     val skippedUpdateTag: String = "",
     val manualModelFallbackEnabled: Boolean = false,
-    val autoFreeIncludeLocal: Boolean = false
+    val autoFreeIncludeLocal: Boolean = false,
+    val openCodeSelectionMode: String = "auto",
+    val autoAllowPaidModels: Boolean = true,
+    val preferConfiguredDefaultInAuto: Boolean = true
 )
 
 class AppPreferences(private val context: Context) {
@@ -120,6 +123,9 @@ class AppPreferences(private val context: Context) {
         val SKIPPED_UPDATE_TAG = stringPreferencesKey("skipped_update_tag")
         val MANUAL_MODEL_FALLBACK = booleanPreferencesKey("manual_model_fallback_enabled")
         val AUTO_FREE_INCLUDE_LOCAL = booleanPreferencesKey("auto_free_include_local")
+        val OPENCODE_SELECTION_MODE = stringPreferencesKey("opencode_selection_mode")
+        val AUTO_ALLOW_PAID_MODELS = booleanPreferencesKey("auto_allow_paid_models")
+        val PREFER_CONFIGURED_DEFAULT_IN_AUTO = booleanPreferencesKey("prefer_configured_default_in_auto")
     }
 
     val settingsFlow: Flow<GatewaySettingsState> = context.dataStore.data.map { p ->
@@ -169,7 +175,10 @@ class AppPreferences(private val context: Context) {
             autoCheckUpdates = p[Keys.AUTO_CHECK_UPDATES] ?: true,
             skippedUpdateTag = p[Keys.SKIPPED_UPDATE_TAG] ?: "",
             manualModelFallbackEnabled = p[Keys.MANUAL_MODEL_FALLBACK] ?: false,
-            autoFreeIncludeLocal = p[Keys.AUTO_FREE_INCLUDE_LOCAL] ?: false
+            autoFreeIncludeLocal = p[Keys.AUTO_FREE_INCLUDE_LOCAL] ?: false,
+            openCodeSelectionMode = p[Keys.OPENCODE_SELECTION_MODE] ?: "auto",
+            autoAllowPaidModels = p[Keys.AUTO_ALLOW_PAID_MODELS] ?: true,
+            preferConfiguredDefaultInAuto = p[Keys.PREFER_CONFIGURED_DEFAULT_IN_AUTO] ?: true
         )
     }
 
@@ -292,6 +301,15 @@ class AppPreferences(private val context: Context) {
     suspend fun setAutoFreeIncludeLocal(enabled: Boolean) = context.dataStore.edit {
         it[Keys.AUTO_FREE_INCLUDE_LOCAL] = enabled
     }
+    suspend fun updateSmartAutoPreferences(
+        openCodeSelectionMode: String,
+        autoAllowPaidModels: Boolean,
+        preferConfiguredDefaultInAuto: Boolean
+    ) = context.dataStore.edit {
+        it[Keys.OPENCODE_SELECTION_MODE] = openCodeSelectionMode.trim().ifBlank { "auto" }
+        it[Keys.AUTO_ALLOW_PAID_MODELS] = autoAllowPaidModels
+        it[Keys.PREFER_CONFIGURED_DEFAULT_IN_AUTO] = preferConfiguredDefaultInAuto
+    }
 
     suspend fun restorePortablePreferences(
         snapshot: GatewaySettingsState,
@@ -337,6 +355,9 @@ class AppPreferences(private val context: Context) {
         p[Keys.AUTO_CHECK_UPDATES] = snapshot.autoCheckUpdates
         p[Keys.MANUAL_MODEL_FALLBACK] = snapshot.manualModelFallbackEnabled
         p[Keys.AUTO_FREE_INCLUDE_LOCAL] = snapshot.autoFreeIncludeLocal
+        p[Keys.OPENCODE_SELECTION_MODE] = snapshot.openCodeSelectionMode
+        p[Keys.AUTO_ALLOW_PAID_MODELS] = snapshot.autoAllowPaidModels
+        p[Keys.PREFER_CONFIGURED_DEFAULT_IN_AUTO] = snapshot.preferConfiguredDefaultInAuto
     }
 
     suspend fun resetSafeAppSettings() {
@@ -359,6 +380,9 @@ class AppPreferences(private val context: Context) {
             p[Keys.MAX_RETRIES] = 2
             p[Keys.MANUAL_MODEL_FALLBACK] = false
             p[Keys.AUTO_FREE_INCLUDE_LOCAL] = false
+            p[Keys.OPENCODE_SELECTION_MODE] = "auto"
+            p[Keys.AUTO_ALLOW_PAID_MODELS] = true
+            p[Keys.PREFER_CONFIGURED_DEFAULT_IN_AUTO] = true
         }
     }
 
@@ -382,7 +406,10 @@ class AppPreferences(private val context: Context) {
             "fallback_enabled",
             "max_retries",
             "manual_model_fallback_enabled",
-            "auto_free_include_local"
+            "auto_free_include_local",
+            "opencode_selection_mode",
+            "auto_allow_paid_models",
+            "prefer_configured_default_in_auto"
         )
 
         val PROTECTED_KEY_NAMES: Set<String> = setOf(

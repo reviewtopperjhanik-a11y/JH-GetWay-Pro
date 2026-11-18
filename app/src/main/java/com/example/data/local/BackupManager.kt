@@ -660,6 +660,9 @@ class BackupManager(
                 put("autoCheckUpdates", s.autoCheckUpdates)
                 put("manualModelFallbackEnabled", s.manualModelFallbackEnabled)
                 put("autoFreeIncludeLocal", s.autoFreeIncludeLocal)
+                put("openCodeSelectionMode", s.openCodeSelectionMode)
+                put("autoAllowPaidModels", s.autoAllowPaidModels)
+                put("preferConfiguredDefaultInAuto", s.preferConfiguredDefaultInAuto)
             })
             includedCategories += "preferences"
         }
@@ -1620,7 +1623,10 @@ class BackupManager(
                 githubUpdateRepo = o.optString("githubUpdateRepo", ""),
                 autoCheckUpdates = o.optBoolean("autoCheckUpdates", true),
                 manualModelFallbackEnabled = o.optBoolean("manualModelFallbackEnabled", false),
-                autoFreeIncludeLocal = o.optBoolean("autoFreeIncludeLocal", false)
+                autoFreeIncludeLocal = o.optBoolean("autoFreeIncludeLocal", false),
+                openCodeSelectionMode = o.optString("openCodeSelectionMode", "auto"),
+                autoAllowPaidModels = o.optBoolean("autoAllowPaidModels", true),
+                preferConfiguredDefaultInAuto = o.optBoolean("preferConfiguredDefaultInAuto", true)
             )
             val remotePlain = o.optString("gatewayRemoteAuthTokenPlain").takeIf { o.has("gatewayRemoteAuthTokenPlain") && it.isNotBlank() }
             StagedPreferences(state = state, remoteAuthTokenPlain = remotePlain)

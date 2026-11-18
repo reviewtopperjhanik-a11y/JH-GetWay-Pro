@@ -645,6 +645,18 @@ interface AppStrings {
     val updaterLastCheckedPrefix: String
     val updaterCachedReleaseBadge: String
     val updaterRetryAfterPrefix: String
+
+    // OpenCode Smart Model Selector & Auto Routing
+    val openCodeSelectorTitle: String
+    val openCodeModeAuto: String
+    val openCodeModeDefault: String
+    val openCodeModeBestCoding: String
+    val openCodeModeFree: String
+    val openCodeAllowPaidInAuto: String
+    val openCodePreferDefaultInAuto: String
+    val openCodeCuratedCountFormat: String
+    val openCodeResolvedTargetPrefix: String
+    val openCodeDefaultBadge: String
 }
 
 val LocalStrings = staticCompositionLocalOf<AppStrings> { EnglishStrings }

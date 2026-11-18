@@ -753,27 +753,37 @@ class LocalGatewayHttpServer(
         anthropicErrorFormat: Boolean = false
     ): Boolean {
         if (client.allowedModelsCsv.isBlank()) return true
-        val effectiveRequest = requestedModelOrAlias.trim().ifBlank { settings?.defaultModelId.orEmpty().trim() }
+        val rawStripped = OpenCodeSelectorIds.stripGatewayPrefix(requestedModelOrAlias)
+            .ifBlank { settings?.defaultModelId.orEmpty().trim() }
+        val normalizedSelector = OpenCodeSelectorIds.normalizeSelectorId(rawStripped)
         val models = db.modelDao().getAllOnce().filter { it.enabled }
         val matched = models.firstOrNull {
-            it.alias.equals(effectiveRequest, ignoreCase = true) ||
-                it.modelId.equals(effectiveRequest, ignoreCase = true)
+            it.alias.equals(rawStripped, ignoreCase = true) ||
+                it.modelId.equals(rawStripped, ignoreCase = true) ||
+                it.alias.equals(normalizedSelector, ignoreCase = true) ||
+                it.modelId.equals(normalizedSelector, ignoreCase = true)
         }
         val allowed = DeviceScopePolicy.isModelAllowed(
             allowedModelsCsv = client.allowedModelsCsv,
-            requestedModelOrAlias = effectiveRequest,
+            requestedModelOrAlias = rawStripped,
             resolvedModelId = matched?.modelId
-        )
+        ) || (
+            normalizedSelector != rawStripped && DeviceScopePolicy.isModelAllowed(
+                allowedModelsCsv = client.allowedModelsCsv,
+                requestedModelOrAlias = normalizedSelector,
+                resolvedModelId = matched?.modelId
+            )
+            )
         if (!allowed) {
             db.metricAndLogDao().insertLog(
                 ActivityLogEntity(
                     category = ActivityCategory.AUTH_EVENT,
                     relatedEntity = client.label,
                     status = "PERMISSION_DENIED",
-                    safeMessage = "Denied ${call.request.path()}: model '$effectiveRequest' is not in client allowlist"
+                    safeMessage = "Denied ${call.request.path()}: model '$rawStripped' is not in client allowlist"
                 )
             )
-            val errMsg = "Model '$effectiveRequest' is not permitted for ${client.label}"
+            val errMsg = "Model '$rawStripped' is not permitted for ${client.label}"
             val errBody = if (anthropicErrorFormat) {
                 GatewayApiContract.formatAnthropicError("permission_error", errMsg)
             } else {
@@ -813,65 +823,53 @@ class LocalGatewayHttpServer(
     private suspend fun handleAuthenticatedModels(call: ApplicationCall) {
         val settings = preferences.settingsFlow.first()
         val client = authenticateAndAuthorize(call, settings, DeviceScope.MODELS_READ) ?: return
-        val seenIds = linkedSetOf<String>()
+        val includeFullCatalog = call.request.queryParameters["full"]?.equals("true", ignoreCase = true) == true ||
+            call.request.queryParameters["all"]?.equals("true", ignoreCase = true) == true
+
+        val providers = db.providerDao().getAllOnce()
+        val localServers = db.localAiServerDao().getAllOnce()
+        val models = db.modelDao().getAllOnce()
+        val apiKeys = db.apiKeyDao().getAllOnce()
+        val routingRules = db.routingRuleDao().getAllOnce()
+        val codingAgent = client.codingAgentId?.let { db.codingAgentDao().getById(it) }
+
+        val curated = OpenCodeModelCatalogResolver.buildCuratedCatalog(
+            providers = providers,
+            localServers = localServers,
+            allModels = models,
+            allKeys = apiKeys,
+            routingRules = routingRules,
+            settings = settings,
+            allowedModelsCsv = client.allowedModelsCsv,
+            codingAgent = codingAgent,
+            includeAllEligible = includeFullCatalog
+        )
+
         val data = JSONArray()
-
-        fun addModelEntry(id: String, ownedBy: String) {
-            val clean = id.trim()
-            if (clean.isBlank()) return
-            if (seenIds.add(clean.lowercase())) {
-                data.put(JSONObject().apply {
-                    put("id", clean)
+        curated.entries.forEach { entry ->
+            data.put(
+                JSONObject().apply {
+                    put("id", entry.id)
                     put("object", "model")
-                    put("owned_by", ownedBy)
-                })
-            }
-        }
-
-        val enabledModels = db.modelDao().getAllOnce().filter { it.enabled }
-        enabledModels.forEach { m ->
-            val primaryId = m.alias.ifBlank { m.modelId }
-            val primaryAllowed = DeviceScopePolicy.isModelAllowed(
-                allowedModelsCsv = client.allowedModelsCsv,
-                requestedModelOrAlias = primaryId,
-                resolvedModelId = m.modelId
+                    put("owned_by", entry.ownedBy)
+                    put("name", entry.displayName)
+                    put("jh_category", entry.category)
+                    entry.providerId?.let { put("jh_provider", it) }
+                    put("jh_access_tier", entry.accessTier.name)
+                    put("jh_coding_capable", entry.isCodingCapable)
+                    put("jh_tool_call", entry.supportsTools)
+                    put("jh_default", entry.isDefault)
+                }
             )
-            if (primaryAllowed) {
-                addModelEntry(primaryId, m.providerName)
-            }
-            if (m.alias.isNotBlank() && !m.alias.equals(m.modelId, ignoreCase = true)) {
-                val rawAllowed = DeviceScopePolicy.isModelAllowed(
-                    allowedModelsCsv = client.allowedModelsCsv,
-                    requestedModelOrAlias = m.modelId,
-                    resolvedModelId = m.modelId
-                )
-                if (rawAllowed) {
-                    addModelEntry(m.modelId, m.providerName)
-                }
-            }
         }
 
-        db.routingRuleDao().getAllOnce().filter { it.enabled }.forEach { rule ->
-            val ruleAlias = rule.modelAlias.trim()
-            if (ruleAlias.isNotBlank() && DeviceScopePolicy.isModelAllowed(client.allowedModelsCsv, ruleAlias, null)) {
-                addModelEntry(ruleAlias, "jhgetway-router")
-            }
-        }
-
-        client.codingAgentId?.let { agentId ->
-            db.codingAgentDao().getById(agentId)?.let { agent ->
-                val agentPrimary = agent.modelAlias.trim()
-                if (agentPrimary.isNotBlank() && DeviceScopePolicy.isModelAllowed(client.allowedModelsCsv, agentPrimary, null)) {
-                    addModelEntry(agentPrimary, "jhgetway")
-                }
-                val agentDefault = agent.defaultModelId.trim()
-                if (agentDefault.isNotBlank() && DeviceScopePolicy.isModelAllowed(client.allowedModelsCsv, agentDefault, agentDefault)) {
-                    addModelEntry(agentDefault, "jhgetway")
-                }
-            }
-        }
-
-        respondJson(call, HttpStatusCode.OK, JSONObject().put("object", "list").put("data", data).toString())
+        val payload = JSONObject()
+            .put("object", "list")
+            .put("data", data)
+            .put("curated", !includeFullCatalog)
+            .put("total_eligible_count", curated.totalEligibleModelsCount)
+            .put("total_stored_count", curated.totalStoredModelsCount)
+        respondJson(call, HttpStatusCode.OK, payload.toString())
     }
 
     private suspend fun handleAuthenticatedChat(call: ApplicationCall) {

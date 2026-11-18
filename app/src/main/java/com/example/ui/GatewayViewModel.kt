@@ -184,6 +184,38 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
         .mapLatest { s -> router.countEligibleAutoFreeModels(s) }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0)
 
+    val openCodeCuratedCatalog: StateFlow<CuratedModelCatalog> = combine(
+        combine(providers, localServers, models) { p, l, m -> Triple(p, l, m) },
+        combine(apiKeys, routingRules, settings) { k, r, s -> Triple(k, r, s) }
+    ) { (p, l, m), (k, r, s) ->
+        OpenCodeModelCatalogResolver.buildCuratedCatalog(
+            providers = p,
+            localServers = l,
+            allModels = m,
+            allKeys = k,
+            routingRules = r,
+            settings = s
+        )
+    }.stateIn(
+        viewModelScope,
+        SharingStarted.WhileSubscribed(5000),
+        CuratedModelCatalog(
+            entries = emptyList(),
+            totalEligibleModelsCount = 0,
+            totalStoredModelsCount = 0,
+            autoAvailable = false,
+            autoResolvedTarget = null,
+            defaultAvailable = false,
+            defaultResolvedTarget = null,
+            defaultFallbackUsed = false,
+            bestCodingAvailable = false,
+            bestCodingResolvedTarget = null,
+            verifiedFreeCount = 0,
+            freeUnavailableReason = null,
+            codingUnavailableReason = null
+        )
+    )
+
     val mcpServers: StateFlow<List<McpServerEntity>> = db.mcpDao().observeServers()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
@@ -454,7 +486,8 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
         }
         if (trimmedModel.isNotBlank()) {
             val existingModels = db.modelDao().getByProvider(provider.id)
-            val shouldSetGlobalDefault = settings.value.defaultModelId.isBlank()
+            val shouldSetGlobalDefault = settings.value.defaultModelId.isBlank() ||
+                (existingId != null && existingId == settings.value.defaultProviderId)
             val matched = existingModels.firstOrNull { it.modelId == trimmedModel }
             if (matched == null) {
                 val pricing = ProviderPresets.lookupPricing(trimmedModel)
@@ -846,6 +879,18 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
     // Smart Router & Rules
     fun updateRoutingSettings(mode: RoutingMode, fallbackEnabled: Boolean, maxRetries: Int) = viewModelScope.launch {
         prefs.updateRoutingSettings(mode, fallbackEnabled, maxRetries)
+    }
+
+    fun updateSmartAutoPreferences(
+        openCodeSelectionMode: String,
+        autoAllowPaidModels: Boolean,
+        preferConfiguredDefaultInAuto: Boolean
+    ) = viewModelScope.launch {
+        prefs.updateSmartAutoPreferences(
+            openCodeSelectionMode = openCodeSelectionMode,
+            autoAllowPaidModels = autoAllowPaidModels,
+            preferConfiguredDefaultInAuto = preferConfiguredDefaultInAuto
+        )
     }
 
     fun saveRoutingRule(rule: RoutingRuleEntity) = viewModelScope.launch {

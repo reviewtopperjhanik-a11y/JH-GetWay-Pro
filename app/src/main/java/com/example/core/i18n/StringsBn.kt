@@ -611,4 +611,15 @@ object BengaliStrings : AppStrings {
     override val updaterLastCheckedPrefix = "সর্বশেষ যাচাই"
     override val updaterCachedReleaseBadge = "ক্যাশড রিলিজ"
     override val updaterRetryAfterPrefix = "পুনরায় চেষ্টার সময়"
+
+    override val openCodeSelectorTitle = "OpenCode স্মার্ট মডেল সিলেক্টর"
+    override val openCodeModeAuto = "অটো"
+    override val openCodeModeDefault = "ডিফল্ট মডেল"
+    override val openCodeModeBestCoding = "সেরা কোডিং"
+    override val openCodeModeFree = "ফ্রি মডেল"
+    override val openCodeAllowPaidInAuto = "অটো মোডে পেইড মডেল অনুমোদন"
+    override val openCodePreferDefaultInAuto = "অটো মোডে ডিফল্ট মডেল অগ্রাধিকার"
+    override val openCodeCuratedCountFormat = "কিউরেটেড OpenCode তালিকা (%d প্রদর্শিত / %d উপযুক্ত / %d সংরক্ষিত)"
+    override val openCodeResolvedTargetPrefix = "নির্বাচিত টার্গেট"
+    override val openCodeDefaultBadge = "ডিফল্ট"
 }

@@ -36,6 +36,7 @@ fun CodingAgentsScreen(viewModel: GatewayViewModel) {
     val runtime by viewModel.gatewayRuntime.collectAsState()
     val settings by viewModel.settings.collectAsState()
     val agentStatuses by viewModel.agentConnectionStatuses.collectAsState()
+    val curatedCatalog by viewModel.openCodeCuratedCatalog.collectAsState()
     val clipboard = LocalClipboardManager.current
 
     val endpointResolution = remember(settings, runtime) {
@@ -146,11 +147,12 @@ fun CodingAgentsScreen(viewModel: GatewayViewModel) {
                     val resolvedModelId = remember(agent, settings) {
                         com.example.gateway.CodingAgentConfigBuilder.resolveAgentModelId(agent, settings)
                     }
-                    val previewSnippet = remember(agent, endpointResolution.baseV1Url, settings) {
+                    val previewSnippet = remember(agent, endpointResolution.baseV1Url, settings, curatedCatalog) {
                         com.example.gateway.CodingAgentConfigBuilder.buildPreviewSnippet(
                             agent = agent,
                             baseV1Url = endpointResolution.baseV1Url,
-                            settings = settings
+                            settings = settings,
+                            curatedCatalog = if (agent.agentType == CodingAgentType.OPENCODE) curatedCatalog else null
                         )
                     }
                     val testStatus = agentStatuses[agent.id]
@@ -212,6 +214,38 @@ fun CodingAgentsScreen(viewModel: GatewayViewModel) {
                         )
                         if (agent.allowedModelsCsv.isNotBlank()) {
                             Text("${s.allowedModelsShortLabel}: ${agent.allowedModelsCsv}", style = MonoTextStyle, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        if (agent.agentType == CodingAgentType.OPENCODE) {
+                            Spacer(Modifier.height(6.dp))
+                            Text(
+                                text = String.format(
+                                    s.openCodeCuratedCountFormat,
+                                    curatedCatalog.entries.size,
+                                    curatedCatalog.totalEligibleModelsCount,
+                                    curatedCatalog.totalStoredModelsCount
+                                ),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Spacer(Modifier.height(4.dp))
+                            FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                StatusPill(
+                                    text = "${s.openCodeModeAuto}: ${if (curatedCatalog.autoAvailable) s.enabled else s.offline}",
+                                    tone = if (curatedCatalog.autoAvailable) StatusTone.INFO else StatusTone.WARNING
+                                )
+                                StatusPill(
+                                    text = "${s.openCodeModeDefault}: ${if (curatedCatalog.defaultAvailable) s.enabled else s.offline}",
+                                    tone = if (curatedCatalog.defaultAvailable) StatusTone.SUCCESS else StatusTone.NEUTRAL
+                                )
+                                StatusPill(
+                                    text = "${s.openCodeModeBestCoding}: ${if (curatedCatalog.bestCodingAvailable) s.enabled else s.offline}",
+                                    tone = if (curatedCatalog.bestCodingAvailable) StatusTone.INFO else StatusTone.NEUTRAL
+                                )
+                                StatusPill(
+                                    text = "${s.openCodeModeFree}: ${curatedCatalog.verifiedFreeCount}",
+                                    tone = if (curatedCatalog.verifiedFreeCount > 0) StatusTone.SUCCESS else StatusTone.WARNING
+                                )
+                            }
                         }
 
                         if (testStatus != null) {
@@ -296,7 +330,8 @@ fun CodingAgentsScreen(viewModel: GatewayViewModel) {
                                                 agent = agent,
                                                 baseV1Url = endpointResolution.baseV1Url,
                                                 decryptedToken = plainTok,
-                                                settings = settings
+                                                settings = settings,
+                                                curatedCatalog = if (agent.agentType == CodingAgentType.OPENCODE) curatedCatalog else null
                                             )
                                             clipboard.setText(AnnotatedString(configSnippet))
                                             viewModel.postBanner(s.copied)
@@ -407,7 +442,11 @@ fun CodingAgentsScreen(viewModel: GatewayViewModel) {
     if (showDialog) {
         var name by remember { mutableStateOf(editingAgent?.name ?: "OpenCode Local") }
         var type by remember { mutableStateOf(editingAgent?.agentType ?: CodingAgentType.OPENCODE) }
-        var alias by remember { mutableStateOf(editingAgent?.modelAlias ?: "jh-coder") }
+        var alias by remember {
+            mutableStateOf(
+                editingAgent?.modelAlias ?: com.example.gateway.OpenCodeSelectorIds.normalizeSelectorId(settings.openCodeSelectionMode)
+            )
+        }
         var allowedModelsCsv by remember { mutableStateOf(editingAgent?.allowedModelsCsv.orEmpty()) }
         var streaming by remember { mutableStateOf(editingAgent?.streaming ?: true) }
         var toolCalling by remember { mutableStateOf(editingAgent?.toolCalling ?: true) }
@@ -420,11 +459,42 @@ fun CodingAgentsScreen(viewModel: GatewayViewModel) {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         items(CodingAgentType.entries) { t ->
-                            FilterChip(selected = type == t, onClick = { type = t; if (editingAgent == null) name = t.name }, label = { Text(t.name) })
+                            FilterChip(
+                                selected = type == t,
+                                onClick = {
+                                    type = t
+                                    if (editingAgent == null) {
+                                        name = t.name
+                                        if (t == CodingAgentType.OPENCODE && (alias == "jh-coder" || alias.isBlank())) {
+                                            alias = com.example.gateway.OpenCodeSelectorIds.AUTO
+                                        }
+                                    }
+                                },
+                                label = { Text(t.name) }
+                            )
                         }
                     }
                     OutlinedTextField(value = name, onValueChange = { name = it }, label = { Text(s.agentName) }, singleLine = true, modifier = Modifier.fillMaxWidth().testTag("agent_dialog_name_input"))
                     OutlinedTextField(value = alias, onValueChange = { alias = it }, label = { Text(s.modelOrAliasLabel) }, textStyle = MonoTextStyle, singleLine = true, modifier = Modifier.fillMaxWidth().testTag("agent_dialog_alias_input"))
+                    if (type == CodingAgentType.OPENCODE) {
+                        LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            items(
+                                listOf(
+                                    com.example.gateway.OpenCodeSelectorIds.AUTO,
+                                    com.example.gateway.OpenCodeSelectorIds.DEFAULT,
+                                    com.example.gateway.OpenCodeSelectorIds.BEST_CODING,
+                                    com.example.gateway.OpenCodeSelectorIds.FREE,
+                                    "jh-coder"
+                                )
+                            ) { quickSel ->
+                                FilterChip(
+                                    selected = alias.equals(quickSel, ignoreCase = true),
+                                    onClick = { alias = quickSel },
+                                    label = { Text(quickSel, style = MonoTextStyle) }
+                                )
+                            }
+                        }
+                    }
                     OutlinedTextField(value = allowedModelsCsv, onValueChange = { allowedModelsCsv = it }, label = { Text(s.modelAllowlistLabel) }, placeholder = { Text(s.modelAllowlistHint) }, textStyle = MonoTextStyle, singleLine = true, modifier = Modifier.fillMaxWidth().testTag("agent_dialog_allowlist_input"))
                     OutlinedTextField(value = limitText, onValueChange = { limitText = it.filter { c -> c.isDigit() } }, label = { Text("${s.dailyTokenLimit} (${s.optional})") }, singleLine = true, modifier = Modifier.fillMaxWidth().testTag("agent_dialog_limit_input"))
                     Row(verticalAlignment = Alignment.CenterVertically) {

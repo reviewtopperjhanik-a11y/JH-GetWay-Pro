@@ -170,17 +170,19 @@ object CodingAgentConfigBuilder {
     }
 
     fun resolveAgentModelId(agent: CodingAgentEntity, settings: GatewaySettingsState): String {
-        return agent.modelAlias.trim()
-            .ifBlank { agent.defaultModelId.trim() }
+        val raw = OpenCodeSelectorIds.stripGatewayPrefix(agent.modelAlias)
+            .ifBlank { OpenCodeSelectorIds.stripGatewayPrefix(agent.defaultModelId) }
+            .ifBlank { OpenCodeSelectorIds.stripGatewayPrefix(settings.openCodeSelectionMode) }
             .ifBlank { settings.defaultModelId.trim() }
-            .ifBlank { "jh-coder" }
+            .ifBlank { OpenCodeSelectorIds.AUTO }
+        return OpenCodeSelectorIds.normalizeSelectorId(raw)
     }
 
     fun collectAgentModelIds(agent: CodingAgentEntity, settings: GatewaySettingsState): List<String> {
         val primary = resolveAgentModelId(agent, settings)
         val extra = agent.allowedModelsCsv
             .split(",", ";", "\n")
-            .map { it.trim() }
+            .map { OpenCodeSelectorIds.normalizeSelectorId(it) }
             .filter { it.isNotEmpty() && it != "*" }
         return (listOf(primary) + extra).distinct()
     }
@@ -189,19 +191,80 @@ object CodingAgentConfigBuilder {
         agent: CodingAgentEntity,
         baseV1Url: String,
         apiKeyValue: String,
-        settings: GatewaySettingsState
+        settings: GatewaySettingsState,
+        curatedCatalog: CuratedModelCatalog? = null
     ): String {
         val primaryModel = resolveAgentModelId(agent, settings)
-        val allModels = collectAgentModelIds(agent, settings)
         val modelsObj = JSONObject()
-        allModels.forEach { modelId ->
-            modelsObj.put(
-                modelId,
-                JSONObject()
-                    .put("name", modelId)
-                    .put("tool_call", agent.toolCalling)
-            )
+
+        fun putModelMeta(
+            modelId: String,
+            displayName: String = modelId,
+            toolCall: Boolean = agent.toolCalling,
+            attachment: Boolean = false,
+            contextLimit: Int? = null
+        ) {
+            val clean = modelId.trim()
+            if (clean.isBlank() || modelsObj.has(clean)) return
+            val obj = JSONObject()
+                .put("name", displayName.ifBlank { clean })
+                .put("tool_call", toolCall)
+            if (attachment) {
+                obj.put("attachment", true)
+            }
+            if (contextLimit != null && contextLimit > 0) {
+                obj.put("limit", JSONObject().put("context", contextLimit))
+            }
+            modelsObj.put(clean, obj)
         }
+
+        if (curatedCatalog != null) {
+            val allowlistRestricted = agent.allowedModelsCsv.isNotBlank() && agent.allowedModelsCsv.trim() != "*"
+            curatedCatalog.entries.forEach { entry ->
+                val resolvedReal = if (entry.category == "selector" || entry.category == "alias") null else entry.resolvedUpstreamModelId ?: entry.id
+                val allowed = !allowlistRestricted || com.example.core.security.DeviceScopePolicy.isModelAllowed(
+                    allowedModelsCsv = agent.allowedModelsCsv,
+                    requestedModelOrAlias = entry.id,
+                    resolvedModelId = resolvedReal
+                )
+                if (allowed) {
+                    putModelMeta(
+                        modelId = entry.id,
+                        displayName = entry.displayName,
+                        toolCall = agent.toolCalling && entry.supportsTools,
+                        attachment = entry.supportsVision,
+                        contextLimit = entry.contextWindow
+                    )
+                }
+            }
+            collectAgentModelIds(agent, settings).forEach { explicitId ->
+                putModelMeta(modelId = explicitId)
+            }
+        } else {
+            val isUnrestricted = agent.allowedModelsCsv.isBlank() || agent.allowedModelsCsv.trim() == "*"
+            val collected = collectAgentModelIds(agent, settings)
+            if (isUnrestricted) {
+                listOf(
+                    OpenCodeSelectorIds.AUTO,
+                    OpenCodeSelectorIds.DEFAULT,
+                    OpenCodeSelectorIds.BEST_CODING,
+                    OpenCodeSelectorIds.FREE
+                ).forEach { sel ->
+                    putModelMeta(
+                        modelId = sel,
+                        displayName = OpenCodeSelectorIds.displayTitleForSelector(sel)
+                    )
+                }
+            }
+            collected.forEach { modelId ->
+                putModelMeta(modelId = modelId)
+            }
+            val globalDefault = settings.defaultModelId.trim()
+            if (isUnrestricted && globalDefault.isNotBlank()) {
+                putModelMeta(modelId = globalDefault)
+            }
+        }
+
         val jhGetWayProvider = JSONObject()
             .put("npm", "@ai-sdk/openai-compatible")
             .put("name", "JH GetWay")
@@ -250,7 +313,8 @@ object CodingAgentConfigBuilder {
     fun buildPreviewSnippet(
         agent: CodingAgentEntity,
         baseV1Url: String,
-        settings: GatewaySettingsState
+        settings: GatewaySettingsState,
+        curatedCatalog: CuratedModelCatalog? = null
     ): String {
         val resolvedBase = baseV1Url.ifBlank { "<gateway-url-not-configured>/v1" }
         val modelId = resolveAgentModelId(agent, settings)
@@ -259,7 +323,8 @@ object CodingAgentConfigBuilder {
                 agent = agent,
                 baseV1Url = resolvedBase,
                 apiKeyValue = agent.tokenPreview.ifBlank { "{env:JH_GETWAY_API_KEY}" },
-                settings = settings
+                settings = settings,
+                curatedCatalog = curatedCatalog
             )
 
             CodingAgentType.CODEX -> buildString {
@@ -299,11 +364,18 @@ object CodingAgentConfigBuilder {
         agent: CodingAgentEntity,
         baseV1Url: String,
         decryptedToken: String,
-        settings: GatewaySettingsState
+        settings: GatewaySettingsState,
+        curatedCatalog: CuratedModelCatalog? = null
     ): String {
         val modelId = resolveAgentModelId(agent, settings)
         return when (agent.agentType) {
-            CodingAgentType.OPENCODE -> buildOpenCodeConfigJson(agent, baseV1Url, decryptedToken, settings)
+            CodingAgentType.OPENCODE -> buildOpenCodeConfigJson(
+                agent = agent,
+                baseV1Url = baseV1Url,
+                apiKeyValue = decryptedToken,
+                settings = settings,
+                curatedCatalog = curatedCatalog
+            )
             CodingAgentType.CODEX -> buildCodexConfigToml(agent, baseV1Url, settings)
             CodingAgentType.CLINE -> """
                 API Provider: OpenAI Compatible
