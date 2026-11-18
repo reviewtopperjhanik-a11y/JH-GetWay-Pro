@@ -444,7 +444,7 @@ fun CodingAgentsScreen(viewModel: GatewayViewModel) {
         var type by remember { mutableStateOf(editingAgent?.agentType ?: CodingAgentType.OPENCODE) }
         var alias by remember {
             mutableStateOf(
-                editingAgent?.modelAlias ?: com.example.gateway.OpenCodeSelectorIds.normalizeSelectorId(settings.openCodeSelectionMode)
+                editingAgent?.modelAlias ?: com.example.gateway.OpenCodeSelectorIds.STABLE_AUTO_ID
             )
         }
         var allowedModelsCsv by remember { mutableStateOf(editingAgent?.allowedModelsCsv.orEmpty()) }
@@ -465,8 +465,8 @@ fun CodingAgentsScreen(viewModel: GatewayViewModel) {
                                     type = t
                                     if (editingAgent == null) {
                                         name = t.name
-                                        if (t == CodingAgentType.OPENCODE && (alias == "jh-coder" || alias.isBlank())) {
-                                            alias = com.example.gateway.OpenCodeSelectorIds.AUTO
+                                        if (t == CodingAgentType.OPENCODE && (alias == "jh-coder" || alias.isBlank() || alias == "auto")) {
+                                            alias = com.example.gateway.OpenCodeSelectorIds.STABLE_AUTO_ID
                                         }
                                     }
                                 },
@@ -480,10 +480,7 @@ fun CodingAgentsScreen(viewModel: GatewayViewModel) {
                         LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                             items(
                                 listOf(
-                                    com.example.gateway.OpenCodeSelectorIds.AUTO,
-                                    com.example.gateway.OpenCodeSelectorIds.DEFAULT,
-                                    com.example.gateway.OpenCodeSelectorIds.BEST_CODING,
-                                    com.example.gateway.OpenCodeSelectorIds.FREE,
+                                    com.example.gateway.OpenCodeSelectorIds.STABLE_AUTO_ID,
                                     "jh-coder"
                                 )
                             ) { quickSel ->

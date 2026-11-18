@@ -30,24 +30,29 @@ object OpenCodeSelectorIds {
     const val BEST_CODING = "best-coding"
     const val FREE = "free"
 
+    const val STABLE_AUTO_ID = "jh-getway/auto"
+    const val DISPLAY_NAME_AUTO = "JH GetWay Auto"
+    const val DISPLAY_PROVIDER_NAME = "JH GetWay"
+    const val DISPLAY_DESCRIPTION_AUTO = "Automatically selects the best available model with fallback."
+
     val ALL_VIRTUAL: Set<String> = setOf(AUTO, DEFAULT, BEST_CODING, FREE)
 
     fun stripGatewayPrefix(raw: String): String {
         val trimmed = raw.trim()
-        return if (trimmed.startsWith("jhgetway/", ignoreCase = true)) {
-            trimmed.substring("jhgetway/".length).trim()
-        } else {
-            trimmed
+        return when {
+            trimmed.startsWith("jhgetway/", ignoreCase = true) ->
+                trimmed.substring("jhgetway/".length).trim()
+            else -> trimmed
         }
     }
 
     fun normalizeSelectorId(raw: String): String {
         val stripped = stripGatewayPrefix(raw)
         return when (stripped.lowercase(Locale.US)) {
-            "auto", "auto-smart", "jhgetway-auto", "jh-auto" -> AUTO
-            "default", "default-model", "jhgetway-default", "jh-default" -> DEFAULT
-            "best-coding", "best_coding", "best-code", "jhgetway-best-coding" -> BEST_CODING
-            "free", "free-models", "auto-free", "auto_free", "jhgetway-free", "jh-free" -> FREE
+            "auto", "auto-smart", "jhgetway-auto", "jh-auto", "jh-getway/auto", "jhgetway/auto" -> AUTO
+            "default", "default-model", "jhgetway-default", "jh-default", "jh-getway/default" -> DEFAULT
+            "best-coding", "best_coding", "best-code", "jhgetway-best-coding", "jh-getway/best-coding" -> BEST_CODING
+            "free", "free-models", "auto-free", "auto_free", "jhgetway-free", "jh-free", "jh-getway/free" -> FREE
             else -> stripped
         }
     }
@@ -56,7 +61,7 @@ object OpenCodeSelectorIds {
         normalizeSelectorId(raw).lowercase(Locale.US) in ALL_VIRTUAL
 
     fun displayTitleForSelector(selectorId: String): String = when (normalizeSelectorId(selectorId)) {
-        AUTO -> "Auto — Smart routing by JH GetWay"
+        AUTO -> DISPLAY_NAME_AUTO
         DEFAULT -> "Default Model — Your configured default"
         BEST_CODING -> "Best Coding — Best eligible coding model"
         FREE -> "Free Models — Verified free models"
@@ -64,7 +69,7 @@ object OpenCodeSelectorIds {
     }
 
     fun descriptionForSelector(selectorId: String): String = when (normalizeSelectorId(selectorId)) {
-        AUTO -> "Chooses the best eligible model per request from preferences, capabilities, and availability."
+        AUTO -> DISPLAY_DESCRIPTION_AUTO
         DEFAULT -> "Routes to the canonical default model configured in provider or gateway settings."
         BEST_CODING -> "Selects the highest-ranked eligible coding-capable model."
         FREE -> "Restricts selection strictly to verified free or explicitly allowed local models."
@@ -607,13 +612,6 @@ object OpenCodeModelCatalogResolver {
             )
 
         val generalRanked = autoEligiblePool.sortedWith(rankComparator(nowMs, settings))
-        val effectiveAutoDefault = when {
-            canonicalDefault != null &&
-                (!freeOnlyAuto || isVerifiedFree(canonicalDefault.model, settings.autoFreeIncludeLocal, canonicalDefault.isLocal)) &&
-                !isRecordCoolingDown(canonicalDefault, nowMs) -> canonicalDefault
-            else -> generalRanked.firstOrNull()
-        }
-
         val hasExplicitConfiguredDefault = settings.defaultModelId.isNotBlank() ||
             allModels.any { it.isDefault } ||
             providers.any { it.enabled && it.defaultModel.isNotBlank() }
@@ -621,6 +619,20 @@ object OpenCodeModelCatalogResolver {
         val defaultFallbackUsed = hasExplicitConfiguredDefault &&
             defaultResolved != null &&
             defaultResolved != canonicalDefault
+
+        val activePolicy = OpenCodeSelectorIds.normalizeSelectorId(settings.openCodeSelectionMode)
+        val effectiveAutoDefault = when (activePolicy) {
+            OpenCodeSelectorIds.DEFAULT -> canonicalDefault ?: generalRanked.firstOrNull()
+            OpenCodeSelectorIds.BEST_CODING -> codingRecords.firstOrNull() ?: canonicalDefault ?: generalRanked.firstOrNull()
+            OpenCodeSelectorIds.FREE -> verifiedFreeRecords.firstOrNull()
+            else -> when {
+                settings.preferConfiguredDefaultInAuto &&
+                    canonicalDefault != null &&
+                    (!freeOnlyAuto || isVerifiedFree(canonicalDefault.model, settings.autoFreeIncludeLocal, canonicalDefault.isLocal)) &&
+                    !isRecordCoolingDown(canonicalDefault, nowMs) -> canonicalDefault
+                else -> generalRanked.firstOrNull()
+            }
+        }
 
         val entries = mutableListOf<CuratedModelEntry>()
         val seenIds = linkedSetOf<String>()
@@ -639,119 +651,47 @@ object OpenCodeModelCatalogResolver {
             }
         }
 
-        // 1. Logical smart selector modes (only exposed when resolvable)
-        if (autoEligiblePool.isNotEmpty()) {
-            tryAddEntry(
-                CuratedModelEntry(
-                    id = OpenCodeSelectorIds.AUTO,
-                    displayName = OpenCodeSelectorIds.displayTitleForSelector(OpenCodeSelectorIds.AUTO),
-                    ownedBy = "jhgetway-selector",
-                    category = "selector",
-                    providerId = effectiveAutoDefault?.providerId,
-                    resolvedUpstreamModelId = effectiveAutoDefault?.model?.modelId,
-                    supportsTools = effectiveAutoDefault?.capabilities?.supportsTools ?: true,
-                    supportsVision = effectiveAutoDefault?.capabilities?.supportsVision ?: false,
-                    supportsStreaming = true,
-                    contextWindow = effectiveAutoDefault?.let { ModelCapabilityRegistry.effectiveContextWindow(it.model) },
-                    accessTier = effectiveAutoDefault?.model?.accessTier ?: AccessTier.UNKNOWN,
-                    freeTierVerified = effectiveAutoDefault?.model?.freeTierVerified ?: false,
-                    description = OpenCodeSelectorIds.descriptionForSelector(OpenCodeSelectorIds.AUTO)
-                ),
-                resolvedRealIdForAllowlist = null
-            )
+        val hasExplicitAllowlist = allowedModelsCsv.isNotBlank() && allowedModelsCsv.trim() != "*"
+
+        // 1. Primary Gateway-owned Auto entry ("jh-getway/auto") — single entry shown by default in OpenCode
+        val stableAutoEntry = CuratedModelEntry(
+            id = OpenCodeSelectorIds.STABLE_AUTO_ID,
+            displayName = OpenCodeSelectorIds.DISPLAY_NAME_AUTO,
+            ownedBy = OpenCodeSelectorIds.DISPLAY_PROVIDER_NAME,
+            category = "selector",
+            providerId = effectiveAutoDefault?.providerId,
+            resolvedUpstreamModelId = effectiveAutoDefault?.model?.modelId,
+            supportsTools = effectiveAutoDefault?.capabilities?.supportsTools ?: true,
+            supportsVision = autoEligiblePool.any { it.capabilities.supportsVision },
+            supportsStreaming = true,
+            contextWindow = effectiveAutoDefault?.let { ModelCapabilityRegistry.effectiveContextWindow(it.model) } ?: 128_000,
+            accessTier = effectiveAutoDefault?.model?.accessTier ?: AccessTier.UNKNOWN,
+            freeTierVerified = effectiveAutoDefault?.model?.freeTierVerified ?: false,
+            isCodingCapable = effectiveAutoDefault?.codingProfile?.isCodingCapable ?: codingRecords.isNotEmpty(),
+            isDefault = true,
+            description = OpenCodeSelectorIds.DISPLAY_DESCRIPTION_AUTO
+        )
+
+        if (!hasExplicitAllowlist || DeviceScopePolicy.isModelAllowed(allowedModelsCsv, OpenCodeSelectorIds.STABLE_AUTO_ID, null)) {
+            tryAddEntry(stableAutoEntry, resolvedRealIdForAllowlist = null)
         }
 
-        if (defaultResolved != null) {
-            tryAddEntry(
-                CuratedModelEntry(
-                    id = OpenCodeSelectorIds.DEFAULT,
-                    displayName = "Default Model — ${defaultResolved.providerName} / ${defaultResolved.model.modelId}",
-                    ownedBy = "jhgetway-selector",
-                    category = "selector",
-                    providerId = defaultResolved.providerId,
-                    resolvedUpstreamModelId = defaultResolved.model.modelId,
-                    supportsTools = defaultResolved.capabilities.supportsTools,
-                    supportsVision = defaultResolved.capabilities.supportsVision,
-                    supportsStreaming = defaultResolved.capabilities.supportsStreaming,
-                    contextWindow = ModelCapabilityRegistry.effectiveContextWindow(defaultResolved.model),
-                    accessTier = defaultResolved.model.accessTier,
-                    freeTierVerified = defaultResolved.model.freeTierVerified,
-                    isCodingCapable = defaultResolved.codingProfile.isCodingCapable,
-                    isDefault = true,
-                    description = OpenCodeSelectorIds.descriptionForSelector(OpenCodeSelectorIds.DEFAULT)
-                ),
-                resolvedRealIdForAllowlist = null
-            )
-        }
+        // 2. Expose upstream / allowlisted models ONLY when:
+        //    (a) explicitly opted-in via includeAllEligible = true (?full=true / ?all=true / ?manual=true), OR
+        //    (b) the client device/agent uses an explicit restricted model allowlist (legacy backward compatibility).
+        if (includeAllEligible || hasExplicitAllowlist) {
+            val recordsToExpose = if (includeAllEligible) {
+                eligible.sortedWith(rankComparator(nowMs, settings))
+            } else {
+                val allowedTokens = DeviceScopePolicy.parseAllowedModels(allowedModelsCsv)
+                eligible.filter { rec ->
+                    val rawId = rec.model.modelId.trim()
+                    val alias = rec.model.alias.trim()
+                    allowedTokens.any { it.equals(rawId, true) || (alias.isNotBlank() && it.equals(alias, true)) }
+                }.sortedWith(rankComparator(nowMs, settings))
+            }
 
-        codingRecords.firstOrNull()?.let { topCoding ->
-            tryAddEntry(
-                CuratedModelEntry(
-                    id = OpenCodeSelectorIds.BEST_CODING,
-                    displayName = "Best Coding — ${topCoding.providerName} / ${topCoding.model.modelId}",
-                    ownedBy = "jhgetway-selector",
-                    category = "selector",
-                    providerId = topCoding.providerId,
-                    resolvedUpstreamModelId = topCoding.model.modelId,
-                    supportsTools = topCoding.capabilities.supportsTools,
-                    supportsVision = topCoding.capabilities.supportsVision,
-                    supportsStreaming = topCoding.capabilities.supportsStreaming,
-                    contextWindow = ModelCapabilityRegistry.effectiveContextWindow(topCoding.model),
-                    accessTier = topCoding.model.accessTier,
-                    freeTierVerified = topCoding.model.freeTierVerified,
-                    isCodingCapable = true,
-                    description = OpenCodeSelectorIds.descriptionForSelector(OpenCodeSelectorIds.BEST_CODING)
-                ),
-                resolvedRealIdForAllowlist = null
-            )
-        }
-
-        if (verifiedFreeRecords.isNotEmpty()) {
-            val topFree = verifiedFreeRecords.first()
-            tryAddEntry(
-                CuratedModelEntry(
-                    id = OpenCodeSelectorIds.FREE,
-                    displayName = "Free Models (${verifiedFreeRecords.size} verified)",
-                    ownedBy = "jhgetway-selector",
-                    category = "selector",
-                    providerId = topFree.providerId,
-                    resolvedUpstreamModelId = topFree.model.modelId,
-                    supportsTools = topFree.capabilities.supportsTools,
-                    supportsVision = topFree.capabilities.supportsVision,
-                    supportsStreaming = topFree.capabilities.supportsStreaming,
-                    contextWindow = ModelCapabilityRegistry.effectiveContextWindow(topFree.model),
-                    accessTier = topFree.model.accessTier,
-                    freeTierVerified = true,
-                    isCodingCapable = topFree.codingProfile.isCodingCapable,
-                    description = OpenCodeSelectorIds.descriptionForSelector(OpenCodeSelectorIds.FREE)
-                ),
-                resolvedRealIdForAllowlist = null
-            )
-        }
-
-        // 2. Curated Recommended Models (never dump 500+ raw rows unless includeAllEligible = true)
-        val recommendedRecords = if (includeAllEligible) {
-            eligible.sortedWith(rankComparator(nowMs, settings))
-        } else {
-            selectRecommendedRecords(
-                eligible = eligible,
-                canonicalDefault = defaultResolved,
-                topCoding = codingRecords,
-                topFree = verifiedFreeRecords,
-                nowMs = nowMs,
-                settings = settings
-            )
-        }
-
-        recommendedRecords
-            .sortedWith(
-                compareBy<EligibleModelRecord> { it.providerPriority }
-                    .thenBy { it.providerName.lowercase(Locale.US) }
-                    .thenByDescending { it == canonicalDefault }
-                    .thenByDescending { it.codingScore }
-                    .thenBy { it.model.modelId.lowercase(Locale.US) }
-            )
-            .forEach { rec ->
+            recordsToExpose.forEach { rec ->
                 val rawId = rec.model.modelId.trim()
                 val label = "${rec.providerName} / ${rec.model.displayName.ifBlank { rawId }}"
                 tryAddEntry(
@@ -796,82 +736,38 @@ object OpenCodeModelCatalogResolver {
                 }
             }
 
-        // If client has explicit allowedModelsCsv listing specific models not yet in the curated top-N, ensure they appear too
-        if (!includeAllEligible && allowedModelsCsv.isNotBlank() && allowedModelsCsv.trim() != "*") {
-            val allowedTokens = DeviceScopePolicy.parseAllowedModels(allowedModelsCsv)
-            eligible.forEach { rec ->
-                val rawId = rec.model.modelId.trim()
-                val alias = rec.model.alias.trim()
-                if (allowedTokens.any { it.equals(rawId, true) || (alias.isNotBlank() && it.equals(alias, true)) }) {
-                    val label = "${rec.providerName} / ${rec.model.displayName.ifBlank { rawId }}"
-                    tryAddEntry(
-                        CuratedModelEntry(
-                            id = rawId,
-                            displayName = label,
-                            ownedBy = rec.providerName,
-                            category = "recommended",
-                            providerId = rec.providerId,
-                            resolvedUpstreamModelId = rawId,
-                            supportsTools = rec.capabilities.supportsTools,
-                            supportsVision = rec.capabilities.supportsVision,
-                            supportsStreaming = rec.capabilities.supportsStreaming,
-                            contextWindow = ModelCapabilityRegistry.effectiveContextWindow(rec.model),
-                            accessTier = rec.model.accessTier,
-                            freeTierVerified = rec.model.freeTierVerified,
-                            isCodingCapable = rec.codingProfile.isCodingCapable,
-                            isDefault = rec == canonicalDefault
-                        ),
-                        resolvedRealIdForAllowlist = rawId
-                    )
+            if (eligible.isNotEmpty() && !hasExplicitAllowlist) {
+                routingRules.filter { it.enabled }.forEach { rule ->
+                    val alias = rule.modelAlias.trim()
+                    if (alias.isNotBlank() && !OpenCodeSelectorIds.isVirtualSelector(alias)) {
+                        tryAddEntry(
+                            CuratedModelEntry(
+                                id = alias,
+                                displayName = "${rule.name} ($alias)",
+                                ownedBy = "jhgetway-router",
+                                category = "alias"
+                            ),
+                            resolvedRealIdForAllowlist = null
+                        )
+                    }
                 }
             }
-        }
-
-        // 3. Enabled custom routing rule aliases and authenticated agent alias (when resolvable)
-        if (eligible.isNotEmpty()) {
-            routingRules.filter { it.enabled }.forEach { rule ->
-                val alias = rule.modelAlias.trim()
-                if (alias.isNotBlank() && !OpenCodeSelectorIds.isVirtualSelector(alias)) {
-                    tryAddEntry(
-                        CuratedModelEntry(
-                            id = alias,
-                            displayName = "${rule.name} ($alias)",
-                            ownedBy = "jhgetway-router",
-                            category = "alias"
-                        ),
-                        resolvedRealIdForAllowlist = null
-                    )
-                }
-            }
-
-            codingAgent?.let { ag ->
-                val primaryAlias = ag.modelAlias.trim()
-                if (primaryAlias.isNotBlank() && !OpenCodeSelectorIds.isVirtualSelector(primaryAlias)) {
-                    tryAddEntry(
-                        CuratedModelEntry(
-                            id = primaryAlias,
-                            displayName = "${ag.name} ($primaryAlias)",
-                            ownedBy = "jhgetway",
-                            category = "alias",
-                            supportsTools = ag.toolCalling,
-                            supportsStreaming = ag.streaming
-                        ),
-                        resolvedRealIdForAllowlist = null
-                    )
-                }
-                val agDef = ag.defaultModelId.trim()
-                if (agDef.isNotBlank() && eligible.any { it.model.modelId.equals(agDef, true) }) {
-                    tryAddEntry(
-                        CuratedModelEntry(
-                            id = agDef,
-                            displayName = agDef,
-                            ownedBy = "jhgetway",
-                            category = "recommended",
-                            supportsTools = ag.toolCalling,
-                            supportsStreaming = ag.streaming
-                        ),
-                        resolvedRealIdForAllowlist = agDef
-                    )
+            if (eligible.isNotEmpty()) {
+                codingAgent?.let { ag ->
+                    val primaryAlias = ag.modelAlias.trim()
+                    if (primaryAlias.isNotBlank() && !OpenCodeSelectorIds.isVirtualSelector(primaryAlias)) {
+                        tryAddEntry(
+                            CuratedModelEntry(
+                                id = primaryAlias,
+                                displayName = "${ag.name} ($primaryAlias)",
+                                ownedBy = "JH GetWay",
+                                category = "alias",
+                                supportsTools = ag.toolCalling,
+                                supportsStreaming = ag.streaming
+                            ),
+                            resolvedRealIdForAllowlist = null
+                        )
+                    }
                 }
             }
         }

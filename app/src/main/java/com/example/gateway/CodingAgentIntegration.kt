@@ -170,12 +170,22 @@ object CodingAgentConfigBuilder {
     }
 
     fun resolveAgentModelId(agent: CodingAgentEntity, settings: GatewaySettingsState): String {
-        val raw = OpenCodeSelectorIds.stripGatewayPrefix(agent.modelAlias)
+        val strippedAlias = OpenCodeSelectorIds.stripGatewayPrefix(agent.modelAlias)
+        if (agent.agentType == CodingAgentType.OPENCODE &&
+            (strippedAlias.isBlank() || OpenCodeSelectorIds.isVirtualSelector(strippedAlias))
+        ) {
+            return OpenCodeSelectorIds.STABLE_AUTO_ID
+        }
+        val raw = strippedAlias
             .ifBlank { OpenCodeSelectorIds.stripGatewayPrefix(agent.defaultModelId) }
             .ifBlank { OpenCodeSelectorIds.stripGatewayPrefix(settings.openCodeSelectionMode) }
             .ifBlank { settings.defaultModelId.trim() }
-            .ifBlank { OpenCodeSelectorIds.AUTO }
-        return OpenCodeSelectorIds.normalizeSelectorId(raw)
+            .ifBlank { OpenCodeSelectorIds.STABLE_AUTO_ID }
+        return if (OpenCodeSelectorIds.normalizeSelectorId(raw) == OpenCodeSelectorIds.AUTO) {
+            OpenCodeSelectorIds.STABLE_AUTO_ID
+        } else {
+            OpenCodeSelectorIds.normalizeSelectorId(raw)
+        }
     }
 
     fun collectAgentModelIds(agent: CodingAgentEntity, settings: GatewaySettingsState): List<String> {
@@ -200,6 +210,7 @@ object CodingAgentConfigBuilder {
         fun putModelMeta(
             modelId: String,
             displayName: String = modelId,
+            description: String = "",
             toolCall: Boolean = agent.toolCalling,
             attachment: Boolean = false,
             contextLimit: Int? = null
@@ -209,6 +220,9 @@ object CodingAgentConfigBuilder {
             val obj = JSONObject()
                 .put("name", displayName.ifBlank { clean })
                 .put("tool_call", toolCall)
+            if (description.isNotBlank()) {
+                obj.put("description", description)
+            }
             if (attachment) {
                 obj.put("attachment", true)
             }
@@ -218,8 +232,22 @@ object CodingAgentConfigBuilder {
             modelsObj.put(clean, obj)
         }
 
-        if (curatedCatalog != null) {
-            val allowlistRestricted = agent.allowedModelsCsv.isNotBlank() && agent.allowedModelsCsv.trim() != "*"
+        val allowlistRestricted = agent.allowedModelsCsv.isNotBlank() && agent.allowedModelsCsv.trim() != "*"
+        val isSingleAutoMode = !allowlistRestricted && primaryModel == OpenCodeSelectorIds.STABLE_AUTO_ID
+
+        if (isSingleAutoMode) {
+            val autoEntry = curatedCatalog?.entries?.firstOrNull {
+                it.id == OpenCodeSelectorIds.STABLE_AUTO_ID
+            }
+            putModelMeta(
+                modelId = OpenCodeSelectorIds.STABLE_AUTO_ID,
+                displayName = autoEntry?.displayName ?: OpenCodeSelectorIds.DISPLAY_NAME_AUTO,
+                description = autoEntry?.description?.ifBlank { null } ?: OpenCodeSelectorIds.DISPLAY_DESCRIPTION_AUTO,
+                toolCall = agent.toolCalling && (autoEntry?.supportsTools ?: true),
+                attachment = autoEntry?.supportsVision ?: false,
+                contextLimit = autoEntry?.contextWindow
+            )
+        } else if (curatedCatalog != null) {
             curatedCatalog.entries.forEach { entry ->
                 val resolvedReal = if (entry.category == "selector" || entry.category == "alias") null else entry.resolvedUpstreamModelId ?: entry.id
                 val allowed = !allowlistRestricted || com.example.core.security.DeviceScopePolicy.isModelAllowed(
@@ -231,6 +259,7 @@ object CodingAgentConfigBuilder {
                     putModelMeta(
                         modelId = entry.id,
                         displayName = entry.displayName,
+                        description = entry.description,
                         toolCall = agent.toolCalling && entry.supportsTools,
                         attachment = entry.supportsVision,
                         contextLimit = entry.contextWindow
@@ -241,27 +270,8 @@ object CodingAgentConfigBuilder {
                 putModelMeta(modelId = explicitId)
             }
         } else {
-            val isUnrestricted = agent.allowedModelsCsv.isBlank() || agent.allowedModelsCsv.trim() == "*"
-            val collected = collectAgentModelIds(agent, settings)
-            if (isUnrestricted) {
-                listOf(
-                    OpenCodeSelectorIds.AUTO,
-                    OpenCodeSelectorIds.DEFAULT,
-                    OpenCodeSelectorIds.BEST_CODING,
-                    OpenCodeSelectorIds.FREE
-                ).forEach { sel ->
-                    putModelMeta(
-                        modelId = sel,
-                        displayName = OpenCodeSelectorIds.displayTitleForSelector(sel)
-                    )
-                }
-            }
-            collected.forEach { modelId ->
+            collectAgentModelIds(agent, settings).forEach { modelId ->
                 putModelMeta(modelId = modelId)
-            }
-            val globalDefault = settings.defaultModelId.trim()
-            if (isUnrestricted && globalDefault.isNotBlank()) {
-                putModelMeta(modelId = globalDefault)
             }
         }
 

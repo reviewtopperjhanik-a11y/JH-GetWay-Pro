@@ -612,14 +612,14 @@ object EnglishStrings : AppStrings {
     override val updaterCachedReleaseBadge = "Cached Release"
     override val updaterRetryAfterPrefix = "Retry available after"
 
-    override val openCodeSelectorTitle = "OpenCode Smart Model Selector"
+    override val openCodeSelectorTitle = "OpenCode Auto Policy (JH GetWay Auto)"
     override val openCodeModeAuto = "Auto"
     override val openCodeModeDefault = "Default Model"
     override val openCodeModeBestCoding = "Best Coding"
     override val openCodeModeFree = "Free Models"
     override val openCodeAllowPaidInAuto = "Allow paid models in Auto"
     override val openCodePreferDefaultInAuto = "Prefer configured default in Auto"
-    override val openCodeCuratedCountFormat = "Curated OpenCode catalog (%d exposed / %d eligible / %d stored)"
+    override val openCodeCuratedCountFormat = "OpenCode exposes %d entry (%d eligible / %d stored internally)"
     override val openCodeResolvedTargetPrefix = "Resolved target"
     override val openCodeDefaultBadge = "Default"
 }

@@ -824,7 +824,8 @@ class LocalGatewayHttpServer(
         val settings = preferences.settingsFlow.first()
         val client = authenticateAndAuthorize(call, settings, DeviceScope.MODELS_READ) ?: return
         val includeFullCatalog = call.request.queryParameters["full"]?.equals("true", ignoreCase = true) == true ||
-            call.request.queryParameters["all"]?.equals("true", ignoreCase = true) == true
+            call.request.queryParameters["all"]?.equals("true", ignoreCase = true) == true ||
+            call.request.queryParameters["manual"]?.equals("true", ignoreCase = true) == true
 
         val providers = db.providerDao().getAllOnce()
         val localServers = db.localAiServerDao().getAllOnce()
@@ -853,20 +854,26 @@ class LocalGatewayHttpServer(
                     put("object", "model")
                     put("owned_by", entry.ownedBy)
                     put("name", entry.displayName)
+                    if (entry.description.isNotBlank()) {
+                        put("description", entry.description)
+                    }
                     put("jh_category", entry.category)
                     entry.providerId?.let { put("jh_provider", it) }
                     put("jh_access_tier", entry.accessTier.name)
                     put("jh_coding_capable", entry.isCodingCapable)
                     put("jh_tool_call", entry.supportsTools)
                     put("jh_default", entry.isDefault)
+                    put("jh_selection_mode", settings.openCodeSelectionMode)
                 }
             )
         }
 
+        val isUnrestricted = client.allowedModelsCsv.isBlank() || client.allowedModelsCsv.trim() == "*"
         val payload = JSONObject()
             .put("object", "list")
             .put("data", data)
             .put("curated", !includeFullCatalog)
+            .put("single_auto_mode", !includeFullCatalog && isUnrestricted)
             .put("total_eligible_count", curated.totalEligibleModelsCount)
             .put("total_stored_count", curated.totalStoredModelsCount)
         respondJson(call, HttpStatusCode.OK, payload.toString())

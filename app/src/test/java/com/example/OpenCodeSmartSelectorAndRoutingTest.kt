@@ -288,7 +288,7 @@ class OpenCodeSmartSelectorAndRoutingTest {
         val agent = seedAgent(token, alias = "auto")
         val (_, baseUrl) = startLocalGateway()
 
-        // Default /v1/models must be curated (<= 20 entries, NOT 520+), and must expose logical selectors
+        // Default /v1/models MUST expose ONLY one primary Auto entry ("jh-getway/auto"), NOT 520+ models!
         val listedIds = mutableListOf<String>()
         httpClient.newCall(
             Request.Builder().url("$baseUrl/v1/models").header("Authorization", "Bearer $token").get().build()
@@ -296,28 +296,31 @@ class OpenCodeSmartSelectorAndRoutingTest {
             assertEquals(200, resp.code)
             val json = JSONObject(resp.body!!.string())
             assertTrue(json.getBoolean("curated"))
+            assertTrue(json.getBoolean("single_auto_mode"))
             assertEquals(522, json.getInt("total_eligible_count"))
+            assertEquals(523, json.getInt("total_stored_count"))
             val arr = json.getJSONArray("data")
-            for (i in 0 until arr.length()) {
-                listedIds += arr.getJSONObject(i).getString("id")
-            }
-            assertTrue("Curated list size should be compact (< 25), got ${listedIds.size}", listedIds.size < 25)
-            assertTrue(listedIds.containsAll(listOf("auto", "default", "best-coding", "free")))
-            // No duplicate IDs
-            assertEquals(listedIds.size, listedIds.map { it.lowercase() }.distinct().size)
+            assertEquals("Default /v1/models must expose exactly 1 primary Auto entry", 1, arr.length())
+            val autoObj = arr.getJSONObject(0)
+            assertEquals(OpenCodeSelectorIds.STABLE_AUTO_ID, autoObj.getString("id"))
+            assertEquals(OpenCodeSelectorIds.DISPLAY_NAME_AUTO, autoObj.getString("name"))
+            assertEquals(OpenCodeSelectorIds.DISPLAY_PROVIDER_NAME, autoObj.getString("owned_by"))
+            assertTrue(autoObj.getString("description").contains("fallback", ignoreCase = true))
+            listedIds += autoObj.getString("id")
         }
 
-        // Explicit ?full=true must return full eligible catalog (excluding duplicates)
+        // Separate opt-in ?full=true diagnostic endpoint returns full eligible catalog (excluding duplicates)
         httpClient.newCall(
             Request.Builder().url("$baseUrl/v1/models?full=true").header("Authorization", "Bearer $token").get().build()
         ).execute().use { resp ->
             assertEquals(200, resp.code)
             val json = JSONObject(resp.body!!.string())
             assertFalse(json.getBoolean("curated"))
+            assertFalse(json.getBoolean("single_auto_mode"))
             assertTrue(json.getJSONArray("data").length() >= 520)
         }
 
-        // OpenCode config builder embeds curated models and jhgetway/auto
+        // OpenCode config builder emits ONLY one primary JH GetWay Auto model entry ("jh-getway/auto")
         val settings = GatewaySettingsState(defaultModelId = "claude-sonnet-4", defaultProviderId = provA.id)
         val curatedCatalog = OpenCodeModelCatalogResolver.buildCuratedCatalog(
             providers = db.providerDao().getAllOnce(),
@@ -327,6 +330,9 @@ class OpenCodeSmartSelectorAndRoutingTest {
             routingRules = emptyList(),
             settings = settings
         )
+        assertEquals(1, curatedCatalog.entries.size)
+        assertEquals(OpenCodeSelectorIds.STABLE_AUTO_ID, curatedCatalog.entries.single().id)
+
         val openCodeConfig = JSONObject(
             CodingAgentConfigBuilder.buildOpenCodeConfigJson(
                 agent = agent,
@@ -336,19 +342,23 @@ class OpenCodeSmartSelectorAndRoutingTest {
                 curatedCatalog = curatedCatalog
             )
         )
-        assertEquals("jhgetway/auto", openCodeConfig.getString("model"))
+        assertEquals("jhgetway/${OpenCodeSelectorIds.STABLE_AUTO_ID}", openCodeConfig.getString("model"))
         val configModels = openCodeConfig.getJSONObject("provider").getJSONObject("jhgetway").getJSONObject("models")
-        assertTrue(configModels.has("auto"))
-        assertTrue(configModels.has("default"))
-        assertTrue(configModels.has("best-coding"))
-        assertTrue(configModels.has("free"))
-        assertTrue(configModels.length() < 25)
+        assertEquals("opencode.json must contain only 1 default Auto entry", 1, configModels.length())
+        assertTrue(configModels.has(OpenCodeSelectorIds.STABLE_AUTO_ID))
+        assertEquals(
+            OpenCodeSelectorIds.DISPLAY_NAME_AUTO,
+            configModels.getJSONObject(OpenCodeSelectorIds.STABLE_AUTO_ID).getString("name")
+        )
+        assertTrue(
+            configModels.getJSONObject(OpenCodeSelectorIds.STABLE_AUTO_ID).getString("description").isNotBlank()
+        )
 
-        // Every single ID returned by /v1/models must resolve and execute cleanly
+        // Stable Auto ID returned by /v1/models (and jhgetway-prefixed form) must resolve and execute cleanly
         seenUpstreamModels.clear()
-        listedIds.forEach { selectorOrModelId ->
+        (listedIds + "jhgetway/${OpenCodeSelectorIds.STABLE_AUTO_ID}").forEach { selectorId ->
             val payload = JSONObject()
-                .put("model", selectorOrModelId)
+                .put("model", selectorId)
                 .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", "hi")))
                 .toString()
             httpClient.newCall(
@@ -358,7 +368,7 @@ class OpenCodeSmartSelectorAndRoutingTest {
                     .post(payload.toRequestBody("application/json".toMediaType()))
                     .build()
             ).execute().use { resp ->
-                assertEquals("Expected 200 for listed id '$selectorOrModelId'", 200, resp.code)
+                assertEquals("Expected 200 for listed id '$selectorId'", 200, resp.code)
             }
         }
         // None of the virtual IDs were ever sent upstream!
@@ -442,8 +452,8 @@ class OpenCodeSmartSelectorAndRoutingTest {
             }
         }
 
-        // Scenario 3 & 5: jhgetway/auto on non-coding prompt uses canonical default ("gpt-4o-mini")
-        val autoResp = postChat("jhgetway/auto", "Summarize a calendar invite")
+        // Scenario 3 & 5: jh-getway/auto on non-coding prompt uses canonical default ("gpt-4o-mini")
+        val autoResp = postChat(OpenCodeSelectorIds.STABLE_AUTO_ID, "Summarize a calendar invite")
         assertEquals("gpt-4o-mini", autoResp.getString("model"))
         assertEquals("gpt-4o-mini", seenModels.last())
 
@@ -451,19 +461,27 @@ class OpenCodeSmartSelectorAndRoutingTest {
         val defResp = postChat("default", "Hi")
         assertEquals("gpt-4o-mini", defResp.getString("model"))
 
-        // Scenario 20: Disabling preferConfiguredDefaultInAuto immediately changes `auto` behavior on coding prompt to pick coding tier ("gpt-5")
+        // Scenario 20: Changing openCodeSelectionMode or preferConfiguredDefaultInAuto immediately changes jh-getway/auto routing
+        app.preferences.updateSmartAutoPreferences(
+            openCodeSelectionMode = OpenCodeSelectorIds.BEST_CODING,
+            autoAllowPaidModels = true,
+            preferConfiguredDefaultInAuto = true
+        )
+        val bestCodingViaAuto = postChat(OpenCodeSelectorIds.STABLE_AUTO_ID, "Any prompt")
+        assertEquals("gpt-5", bestCodingViaAuto.getString("model"))
+
         app.preferences.updateSmartAutoPreferences(
             openCodeSelectionMode = "auto",
             autoAllowPaidModels = true,
             preferConfiguredDefaultInAuto = false
         )
-        val codeResp = postChat("auto", "Refactor ```kotlin\nfun main() {}\n``` and run unit test")
+        val codeResp = postChat(OpenCodeSelectorIds.STABLE_AUTO_ID, "Refactor ```kotlin\nfun main() {}\n``` and run unit test")
         assertEquals("gpt-5", codeResp.getString("model"))
 
         // Scenario 18: Explicit model ID still routes directly
         val explicitResp = postChat("jhgetway/gpt-4o-mini", "Explicit call")
         assertEquals("gpt-4o-mini", explicitResp.getString("model"))
-        assertFalse(seenModels.any { it == "auto" || it == "jhgetway/auto" || it == "default" })
+        assertFalse(seenModels.any { it == "auto" || it == "jhgetway/auto" || it == "jh-getway/auto" || it == "default" })
     }
 
     // Scenarios 6, 7, 8, 13:

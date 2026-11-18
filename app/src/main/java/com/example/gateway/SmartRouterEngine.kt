@@ -667,7 +667,14 @@ class SmartRouterEngine(
 
         val intent = analyzeIntent(requestContext)
         val normalizedRequest = OpenCodeSelectorIds.normalizeSelectorId(requestedModelOrAlias)
-        val isVirtualFree = normalizedRequest == OpenCodeSelectorIds.FREE ||
+        val effectiveAutoPolicy = if (normalizedRequest == OpenCodeSelectorIds.AUTO) {
+            OpenCodeSelectorIds.normalizeSelectorId(settings.openCodeSelectionMode)
+                .takeIf { it in OpenCodeSelectorIds.ALL_VIRTUAL }
+                ?: OpenCodeSelectorIds.AUTO
+        } else {
+            normalizedRequest
+        }
+        val isVirtualFree = effectiveAutoPolicy == OpenCodeSelectorIds.FREE ||
             (mode == RoutingMode.AUTO_FREE && explicitProviderId == null && (normalizedRequest.isBlank() || normalizedRequest == OpenCodeSelectorIds.AUTO))
 
         if (isVirtualFree && explicitProviderId == null) {
@@ -682,15 +689,15 @@ class SmartRouterEngine(
             )
         }
 
-        // Handle logical selectors: auto, default, best-coding
+        // Handle logical selectors: auto, default, best-coding (honoring openCodeSelectionMode for jh-getway/auto)
         if (explicitProviderId == null && (
-                normalizedRequest == OpenCodeSelectorIds.AUTO ||
-                    normalizedRequest == OpenCodeSelectorIds.DEFAULT ||
-                    normalizedRequest == OpenCodeSelectorIds.BEST_CODING
+                effectiveAutoPolicy == OpenCodeSelectorIds.AUTO ||
+                    effectiveAutoPolicy == OpenCodeSelectorIds.DEFAULT ||
+                    effectiveAutoPolicy == OpenCodeSelectorIds.BEST_CODING
                 )
         ) {
             return resolveLogicalSelectorCandidates(
-                selector = normalizedRequest,
+                selector = effectiveAutoPolicy,
                 providers = allProviders,
                 localServers = allLocalServers,
                 allModels = allStoredModels,
