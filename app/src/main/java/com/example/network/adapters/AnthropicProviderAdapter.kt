@@ -304,6 +304,7 @@ class AnthropicProviderAdapter : ProviderAdapter {
 
     override fun parseChatResponse(bodyStr: String, latencyMs: Long, statusCode: Int): ChatExecutionResult {
         val root = JSONObject(bodyStr)
+        AdapterHelper.parseInlineErrorIfPresent(root, statusCode, latencyMs)?.let { return it }
         val contentArr = root.optJSONArray("content")
         val text = StringBuilder()
         val toolCalls = mutableListOf<ToolCallPayload>()

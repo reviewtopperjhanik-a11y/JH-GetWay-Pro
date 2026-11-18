@@ -32,6 +32,7 @@ import io.ktor.server.routing.route
 import io.ktor.server.routing.routing
 import io.ktor.utils.io.readAvailable
 import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
@@ -295,7 +296,7 @@ class LocalGatewayHttpServer(
                             host = bindValidation.normalizedHost
                             port = bindValidation.normalizedPort
                         }
-                        connectionIdleTimeoutSeconds = settings.gatewayTimeoutSec.coerceIn(5, 300)
+                        connectionIdleTimeoutSeconds = maxOf(settings.gatewayTimeoutSec, 120).coerceIn(30, 300)
                         reuseAddress = true
                     }
                 ) {
@@ -1136,12 +1137,10 @@ class LocalGatewayHttpServer(
                 respondJson(call, HttpStatusCode.OK, respJson.toString())
             }
         } else {
-            call.response.header(HttpHeaders.CacheControl, "no-cache")
-            call.response.header(HttpHeaders.Connection, "close")
-            call.respondTextWriter(contentType = ContentType.Text.EventStream, status = HttpStatusCode.OK) {
-                val cid = "chatcmpl-${UUID.randomUUID().toString().take(8)}"
-                var firstChunk = true
-                router.streamRoutedChat(
+            streamWithPreFlightErrorHandling(
+                call = call,
+                client = client,
+                flow = router.streamRoutedChat(
                     requestedModelOrAlias = parsed.model,
                     messages = parsed.messages,
                     settings = settings,
@@ -1155,11 +1154,12 @@ class LocalGatewayHttpServer(
                     tools = parsed.tools,
                     toolChoice = parsed.toolChoice,
                     responseFormat = parsed.responseFormat
-                ).collect { (ev, decision) ->
-                    currentCoroutineContext().ensureActive()
-                    if (decision != null && (ev is StreamEvent.Completed || ev is StreamEvent.Failed)) {
-                        reconcileAgentUsageIfNeeded(client, decision.resolvedUsage)
-                    }
+                ),
+                anthropicErrorFormat = false
+            ) {
+                val cid = "chatcmpl-${UUID.randomUUID().toString().take(8)}"
+                var firstChunk = true
+                { ev ->
                     val emitted = GatewayApiContract.writeOpenAiSseEvent(
                         writer = this,
                         cid = cid,
@@ -1242,12 +1242,10 @@ class LocalGatewayHttpServer(
                 respondJson(call, HttpStatusCode.OK, respJson.toString())
             }
         } else {
-            call.response.header(HttpHeaders.CacheControl, "no-cache")
-            call.response.header(HttpHeaders.Connection, "close")
-            call.respondTextWriter(contentType = ContentType.Text.EventStream, status = HttpStatusCode.OK) {
-                val respId = "resp_${UUID.randomUUID().toString().take(8)}"
-                val sseWriter = GatewayApiContract.ResponsesSseWriter(this, respId, parsed.model)
-                router.streamRoutedChat(
+            streamWithPreFlightErrorHandling(
+                call = call,
+                client = client,
+                flow = router.streamRoutedChat(
                     requestedModelOrAlias = parsed.model,
                     messages = parsed.messages,
                     settings = settings,
@@ -1261,13 +1259,12 @@ class LocalGatewayHttpServer(
                     tools = parsed.tools,
                     toolChoice = parsed.toolChoice,
                     responseFormat = parsed.responseFormat
-                ).collect { (ev, decision) ->
-                    currentCoroutineContext().ensureActive()
-                    if (decision != null && (ev is StreamEvent.Completed || ev is StreamEvent.Failed)) {
-                        reconcileAgentUsageIfNeeded(client, decision.resolvedUsage)
-                    }
-                    sseWriter.onEvent(ev)
-                }
+                ),
+                anthropicErrorFormat = false
+            ) {
+                val respId = "resp_${UUID.randomUUID().toString().take(8)}"
+                val sseWriter = GatewayApiContract.ResponsesSseWriter(this, respId, parsed.model)
+                sseWriter::onEvent
             }
         }
     }
@@ -1346,12 +1343,10 @@ class LocalGatewayHttpServer(
                 respondJson(call, HttpStatusCode.OK, respJson.toString())
             }
         } else {
-            call.response.header(HttpHeaders.CacheControl, "no-cache")
-            call.response.header(HttpHeaders.Connection, "close")
-            call.respondTextWriter(contentType = ContentType.Text.EventStream, status = HttpStatusCode.OK) {
-                val msgId = "msg_${UUID.randomUUID().toString().take(8)}"
-                val sseWriter = GatewayApiContract.AnthropicSseWriter(this, msgId, parsed.model)
-                router.streamRoutedChat(
+            streamWithPreFlightErrorHandling(
+                call = call,
+                client = client,
+                flow = router.streamRoutedChat(
                     requestedModelOrAlias = parsed.model,
                     messages = parsed.messages,
                     settings = settings,
@@ -1365,13 +1360,89 @@ class LocalGatewayHttpServer(
                     tools = parsed.tools,
                     toolChoice = parsed.toolChoice,
                     responseFormat = parsed.responseFormat
-                ).collect { (ev, decision) ->
-                    currentCoroutineContext().ensureActive()
+                ),
+                anthropicErrorFormat = true
+            ) {
+                val msgId = "msg_${UUID.randomUUID().toString().take(8)}"
+                val sseWriter = GatewayApiContract.AnthropicSseWriter(this, msgId, parsed.model)
+                sseWriter::onEvent
+            }
+        }
+    }
+
+    private suspend fun streamWithPreFlightErrorHandling(
+        call: ApplicationCall,
+        client: AuthenticatedClient,
+        flow: Flow<Pair<StreamEvent, RouterDecisionSnapshot?>>,
+        anthropicErrorFormat: Boolean,
+        initWriter: java.io.Writer.() -> ((StreamEvent) -> Unit)
+    ) = coroutineScope {
+        val eventChannel = Channel<Pair<StreamEvent, RouterDecisionSnapshot?>>(capacity = 64)
+        val producerJob = launch {
+            try {
+                flow.collect { pair ->
+                    eventChannel.send(pair)
+                }
+            } finally {
+                eventChannel.close()
+            }
+        }
+
+        val firstItem = eventChannel.receiveCatching().getOrNull()
+        val firstEvent = firstItem?.first
+        if (firstItem == null || (firstEvent is StreamEvent.Failed && !firstEvent.emittedAnyChunk)) {
+            producerJob.cancel()
+            val decision = firstItem?.second
+            if (decision != null) {
+                reconcileAgentUsageIfNeeded(client, decision.resolvedUsage)
+            }
+            val failedErr = (firstEvent as? StreamEvent.Failed)?.error
+            val statusCode = (failedErr?.statusCode ?: 502).coerceIn(400, 599)
+            val httpStatus = HttpStatusCode.fromValue(statusCode)
+            val message = failedErr?.safeErrorMessage ?: "Upstream streaming request failed before producing output"
+            val errBody = if (anthropicErrorFormat) {
+                val errType = when (statusCode) {
+                    400 -> "invalid_request_error"
+                    401 -> "authentication_error"
+                    403 -> "permission_error"
+                    429 -> "rate_limit_error"
+                    529 -> "overloaded_error"
+                    else -> "api_error"
+                }
+                GatewayApiContract.formatAnthropicError(errType, message)
+            } else {
+                JSONObject().put(
+                    "error",
+                    JSONObject()
+                        .put("message", message)
+                        .put("type", "upstream_error")
+                        .put("code", failedErr?.errorCode ?: "gateway_error")
+                ).toString()
+            }
+            respondJson(call, httpStatus, errBody)
+            return@coroutineScope
+        }
+
+        call.response.header(HttpHeaders.CacheControl, "no-cache")
+        call.response.header(HttpHeaders.Connection, "close")
+        call.response.header("X-Accel-Buffering", "no")
+        call.respondTextWriter(contentType = ContentType.Text.EventStream, status = HttpStatusCode.OK) {
+            try {
+                val onEvent = initWriter()
+                suspend fun handleItem(item: Pair<StreamEvent, RouterDecisionSnapshot?>) {
+                    val (ev, decision) = item
                     if (decision != null && (ev is StreamEvent.Completed || ev is StreamEvent.Failed)) {
                         reconcileAgentUsageIfNeeded(client, decision.resolvedUsage)
                     }
-                    sseWriter.onEvent(ev)
+                    onEvent(ev)
                 }
+                handleItem(firstItem)
+                for (nextItem in eventChannel) {
+                    currentCoroutineContext().ensureActive()
+                    handleItem(nextItem)
+                }
+            } finally {
+                producerJob.cancel()
             }
         }
     }

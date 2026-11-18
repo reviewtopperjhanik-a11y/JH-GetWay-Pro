@@ -1,6 +1,7 @@
 package com.example.gateway
 
 import com.example.core.security.CryptoManager
+import com.example.core.security.MaskingUtils
 import com.example.core.security.ResolvedTokenUsage
 import com.example.core.security.TokenUsageAccounting
 import com.example.core.security.UsageSource
@@ -319,19 +320,61 @@ class SmartRouterEngine(
                 OpenCodeSelectorIds.isVirtualSelector(normalizedSelector)
         }
         val maxAttempts = if (allowFallback) (1 + settings.maxRetries).coerceAtMost(candidates.size) else 1
+        val requestStartNs = System.nanoTime()
+        val totalBudgetSec = settings.gatewayTimeoutSec.coerceIn(2, 75)
+        val deadlineNs = requestStartNs + totalBudgetSec * 1_000_000_000L
+
         var attemptCount = 0
         var lastResult = ChatExecutionResult(false, errorCode = "UNKNOWN", safeErrorMessage = "No attempts made")
         var winningCandidate = candidates.first()
         var triggeredFallbackReason: String? = null
+        val attemptedKeys = mutableSetOf<Triple<String, String?, String>>()
+        val failedModels = mutableSetOf<Pair<String, String>>()
+        val failedProviders = mutableSetOf<String>()
 
-        for (i in 0 until maxAttempts) {
-            val candidate = candidates[i]
+        while (attemptCount < maxAttempts) {
+            val candidate = pickNextCandidate(
+                candidates = candidates,
+                explicitProviderId = explicitProviderId,
+                attemptedKeys = attemptedKeys,
+                failedModels = failedModels,
+                failedProviders = failedProviders
+            ) ?: break
+
             // Protocol safety invariant: never forward Gateway virtual IDs upstream
             check(!OpenCodeSelectorIds.isVirtualSelector(candidate.modelId)) {
                 "Virtual selector ID '${candidate.modelId}' cannot be sent upstream"
             }
+
+            val remainingNs = deadlineNs - System.nanoTime()
+            if (attemptCount > 0 && remainingNs < 1_000_000_000L) {
+                if (triggeredFallbackReason.isNullOrBlank()) {
+                    triggeredFallbackReason = "Routing time budget (${totalBudgetSec}s) exhausted before backup attempt"
+                }
+                break
+            }
+
+            attemptedKeys += Triple(candidate.id, candidate.keyEntityId, candidate.modelId.lowercase(Locale.US))
             winningCandidate = candidate
             attemptCount++
+
+            val remainingDistinctModels = countRemainingDistinctModels(
+                candidates = candidates,
+                explicitProviderId = explicitProviderId,
+                attemptedKeys = attemptedKeys,
+                failedModels = failedModels
+            )
+            val hasMoreBackupCandidates = allowFallback && attemptCount < maxAttempts && remainingDistinctModels > 0
+            val remainingBudgetSec = ((remainingNs + 999_999_999L) / 1_000_000_000L).toInt().coerceAtLeast(2)
+            val attemptTimeoutSec = if (hasMoreBackupCandidates) {
+                minOf(
+                    remainingBudgetSec,
+                    minOf(25, (totalBudgetSec * 2 / (remainingDistinctModels + 2)).coerceAtLeast(2))
+                )
+            } else {
+                remainingBudgetSec
+            }
+            val attemptConnectSec = minOf(attemptTimeoutSec, 8)
 
             val res = httpClient.executeChat(
                 baseUrl = candidate.baseUrl,
@@ -353,7 +396,8 @@ class SmartRouterEngine(
                     capabilities = candidate.capabilities
                 ),
                 allowLocalHttp = settings.localNetworkAccessAllowed,
-                timeoutSec = settings.gatewayTimeoutSec
+                timeoutSec = attemptTimeoutSec,
+                connectTimeoutSec = attemptConnectSec
             )
             val normalizedRes = if (res.success && res.modelUsed.isNullOrBlank()) {
                 res.copy(modelUsed = candidate.modelId)
@@ -365,21 +409,51 @@ class SmartRouterEngine(
             updateProviderAndKeyHealth(candidate, normalizedRes)
             if (normalizedRes.success) break
 
+            failedModels += candidate.id to candidate.modelId.lowercase(Locale.US)
+            if (normalizedRes.statusCode >= 500 ||
+                normalizedRes.statusCode == 429 ||
+                normalizedRes.statusCode == 401 ||
+                normalizedRes.statusCode == 403 ||
+                normalizedRes.errorCode == "TIMEOUT" ||
+                normalizedRes.errorCode == "CONNECTION_ERROR" ||
+                normalizedRes.errorCode == "EMPTY_RESPONSE"
+            ) {
+                failedProviders += candidate.id
+            }
+
             val failCategory = normalizedRes.errorCode ?: "HTTP_${normalizedRes.statusCode}"
-            if (attemptCount > 1 || (normalizedRes.retryable && i + 1 < maxAttempts)) {
+            val nextBackupExists = allowFallback && attemptCount < maxAttempts && normalizedRes.retryable &&
+                pickNextCandidate(candidates, explicitProviderId, attemptedKeys, failedModels, failedProviders) != null
+
+            logSafeRouterDiagnostic(
+                requestId = requestId,
+                endpoint = endpoint,
+                requestedAutoId = requestedModelOrAlias,
+                normalizedSelector = normalizedSelector,
+                selectedProvider = candidate.displayName,
+                selectedModel = candidate.modelId,
+                upstreamStatus = normalizedRes.statusCode,
+                fallbackAttempts = (attemptCount - 1).coerceAtLeast(0),
+                elapsedMs = (System.nanoTime() - requestStartNs) / 1_000_000L,
+                finalStatus = if (nextBackupExists) "RETRYING ($failCategory)" else "ATTEMPT_FAILED ($failCategory)",
+                detail = normalizedRes.safeErrorMessage
+            )
+
+            if (attemptCount > 1 || nextBackupExists) {
                 triggeredFallbackReason = "$failCategory on ${candidate.displayName}/${candidate.modelId}"
                 db.metricAndLogDao().insertLog(
                     ActivityLogEntity(
                         category = ActivityCategory.FALLBACK_EVENT,
                         relatedEntity = candidate.displayName,
                         status = failCategory,
-                        safeMessage = "Fallback triggered from ${candidate.displayName} (${normalizedRes.safeErrorMessage})"
+                        safeMessage = "Fallback triggered from ${candidate.displayName}/${candidate.modelId} (${MaskingUtils.sanitizeErrorMessage(normalizedRes.safeErrorMessage)})"
                     )
                 )
             }
             if (!normalizedRes.retryable) break
         }
 
+        val totalElapsedMs = ((System.nanoTime() - requestStartNs) / 1_000_000L).coerceAtLeast(lastResult.latencyMs)
         val fallbackUsed = attemptCount > 1
         val finalStatus = if (lastResult.success) {
             if (fallbackUsed) "SUCCESS (FALLBACK)" else "SUCCESS"
@@ -401,7 +475,7 @@ class SmartRouterEngine(
             routingReason = reason,
             fallbackUsed = fallbackUsed,
             attemptCount = attemptCount,
-            latencyMs = lastResult.latencyMs,
+            latencyMs = totalElapsedMs,
             finalStatus = finalStatus,
             resolvedUsage = resolved,
             requestedModelOrAlias = requestedModelOrAlias.ifBlank { effectiveMode.name },
@@ -484,7 +558,7 @@ class SmartRouterEngine(
                 fallbackUsed = false,
                 attemptCount = 0,
                 latencyMs = 0,
-                finalStatus = "FAILED",
+                finalStatus = "FAILED (NO_PROVIDER)",
                 resolvedUsage = resolved,
                 requestedModelOrAlias = requestedModelOrAlias.ifBlank { effectiveMode.name },
                 usedDefaultModel = false,
@@ -503,15 +577,57 @@ class SmartRouterEngine(
                 OpenCodeSelectorIds.isVirtualSelector(normalizedSelector)
         }
         val maxAttempts = if (allowFallback) (1 + settings.maxRetries).coerceAtMost(candidates.size) else 1
+        val requestStartNs = System.nanoTime()
+        val totalBudgetSec = settings.gatewayTimeoutSec.coerceIn(2, 75)
+        val deadlineNs = requestStartNs + totalBudgetSec * 1_000_000_000L
+
         var attempt = 0
         var triggeredFallbackReason: String? = null
+        val attemptedKeys = mutableSetOf<Triple<String, String?, String>>()
+        val failedModels = mutableSetOf<Pair<String, String>>()
+        val failedProviders = mutableSetOf<String>()
+        var lastFailedEvent: Pair<StreamEvent.Failed, RouteCandidate>? = null
 
-        for (i in 0 until maxAttempts) {
-            val candidate = candidates[i]
+        while (attempt < maxAttempts) {
+            val candidate = pickNextCandidate(
+                candidates = candidates,
+                explicitProviderId = explicitProviderId,
+                attemptedKeys = attemptedKeys,
+                failedModels = failedModels,
+                failedProviders = failedProviders
+            ) ?: break
+
             check(!OpenCodeSelectorIds.isVirtualSelector(candidate.modelId)) {
                 "Virtual selector ID '${candidate.modelId}' cannot be sent upstream"
             }
+
+            val remainingNs = deadlineNs - System.nanoTime()
+            if (attempt > 0 && remainingNs < 1_000_000_000L) {
+                break
+            }
+
+            lastFailedEvent = null
+            attemptedKeys += Triple(candidate.id, candidate.keyEntityId, candidate.modelId.lowercase(Locale.US))
             attempt++
+
+            val remainingDistinctModels = countRemainingDistinctModels(
+                candidates = candidates,
+                explicitProviderId = explicitProviderId,
+                attemptedKeys = attemptedKeys,
+                failedModels = failedModels
+            )
+            val hasMoreBackupCandidates = allowFallback && attempt < maxAttempts && remainingDistinctModels > 0
+            val remainingBudgetSec = ((remainingNs + 999_999_999L) / 1_000_000_000L).toInt().coerceAtLeast(2)
+            val attemptTimeoutSec = if (hasMoreBackupCandidates) {
+                minOf(
+                    remainingBudgetSec,
+                    minOf(25, (totalBudgetSec * 2 / (remainingDistinctModels + 2)).coerceAtLeast(2))
+                )
+            } else {
+                remainingBudgetSec
+            }
+            val attemptConnectSec = minOf(attemptTimeoutSec, 8)
+
             var finishedCleanly = false
             var canRetryNext = false
             var latestResult: ChatExecutionResult? = null
@@ -537,12 +653,19 @@ class SmartRouterEngine(
                         capabilities = candidate.capabilities
                     ),
                     allowLocalHttp = settings.localNetworkAccessAllowed,
-                    timeoutSec = settings.gatewayTimeoutSec
+                    timeoutSec = attemptTimeoutSec,
+                    connectTimeoutSec = attemptConnectSec
                 ).collect { event ->
                     when (event) {
-                        is StreamEvent.Delta -> emit(event to null)
+                        is StreamEvent.Delta -> {
+                            lastFailedEvent = null
+                            emit(event to null)
+                        }
                         is StreamEvent.Completed -> {
+                            lastFailedEvent = null
                             finishedCleanly = true
+                            val totalElapsedMs = ((System.nanoTime() - requestStartNs) / 1_000_000L)
+                                .coerceAtLeast(event.result.latencyMs)
                             val stampedResult = if (event.result.modelUsed.isNullOrBlank()) {
                                 event.result.copy(modelUsed = candidate.modelId)
                             } else {
@@ -565,7 +688,7 @@ class SmartRouterEngine(
                                 routingReason = reason,
                                 fallbackUsed = attempt > 1,
                                 attemptCount = attempt,
-                                latencyMs = stampedResult.latencyMs,
+                                latencyMs = totalElapsedMs,
                                 finalStatus = if (attempt > 1) "SUCCESS (FALLBACK)" else "SUCCESS",
                                 resolvedUsage = resolved,
                                 requestedModelOrAlias = requestedModelOrAlias.ifBlank { effectiveMode.name },
@@ -578,20 +701,57 @@ class SmartRouterEngine(
                         is StreamEvent.Failed -> {
                             latestResult = event.error
                             updateProviderAndKeyHealth(candidate, event.error)
+                            failedModels += candidate.id to candidate.modelId.lowercase(Locale.US)
+                            if (event.error.statusCode >= 500 ||
+                                event.error.statusCode == 429 ||
+                                event.error.statusCode == 401 ||
+                                event.error.statusCode == 403 ||
+                                event.error.errorCode == "TIMEOUT" ||
+                                event.error.errorCode == "CONNECTION_ERROR" ||
+                                event.error.errorCode == "EMPTY_RESPONSE"
+                            ) {
+                                failedProviders += candidate.id
+                            }
+
+                            val nextCandidateAvailable = !event.emittedAnyChunk &&
+                                event.error.retryable &&
+                                allowFallback &&
+                                attempt < maxAttempts &&
+                                (deadlineNs - System.nanoTime()) >= 1_000_000_000L &&
+                                pickNextCandidate(candidates, explicitProviderId, attemptedKeys, failedModels, failedProviders) != null
+
+                            val failCode = event.error.errorCode ?: "STREAM_FAIL"
+                            logSafeRouterDiagnostic(
+                                requestId = requestId,
+                                endpoint = endpoint,
+                                requestedAutoId = requestedModelOrAlias,
+                                normalizedSelector = normalizedSelector,
+                                selectedProvider = candidate.displayName,
+                                selectedModel = candidate.modelId,
+                                upstreamStatus = event.error.statusCode,
+                                fallbackAttempts = (attempt - 1).coerceAtLeast(0),
+                                elapsedMs = (System.nanoTime() - requestStartNs) / 1_000_000L,
+                                finalStatus = if (nextCandidateAvailable) "RETRYING_STREAM ($failCode)" else "STREAM_FAILED ($failCode)",
+                                detail = event.error.safeErrorMessage
+                            )
+
                             // Rule 7.3: Never restart mid-stream after chunks have been emitted
-                            if (!event.emittedAnyChunk && event.error.retryable && i + 1 < maxAttempts) {
+                            if (nextCandidateAvailable) {
                                 canRetryNext = true
-                                val failCode = event.error.errorCode ?: "STREAM_FAIL"
+                                lastFailedEvent = event to candidate
                                 triggeredFallbackReason = "$failCode on ${candidate.displayName}/${candidate.modelId}"
                                 db.metricAndLogDao().insertLog(
                                     ActivityLogEntity(
                                         category = ActivityCategory.FALLBACK_EVENT,
                                         relatedEntity = candidate.displayName,
                                         status = failCode,
-                                        safeMessage = "Pre-stream fallback from ${candidate.displayName}: ${event.error.safeErrorMessage}"
+                                        safeMessage = "Pre-stream fallback from ${candidate.displayName}/${candidate.modelId}: ${MaskingUtils.sanitizeErrorMessage(event.error.safeErrorMessage)}"
                                     )
                                 )
                             } else {
+                                lastFailedEvent = null
+                                val totalElapsedMs = ((System.nanoTime() - requestStartNs) / 1_000_000L)
+                                    .coerceAtLeast(event.error.latencyMs)
                                 val resolved = TokenUsageAccounting.resolveUsage(
                                     reportedInputTokens = event.error.inputTokens,
                                     reportedOutputTokens = event.error.outputTokens,
@@ -607,7 +767,7 @@ class SmartRouterEngine(
                                     routingReason = reason,
                                     fallbackUsed = attempt > 1,
                                     attemptCount = attempt,
-                                    latencyMs = event.error.latencyMs,
+                                    latencyMs = totalElapsedMs,
                                     finalStatus = "FAILED (${event.error.errorCode ?: event.error.statusCode})",
                                     resolvedUsage = resolved,
                                     requestedModelOrAlias = requestedModelOrAlias.ifBlank { effectiveMode.name },
@@ -626,6 +786,38 @@ class SmartRouterEngine(
 
             if (finishedCleanly || !canRetryNext) break
             if (latestResult != null && !latestResult!!.retryable) break
+        }
+
+        // If loop exited after a deferred pre-stream failure without finding another candidate or before emitting terminal failure:
+        val lingering = lastFailedEvent
+        if (lingering != null) {
+            val (ev, cand) = lingering
+            val totalElapsedMs = ((System.nanoTime() - requestStartNs) / 1_000_000L)
+                .coerceAtLeast(ev.error.latencyMs)
+            val resolved = TokenUsageAccounting.resolveUsage(
+                reportedInputTokens = ev.error.inputTokens,
+                reportedOutputTokens = ev.error.outputTokens,
+                usageReported = ev.error.usageReported,
+                promptMessages = messages,
+                completionText = ev.error.content,
+                requestSucceeded = false
+            )
+            val decision = RouterDecisionSnapshot(
+                requestId = requestId,
+                selectedProvider = cand.displayName,
+                selectedModel = cand.modelId,
+                routingReason = reason,
+                fallbackUsed = attempt > 1,
+                attemptCount = attempt,
+                latencyMs = totalElapsedMs,
+                finalStatus = "FAILED (${ev.error.errorCode ?: ev.error.statusCode})",
+                resolvedUsage = resolved,
+                requestedModelOrAlias = requestedModelOrAlias.ifBlank { effectiveMode.name },
+                usedDefaultModel = cand.isCanonicalDefault,
+                fallbackReason = triggeredFallbackReason
+            )
+            recordDecision(decision, ev.error, cand, deviceName, endpoint, effectiveMode.name, resolved)
+            emit(ev to decision)
         }
     }
 
@@ -1062,7 +1254,14 @@ class SmartRouterEngine(
                 eligibleRecords.filter { rec ->
                     if (OpenCodeSelectorIds.isVirtualSelector(rec.model.modelId)) return@filter false
                     if (OpenCodeModelCatalogResolver.isRecordCoolingDown(rec, nowMs)) return@filter false
-                    if (rec.isLocal && isLocalServerCoolingDown(localMap[rec.providerId] ?: return@filter false)) return@filter false
+                    if (rec.isLocal) {
+                        if (isLocalServerCoolingDown(localMap[rec.providerId] ?: return@filter false)) return@filter false
+                    } else {
+                        if (settings.localRoutingPolicy == LocalRoutingPolicy.LOCAL_ONLY) return@filter false
+                        if (settings.localRoutingPolicy == LocalRoutingPolicy.LOCAL_FIRST && !settings.allowCloudFallbackForLocal) {
+                            if (eligibleRecords.any { it.isLocal }) return@filter false
+                        }
+                    }
                     if (enforceFreeOnly && !OpenCodeModelCatalogResolver.isVerifiedFree(rec.model, settings.autoFreeIncludeLocal, rec.isLocal)) {
                         return@filter false
                     }
@@ -1485,6 +1684,16 @@ class SmartRouterEngine(
         if (enabledProviders.isNotEmpty() && enabledProviders.all { p -> selectKeysForProvider(allKeys.filter { it.providerId == p.id }).isEmpty() } && enabledLocal.isEmpty()) {
             return "No active API key found for enabled providers. Add an API key in Providers or API Key Vault."
         }
+        val nowMs = System.currentTimeMillis()
+        if (explicitProviderId == null && enabledProviders.isNotEmpty() &&
+            enabledProviders.all { isProviderCoolingDown(it, nowMs) } &&
+            enabledLocal.all { isLocalServerCoolingDown(it) }
+        ) {
+            return "All enabled providers are in temporary 60s cooldown after recent rate limits or errors. Retry shortly or verify provider status."
+        }
+        if (requireVision || requiredDocumentMimeTypes.isNotEmpty()) {
+            return "No enabled provider or model supports the requested image or document attachment."
+        }
         return "No enabled provider or model available for '${requestedModelOrAlias.ifBlank { settings.defaultModelId.ifBlank { "default" } }}'."
     }
 
@@ -1556,6 +1765,75 @@ class SmartRouterEngine(
         }
     }
 
+    private fun pickNextCandidate(
+        candidates: List<RouteCandidate>,
+        explicitProviderId: String?,
+        attemptedKeys: Set<Triple<String, String?, String>>,
+        failedModels: Set<Pair<String, String>>,
+        failedProviders: Set<String>
+    ): RouteCandidate? {
+        val remaining = candidates.filter {
+            Triple(it.id, it.keyEntityId, it.modelId.lowercase(Locale.US)) !in attemptedKeys
+        }
+        if (remaining.isEmpty()) return null
+        if (explicitProviderId != null) {
+            // Manual/explicit provider pinning permits multi-key failover within that provider
+            return remaining.firstOrNull()
+        }
+        // Auto fallback must move to a different eligible model and never repeat the same failed (provider, model)
+        val differentModels = remaining.filter { (it.id to it.modelId.lowercase(Locale.US)) !in failedModels }
+        if (differentModels.isEmpty()) return null
+        return differentModels.firstOrNull { it.id !in failedProviders }
+            ?: differentModels.firstOrNull()
+    }
+
+    private fun countRemainingDistinctModels(
+        candidates: List<RouteCandidate>,
+        explicitProviderId: String?,
+        attemptedKeys: Set<Triple<String, String?, String>>,
+        failedModels: Set<Pair<String, String>>
+    ): Int {
+        val remaining = candidates.filter {
+            Triple(it.id, it.keyEntityId, it.modelId.lowercase(Locale.US)) !in attemptedKeys
+        }
+        if (explicitProviderId != null) return remaining.size
+        return remaining
+            .map { it.id to it.modelId.lowercase(Locale.US) }
+            .filter { it !in failedModels }
+            .distinct()
+            .size
+    }
+
+    private fun logSafeRouterDiagnostic(
+        requestId: String,
+        endpoint: String,
+        requestedAutoId: String,
+        normalizedSelector: String,
+        selectedProvider: String,
+        selectedModel: String,
+        upstreamStatus: Int,
+        fallbackAttempts: Int,
+        elapsedMs: Long,
+        finalStatus: String,
+        detail: String? = null
+    ) {
+        val msg = buildString {
+            append("reqId=").append(requestId)
+            append(" endpoint=").append(endpoint)
+            append(" autoId=").append(requestedAutoId.ifBlank { "<empty>" })
+            append(" policy=").append(normalizedSelector.ifBlank { "<empty>" })
+            append(" selected=").append(selectedProvider).append('/').append(selectedModel)
+            append(" upstreamHttp=").append(upstreamStatus)
+            append(" fallbackAttempts=").append(fallbackAttempts)
+            append(" elapsedMs=").append(elapsedMs)
+            append(" finalStatus=").append(finalStatus)
+            if (!detail.isNullOrBlank()) {
+                append(" detail=").append(MaskingUtils.sanitizeErrorMessage(detail))
+            }
+        }
+        runCatching { android.util.Log.i("JHGetWayRouter", msg) }
+    }
+
     private suspend fun recordDecision(
         decision: RouterDecisionSnapshot,
         result: ChatExecutionResult,
@@ -1566,6 +1844,21 @@ class SmartRouterEngine(
         resolvedUsage: ResolvedTokenUsage
     ) {
         _recentDecisions.update { (listOf(decision) + it).take(30) }
+
+        val fallbackAttempts = (decision.attemptCount - 1).coerceAtLeast(0)
+        logSafeRouterDiagnostic(
+            requestId = decision.requestId,
+            endpoint = endpoint,
+            requestedAutoId = decision.requestedModelOrAlias,
+            normalizedSelector = OpenCodeSelectorIds.normalizeSelectorId(decision.requestedModelOrAlias),
+            selectedProvider = decision.selectedProvider,
+            selectedModel = decision.selectedModel,
+            upstreamStatus = result.statusCode,
+            fallbackAttempts = fallbackAttempts,
+            elapsedMs = decision.latencyMs,
+            finalStatus = decision.finalStatus,
+            detail = if (result.success) null else (result.safeErrorMessage ?: result.errorCode)
+        )
 
         val pricing = if (candidate != null && !candidate.isLocal) ProviderPresets.lookupPricing(candidate.modelId) else null
         val estCost = when {
@@ -1605,7 +1898,7 @@ class SmartRouterEngine(
                 endpoint = endpoint,
                 statusCode = result.statusCode,
                 success = result.success,
-                latencyMs = result.latencyMs,
+                latencyMs = decision.latencyMs,
                 inputTokens = resolvedUsage.inputTokens,
                 outputTokens = resolvedUsage.outputTokens,
                 usageSource = resolvedUsage.source.name,
@@ -1613,11 +1906,11 @@ class SmartRouterEngine(
                 actualBilledCostUsd = result.actualBilledCostUsd,
                 pricingSource = pricingSource,
                 pricingUpdatedAt = pricing?.updatedAt,
-                fallbackAttempts = (decision.attemptCount - 1).coerceAtLeast(0),
+                fallbackAttempts = fallbackAttempts,
                 routingMode = routingModeName,
                 routingReason = enrichedReason,
                 errorCode = result.errorCode,
-                safeErrorMessage = result.safeErrorMessage
+                safeErrorMessage = MaskingUtils.sanitizeErrorMessage(result.safeErrorMessage)
             )
         )
 
@@ -1627,9 +1920,9 @@ class SmartRouterEngine(
                 relatedEntity = "${decision.selectedProvider} (${decision.selectedModel})",
                 status = decision.finalStatus,
                 safeMessage = if (result.success) {
-                    "$endpoint completed [req=${decision.requestedModelOrAlias.ifBlank { routingModeName }} -> ${decision.selectedProvider}/${decision.selectedModel}] in ${result.latencyMs}ms (${resolvedUsage.inputTokens}+${resolvedUsage.outputTokens} tok, ${resolvedUsage.source.name})"
+                    "$endpoint completed [req=${decision.requestedModelOrAlias.ifBlank { routingModeName }} -> ${decision.selectedProvider}/${decision.selectedModel}] http=${result.statusCode} fallbacks=$fallbackAttempts in ${decision.latencyMs}ms (${resolvedUsage.inputTokens}+${resolvedUsage.outputTokens} tok, ${resolvedUsage.source.name})"
                 } else {
-                    "$endpoint failed [req=${decision.requestedModelOrAlias.ifBlank { routingModeName }}]: ${result.safeErrorMessage ?: result.errorCode}"
+                    "$endpoint failed [req=${decision.requestedModelOrAlias.ifBlank { routingModeName }} -> ${decision.selectedProvider}/${decision.selectedModel}] http=${result.statusCode} fallbacks=$fallbackAttempts in ${decision.latencyMs}ms: ${MaskingUtils.sanitizeErrorMessage(result.safeErrorMessage ?: result.errorCode)}"
                 }
             )
         )

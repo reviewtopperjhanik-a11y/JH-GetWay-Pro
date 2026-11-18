@@ -290,6 +290,7 @@ class GeminiProviderAdapter : ProviderAdapter {
 
     override fun parseChatResponse(bodyStr: String, latencyMs: Long, statusCode: Int): ChatExecutionResult {
         val root = JSONObject(bodyStr)
+        AdapterHelper.parseInlineErrorIfPresent(root, statusCode, latencyMs)?.let { return it }
         val first = root.optJSONArray("candidates")?.optJSONObject(0)
         val parts = first?.optJSONObject("content")?.optJSONArray("parts")
         val text = StringBuilder()
@@ -458,6 +459,7 @@ class CohereProviderAdapter : ProviderAdapter {
 
     override fun parseChatResponse(bodyStr: String, latencyMs: Long, statusCode: Int): ChatExecutionResult {
         val root = JSONObject(bodyStr)
+        AdapterHelper.parseInlineErrorIfPresent(root, statusCode, latencyMs)?.let { return it }
         val contentArr = root.optJSONObject("message")?.optJSONArray("content")
         val text = contentArr?.optJSONObject(0)?.optString("text").orEmpty()
         val usage = root.optJSONObject("usage")?.optJSONObject("tokens")
@@ -648,6 +650,7 @@ class OllamaProviderAdapter : ProviderAdapter {
 
     override fun parseChatResponse(bodyStr: String, latencyMs: Long, statusCode: Int): ChatExecutionResult {
         val root = JSONObject(bodyStr)
+        AdapterHelper.parseInlineErrorIfPresent(root, statusCode, latencyMs)?.let { return it }
         val msgObj = root.optJSONObject("message")
         val text = msgObj?.optString("content").orEmpty()
         val toolCalls = mutableListOf<ToolCallPayload>()

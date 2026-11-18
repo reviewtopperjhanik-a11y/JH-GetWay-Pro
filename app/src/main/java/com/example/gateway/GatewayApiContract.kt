@@ -117,7 +117,7 @@ object GatewayApiContract {
                                 if (sb.isNotEmpty()) sb.append("\n")
                                 sb.append(t)
                             }
-                            "image_url" -> {
+                            "image_url", "input_image" -> {
                                 val img = partObj.optJSONObject("image_url")
                                 val url = img?.optString("url") ?: partObj.optString("image_url")
                                 if (url.isBlank()) {
@@ -125,7 +125,7 @@ object GatewayApiContract {
                                         HttpStatusCode.BadRequest, "invalid_request_error", "invalid_image_url", "image_url block requires a non-empty url"
                                     )
                                 }
-                                contentParts += ContentPart.ImageUrl(url = url, detail = img?.optString("detail")?.takeIf { it.isNotBlank() })
+                                contentParts += ContentPart.ImageUrl(url = url, detail = (img?.optString("detail") ?: partObj.optString("detail")).takeIf { it.isNotBlank() })
                             }
                             else -> return ContractParseResult.Invalid(
                                 HttpStatusCode.BadRequest, "invalid_request_error", "unsupported_content_part", "Unsupported content part type '$pType'"
@@ -278,7 +278,11 @@ object GatewayApiContract {
                     event.toolCallDeltas.forEach { d ->
                         val fnObj = JSONObject()
                         if (!d.name.isNullOrBlank()) fnObj.put("name", d.name)
-                        if (d.argumentsChunk != null) fnObj.put("arguments", d.argumentsChunk)
+                        if (d.argumentsChunk != null) {
+                            fnObj.put("arguments", d.argumentsChunk)
+                        } else if (!d.name.isNullOrBlank()) {
+                            fnObj.put("arguments", "")
+                        }
                         val item = JSONObject().put("index", d.index)
                         if (!d.id.isNullOrBlank()) {
                             item.put("id", d.id)

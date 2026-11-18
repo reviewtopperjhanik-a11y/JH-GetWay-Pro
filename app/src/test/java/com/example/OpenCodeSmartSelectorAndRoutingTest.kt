@@ -22,6 +22,8 @@ import io.ktor.server.response.respondTextWriter
 import io.ktor.server.routing.post
 import io.ktor.server.routing.routing
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
 import okhttp3.MediaType.Companion.toMediaType
@@ -829,5 +831,487 @@ class OpenCodeSmartSelectorAndRoutingTest {
         assertEquals(listOf("partial-"), deltasMid)
         assertTrue(midEvents.any { it.first is StreamEvent.Failed })
         assertFalse("Mid-stream failure must not fallback after chunks emitted", midEvents.last().second?.fallbackUsed == true)
+    }
+
+    @Test
+    fun e2e_jhGetwayAuto_succeedsAndNeverSendsVirtualIdUpstream(): Unit = runBlocking {
+        val seenAuthHeaders = CopyOnWriteArrayList<String>()
+        val seenModels = CopyOnWriteArrayList<String>()
+        val srv = embeddedServer(CIO, configure = { connector { host = "127.0.0.1"; port = 0 } }) {
+            routing {
+                post("/v1/chat/completions") {
+                    seenAuthHeaders += call.request.headers["Authorization"].orEmpty()
+                    val req = JSONObject(call.receiveText())
+                    val model = req.optString("model")
+                    seenModels += model
+                    call.respondText(openAiOkJson(model, "Hello from $model"), ContentType.Application.Json, HttpStatusCode.OK)
+                }
+            }
+        }
+        srv.start(wait = false)
+        upstreamServers += srv
+        val upPort = srv.engine.resolvedConnectors().first().port
+
+        val prov = ProviderEntity(
+            id = "prov-auto-ok",
+            name = "PrimaryOpenAI",
+            baseUrl = "http://127.0.0.1:$upPort/v1",
+            apiFormat = ApiFormat.OPENAI,
+            defaultModel = "gpt-4o",
+            priority = 1,
+            status = ProviderStatus.CONNECTED,
+            enabled = true
+        )
+        db.providerDao().upsert(prov)
+        val secretApiKey = "sk-secret-primary-never-log-me-999"
+        db.apiKeyDao().upsert(
+            ApiKeyEntity(
+                providerId = prov.id,
+                label = "Key1",
+                encryptedKey = CryptoManager.encrypt(secretApiKey),
+                maskedPreview = "sk-••••999",
+                enabled = true,
+                isDefault = true
+            )
+        )
+        db.modelDao().upsert(
+            ModelEntity(
+                id = "${prov.id}::gpt-4o",
+                modelId = "gpt-4o",
+                displayName = "GPT-4o",
+                providerId = prov.id,
+                providerName = prov.name,
+                isDefault = true,
+                enabled = true
+            )
+        )
+
+        val agentToken = "jhgw_opencode_auto_ok_token"
+        seedAgent(token = agentToken)
+        val (_, baseUrl) = startLocalGateway()
+
+        for (autoVariant in listOf(OpenCodeSelectorIds.STABLE_AUTO_ID, "jhgetway/${OpenCodeSelectorIds.STABLE_AUTO_ID}")) {
+            val reqBody = JSONObject()
+                .put("model", autoVariant)
+                .put("stream", false)
+                .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", "ping")))
+                .toString()
+            val req = Request.Builder()
+                .url("$baseUrl/v1/chat/completions")
+                .header("Authorization", "Bearer $agentToken")
+                .post(reqBody.toRequestBody("application/json".toMediaType()))
+                .build()
+            httpClient.newCall(req).execute().use { resp ->
+                assertEquals(200, resp.code)
+                val json = JSONObject(resp.body!!.string())
+                val content = json.getJSONArray("choices").getJSONObject(0).getJSONObject("message").getString("content")
+                assertEquals("Hello from gpt-4o", content)
+            }
+        }
+
+        assertEquals(listOf("gpt-4o", "gpt-4o"), seenModels.toList())
+        assertTrue(seenAuthHeaders.all { it == "Bearer $secretApiKey" })
+        val persistedLogs = db.metricAndLogDao().observeLogs().first()
+        val logsJoined = persistedLogs.joinToString("\n") { "${it.status} ${it.relatedEntity} ${it.safeMessage}" }
+        assertFalse("API key must never appear in persisted logs", logsJoined.contains(secretApiKey))
+        assertTrue("Safe log should include requested Auto ID and upstream HTTP", logsJoined.contains("jh-getway/auto") && logsJoined.contains("http=200"))
+        val latestLogs = db.metricAndLogDao().getMetricsOnce()
+        assertEquals(2, latestLogs.size)
+        assertTrue(latestLogs.all { it.success && it.modelId == "gpt-4o" && it.fallbackAttempts == 0 && it.statusCode == 200 })
+    }
+
+    @Test
+    fun e2e_jhGetwayAuto_failedFirstModelMovesToDifferentModelNeverRepeatsFailedModel(): Unit = runBlocking {
+        val brokenHits = CopyOnWriteArrayList<String>()
+        val brokenKeys = CopyOnWriteArrayList<String>()
+        val backupHits = CopyOnWriteArrayList<String>()
+
+        val primarySrv = embeddedServer(CIO, configure = { connector { host = "127.0.0.1"; port = 0 } }) {
+            routing {
+                post("/v1/chat/completions") {
+                    brokenKeys += call.request.headers["Authorization"].orEmpty()
+                    val req = JSONObject(call.receiveText())
+                    brokenHits += req.optString("model")
+                    // Inline HTTP 200 JSON error payload even when stream=true
+                    call.respondText(
+                        """{"error":{"message":"Model temporarily overloaded","type":"server_error","code":503}}""",
+                        ContentType.Application.Json,
+                        HttpStatusCode.OK
+                    )
+                }
+            }
+        }
+        primarySrv.start(wait = false)
+        upstreamServers += primarySrv
+        val p1Port = primarySrv.engine.resolvedConnectors().first().port
+
+        val backupSrv = embeddedServer(CIO, configure = { connector { host = "127.0.0.1"; port = 0 } }) {
+            routing {
+                post("/v1/chat/completions") {
+                    val req = JSONObject(call.receiveText())
+                    val model = req.optString("model")
+                    backupHits += model
+                    call.respondTextWriter(ContentType.Text.EventStream, HttpStatusCode.OK) {
+                        write("""data: {"model":"$model","choices":[{"index":0,"delta":{"role":"assistant","content":"ok-via-"}}]}""" + "\n\n")
+                        write("""data: {"model":"$model","choices":[{"index":0,"delta":{"content":"$model"}}]}""" + "\n\n")
+                        write("""data: {"model":"$model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}""" + "\n\n")
+                        write("data: [DONE]\n\n")
+                        flush()
+                    }
+                }
+            }
+        }
+        backupSrv.start(wait = false)
+        upstreamServers += backupSrv
+        val p2Port = backupSrv.engine.resolvedConnectors().first().port
+
+        val p1 = ProviderEntity(id = "p-broken", name = "PrimaryBroken", baseUrl = "http://127.0.0.1:$p1Port/v1", apiFormat = ApiFormat.OPENAI, defaultModel = "broken-model", priority = 1, status = ProviderStatus.CONNECTED, enabled = true)
+        val p2 = ProviderEntity(id = "p-healthy", name = "BackupHealthy", baseUrl = "http://127.0.0.1:$p2Port/v1", apiFormat = ApiFormat.OPENAI, defaultModel = "healthy-backup-model", priority = 2, status = ProviderStatus.CONNECTED, enabled = true)
+        db.providerDao().upsert(p1)
+        db.providerDao().upsert(p2)
+        // Multiple keys on broken primary: Auto must NOT burn retries repeating broken-model across duplicate keys!
+        db.apiKeyDao().upsert(ApiKeyEntity(providerId = p1.id, label = "K1", selectionPolicy = KeySelectionPolicy.FAILOVER, priority = 1, encryptedKey = CryptoManager.encrypt("sk-broken-1"), maskedPreview = "1", enabled = true, isDefault = true))
+        db.apiKeyDao().upsert(ApiKeyEntity(providerId = p1.id, label = "K2", selectionPolicy = KeySelectionPolicy.FAILOVER, priority = 2, encryptedKey = CryptoManager.encrypt("sk-broken-2"), maskedPreview = "2", enabled = true, isDefault = false))
+        db.apiKeyDao().upsert(ApiKeyEntity(providerId = p2.id, label = "K3", encryptedKey = CryptoManager.encrypt("sk-backup-ok"), maskedPreview = "3", enabled = true, isDefault = true))
+        db.modelDao().upsertAll(
+            listOf(
+                ModelEntity(id = "${p1.id}::broken-model", modelId = "broken-model", displayName = "broken-model", providerId = p1.id, providerName = p1.name, isDefault = true, enabled = true),
+                ModelEntity(id = "${p2.id}::healthy-backup-model", modelId = "healthy-backup-model", displayName = "healthy-backup-model", providerId = p2.id, providerName = p2.name, enabled = true)
+            )
+        )
+
+        val token = "jhgw_opencode_fallback_diff_model"
+        seedAgent(token = token)
+        val (_, baseUrl) = startLocalGateway()
+        app.preferences.setDefaultModelAndProvider("broken-model", p1.id)
+        app.preferences.updateRoutingSettings(RoutingMode.PRIORITY, fallbackEnabled = true, maxRetries = 4)
+
+        val reqBody = JSONObject()
+            .put("model", OpenCodeSelectorIds.STABLE_AUTO_ID)
+            .put("stream", true)
+            .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", "help")))
+            .toString()
+        val req = Request.Builder()
+            .url("$baseUrl/v1/chat/completions")
+            .header("Authorization", "Bearer $token")
+            .post(reqBody.toRequestBody("application/json".toMediaType()))
+            .build()
+
+        httpClient.newCall(req).execute().use { resp ->
+            assertEquals(200, resp.code)
+            val sseText = resp.body!!.string()
+            assertTrue(sseText.contains("ok-via-"))
+            assertTrue(sseText.contains("healthy-backup-model"))
+            assertTrue(sseText.contains("data: [DONE]"))
+        }
+
+        assertEquals("Failed model must be tried only once before moving to a different model", 1, brokenHits.size)
+        assertEquals(listOf("broken-model"), brokenHits.toList())
+        assertEquals(listOf("healthy-backup-model"), backupHits.toList())
+
+        val metrics = db.metricAndLogDao().getMetricsOnce()
+        assertEquals(1, metrics.size)
+        assertTrue(metrics.first().success)
+        assertEquals("healthy-backup-model", metrics.first().modelId)
+        assertEquals(1, metrics.first().fallbackAttempts)
+        val logsText = db.metricAndLogDao().observeLogs().first().joinToString("\n") { it.safeMessage }
+        assertTrue(logsText.contains("fallbacks=1"))
+        assertFalse(logsText.contains("sk-broken"))
+        assertFalse(logsText.contains("sk-backup-ok"))
+    }
+
+    @Test
+    fun e2e_jhGetwayAuto_rateLimited429AndEmptyStreamTriggerFallback(): Unit = runBlocking {
+        var primaryMode = "429"
+        val primaryModelsSeen = CopyOnWriteArrayList<String>()
+        val primarySrv = embeddedServer(CIO, configure = { connector { host = "127.0.0.1"; port = 0 } }) {
+            routing {
+                post("/v1/chat/completions") {
+                    val req = JSONObject(call.receiveText())
+                    primaryModelsSeen += req.optString("model")
+                    if (primaryMode == "429") {
+                        call.respondText(
+                            """{"error":{"message":"Rate limit reached for requests"}}""",
+                            ContentType.Application.Json,
+                            HttpStatusCode.TooManyRequests
+                        )
+                    } else {
+                        // Empty SSE stream without content or tool calls
+                        call.respondTextWriter(ContentType.Text.EventStream, HttpStatusCode.OK) {
+                            write("""data: {"choices":[]}""" + "\n\n")
+                            write("data: [DONE]\n\n")
+                            flush()
+                        }
+                    }
+                }
+            }
+        }
+        primarySrv.start(wait = false)
+        upstreamServers += primarySrv
+        val p1Port = primarySrv.engine.resolvedConnectors().first().port
+
+        val backupSrv = embeddedServer(CIO, configure = { connector { host = "127.0.0.1"; port = 0 } }) {
+            routing {
+                post("/v1/chat/completions") {
+                    val req = JSONObject(call.receiveText())
+                    val m = req.optString("model")
+                    call.respondTextWriter(ContentType.Text.EventStream, HttpStatusCode.OK) {
+                        write("""data: {"model":"$m","choices":[{"index":0,"delta":{"content":"recovered-$primaryMode"}}]}""" + "\n\n")
+                        write("""data: {"model":"$m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}""" + "\n\n")
+                        write("data: [DONE]\n\n")
+                        flush()
+                    }
+                }
+            }
+        }
+        backupSrv.start(wait = false)
+        upstreamServers += backupSrv
+        val p2Port = backupSrv.engine.resolvedConnectors().first().port
+
+        val p1 = ProviderEntity(id = "p-429", name = "RateLimitedPrimary", baseUrl = "http://127.0.0.1:$p1Port/v1", apiFormat = ApiFormat.OPENAI, defaultModel = "model-a", priority = 1, status = ProviderStatus.CONNECTED, enabled = true)
+        val p2 = ProviderEntity(id = "p-ok2", name = "BackupTwo", baseUrl = "http://127.0.0.1:$p2Port/v1", apiFormat = ApiFormat.OPENAI, defaultModel = "model-b", priority = 2, status = ProviderStatus.CONNECTED, enabled = true)
+        db.providerDao().upsert(p1)
+        db.providerDao().upsert(p2)
+        db.apiKeyDao().upsert(ApiKeyEntity(providerId = p1.id, label = "K1", encryptedKey = CryptoManager.encrypt("sk-111"), maskedPreview = "111", enabled = true, isDefault = true))
+        db.apiKeyDao().upsert(ApiKeyEntity(providerId = p2.id, label = "K2", encryptedKey = CryptoManager.encrypt("sk-222"), maskedPreview = "222", enabled = true, isDefault = true))
+        db.modelDao().upsertAll(
+            listOf(
+                ModelEntity(id = "${p1.id}::model-a", modelId = "model-a", displayName = "Model A", providerId = p1.id, providerName = p1.name, isDefault = true, enabled = true),
+                ModelEntity(id = "${p2.id}::model-b", modelId = "model-b", displayName = "Model B", providerId = p2.id, providerName = p2.name, enabled = true)
+            )
+        )
+
+        val token = "jhgw_opencode_429_empty"
+        seedAgent(token = token)
+        val (_, baseUrl) = startLocalGateway()
+        app.preferences.setDefaultModelAndProvider("model-a", p1.id)
+        app.preferences.updateRoutingSettings(RoutingMode.PRIORITY, fallbackEnabled = true, maxRetries = 2)
+
+        fun sendStreamReq(): String {
+            val reqBody = JSONObject()
+                .put("model", OpenCodeSelectorIds.STABLE_AUTO_ID)
+                .put("stream", true)
+                .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", "test")))
+                .toString()
+            val req = Request.Builder()
+                .url("$baseUrl/v1/chat/completions")
+                .header("Authorization", "Bearer $token")
+                .post(reqBody.toRequestBody("application/json".toMediaType()))
+                .build()
+            return httpClient.newCall(req).execute().use { resp ->
+                assertEquals(200, resp.code)
+                resp.body!!.string()
+            }
+        }
+
+        // 1) 429 triggers fallback + cooldown
+        val body429 = sendStreamReq()
+        assertTrue(body429.contains("recovered-429"))
+        assertEquals(ProviderStatus.RATE_LIMITED, db.providerDao().getById(p1.id)?.status)
+
+        // 2) Reset primary health, verify empty stream response triggers fallback rather than "No answer from the model"
+        db.providerDao().upsert(p1.copy(status = ProviderStatus.CONNECTED, lastCheckedAt = null))
+        primaryMode = "empty"
+        val bodyEmpty = sendStreamReq()
+        assertTrue(bodyEmpty.contains("recovered-empty"))
+        assertTrue(primaryModelsSeen.all { it == "model-a" })
+    }
+
+    @Test
+    fun e2e_jhGetwayAuto_highVolumeStreamingAndStreamOptionsCompatAndToolDeltasCompleteCleanly(): Unit = runBlocking {
+        var attemptNo = 0
+        val srv = embeddedServer(CIO, configure = { connector { host = "127.0.0.1"; port = 0 } }) {
+            routing {
+                post("/v1/chat/completions") {
+                    val req = JSONObject(call.receiveText())
+                    attemptNo++
+                    // Simulate proxy that rejects stream_options on first attempt
+                    if (attemptNo == 1 && req.has("stream_options")) {
+                        call.respondText(
+                            """{"error":{"message":"Extra inputs are not permitted: stream_options"}}""",
+                            ContentType.Application.Json,
+                            HttpStatusCode.BadRequest
+                        )
+                        return@post
+                    }
+                    call.respondTextWriter(ContentType.Text.EventStream, HttpStatusCode.OK) {
+                        // Emit 90 text chunks (> channel buffer 64) + a tool call delta to prove zero drops!
+                        for (i in 0 until 90) {
+                            write("""data: {"model":"gpt-4o","choices":[{"index":0,"delta":{"content":"[$i]"}}]}""" + "\n\n")
+                        }
+                        write("""data: {"model":"gpt-4o","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read_file","arguments":""}}]}}]}""" + "\n\n")
+                        write("""data: {"model":"gpt-4o","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":\"a.kt\"}"}}]}}]}""" + "\n\n")
+                        write("""data: {"model":"gpt-4o","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":25,"completion_tokens":95,"total_tokens":120}}""" + "\n\n")
+                        write("data: [DONE]\n\n")
+                        flush()
+                    }
+                }
+            }
+        }
+        srv.start(wait = false)
+        upstreamServers += srv
+        val upPort = srv.engine.resolvedConnectors().first().port
+
+        val prov = ProviderEntity(id = "p-stream", name = "HighVolumeStream", baseUrl = "http://127.0.0.1:$upPort/v1", apiFormat = ApiFormat.OPENAI, defaultModel = "gpt-4o", priority = 1, status = ProviderStatus.CONNECTED, enabled = true)
+        db.providerDao().upsert(prov)
+        db.apiKeyDao().upsert(ApiKeyEntity(providerId = prov.id, label = "K", encryptedKey = CryptoManager.encrypt("sk-stream-test"), maskedPreview = "sk", enabled = true, isDefault = true))
+        db.modelDao().upsert(ModelEntity(id = "${prov.id}::gpt-4o", modelId = "gpt-4o", displayName = "gpt-4o", providerId = prov.id, providerName = prov.name, supportsTools = true, isDefault = true, enabled = true))
+
+        val token = "jhgw_opencode_highvol_stream"
+        seedAgent(token = token)
+        val (_, baseUrl) = startLocalGateway()
+
+        val reqBody = JSONObject()
+            .put("model", OpenCodeSelectorIds.STABLE_AUTO_ID)
+            .put("stream", true)
+            .put("tools", JSONArray().put(JSONObject().put("type", "function").put("function", JSONObject().put("name", "read_file"))))
+            .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", "read a.kt")))
+            .toString()
+        val req = Request.Builder()
+            .url("$baseUrl/v1/chat/completions")
+            .header("Authorization", "Bearer $token")
+            .post(reqBody.toRequestBody("application/json".toMediaType()))
+            .build()
+
+        httpClient.newCall(req).execute().use { resp ->
+            assertEquals(200, resp.code)
+            val sse = resp.body!!.string()
+            // Every single one of the 90 deltas must arrive intact (zero trySend drops!)
+            for (i in 0 until 90) {
+                assertTrue("Missing chunk [$i]", sse.contains("[$i]"))
+            }
+            assertTrue(sse.contains("read_file"))
+            assertTrue(sse.contains("\"finish_reason\":\"tool_calls\""))
+            assertTrue(sse.contains("data: [DONE]"))
+        }
+        assertEquals(2, attemptNo)
+    }
+
+    @Test
+    fun e2e_jhGetwayAuto_allCandidatesFailOrHangReturnsPromptNon200ErrorWithoutHanging(): Unit = runBlocking {
+        val slowSrv = embeddedServer(CIO, configure = { connector { host = "127.0.0.1"; port = 0 } }) {
+            routing {
+                post("/v1/chat/completions") {
+                    delay(4_500)
+                    call.respondText(openAiOkJson("slow-model", "too late"), ContentType.Application.Json, HttpStatusCode.OK)
+                }
+            }
+        }
+        slowSrv.start(wait = false)
+        upstreamServers += slowSrv
+        val slowPort = slowSrv.engine.resolvedConnectors().first().port
+
+        val deadSrv = embeddedServer(CIO, configure = { connector { host = "127.0.0.1"; port = 0 } }) {
+            routing {
+                post("/v1/chat/completions") {
+                    call.respondText("""{"error":{"message":"Backup overloaded"}}""", ContentType.Application.Json, HttpStatusCode.ServiceUnavailable)
+                }
+            }
+        }
+        deadSrv.start(wait = false)
+        upstreamServers += deadSrv
+        val deadPort = deadSrv.engine.resolvedConnectors().first().port
+
+        val p1 = ProviderEntity(id = "p-slow", name = "SlowPrimary", baseUrl = "http://127.0.0.1:$slowPort/v1", apiFormat = ApiFormat.OPENAI, defaultModel = "slow-model", priority = 1, status = ProviderStatus.CONNECTED, enabled = true)
+        val p2 = ProviderEntity(id = "p-dead", name = "DeadBackup", baseUrl = "http://127.0.0.1:$deadPort/v1", apiFormat = ApiFormat.OPENAI, defaultModel = "dead-model", priority = 2, status = ProviderStatus.CONNECTED, enabled = true)
+        db.providerDao().upsert(p1)
+        db.providerDao().upsert(p2)
+        db.apiKeyDao().upsert(ApiKeyEntity(providerId = p1.id, label = "K1", encryptedKey = CryptoManager.encrypt("sk-slow-secret"), maskedPreview = "1", enabled = true, isDefault = true))
+        db.apiKeyDao().upsert(ApiKeyEntity(providerId = p2.id, label = "K2", encryptedKey = CryptoManager.encrypt("sk-dead-secret"), maskedPreview = "2", enabled = true, isDefault = true))
+        db.modelDao().upsertAll(
+            listOf(
+                ModelEntity(id = "${p1.id}::slow-model", modelId = "slow-model", displayName = "slow-model", providerId = p1.id, providerName = p1.name, isDefault = true, enabled = true),
+                ModelEntity(id = "${p2.id}::dead-model", modelId = "dead-model", displayName = "dead-model", providerId = p2.id, providerName = p2.name, enabled = true)
+            )
+        )
+
+        val token = "jhgw_opencode_all_fail_promptly"
+        seedAgent(token = token)
+        val (_, baseUrl) = startLocalGateway()
+        // Short 3s gateway timeout proves bounded timeout across SlowPrimary + DeadBackup!
+        app.preferences.updateGatewaySettings(
+            name = "Bounded Timeout GW",
+            mode = GatewayMode.LOCAL,
+            host = "127.0.0.1",
+            port = 0,
+            remoteUrl = "",
+            authRequired = true,
+            timeoutSec = 3,
+            maxRequestKb = 512,
+            streaming = true,
+            rateLimitPerMin = 500,
+            loggingLevel = LoggingLevel.METADATA_ONLY
+        )
+        app.preferences.updateRoutingSettings(RoutingMode.PRIORITY, fallbackEnabled = true, maxRetries = 2)
+
+        for (isStream in listOf(true, false)) {
+            db.providerDao().upsert(p1.copy(status = ProviderStatus.CONNECTED, lastCheckedAt = null))
+            db.providerDao().upsert(p2.copy(status = ProviderStatus.CONNECTED, lastCheckedAt = null))
+            val t0 = System.nanoTime()
+            val reqBody = JSONObject()
+                .put("model", OpenCodeSelectorIds.STABLE_AUTO_ID)
+                .put("stream", isStream)
+                .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", "ping")))
+                .toString()
+            val req = Request.Builder()
+                .url("$baseUrl/v1/chat/completions")
+                .header("Authorization", "Bearer $token")
+                .post(reqBody.toRequestBody("application/json".toMediaType()))
+                .build()
+
+            httpClient.newCall(req).execute().use { resp ->
+                val elapsedMs = (System.nanoTime() - t0) / 1_000_000L
+                assertTrue("Expected prompt failure under 8s, got ${elapsedMs}ms", elapsedMs < 8_000L)
+                assertTrue("All-failed must return HTTP 4xx/5xx error (was ${resp.code})", resp.code in 400..599)
+                val body = resp.body!!.string()
+                val errObj = JSONObject(body).getJSONObject("error")
+                assertTrue(errObj.getString("message").isNotBlank())
+                assertFalse(body.contains("sk-slow-secret"))
+                assertFalse(body.contains("sk-dead-secret"))
+            }
+        }
+    }
+
+    @Test
+    fun e2e_directRealModelRequest_continuesToWorkDirectly(): Unit = runBlocking {
+        val seen = CopyOnWriteArrayList<String>()
+        val (upPort, _) = startScriptedUpstream { req, _ ->
+            val m = req.optString("model")
+            seen += m
+            HttpStatusCode.OK to openAiOkJson(m, "Direct $m")
+        }
+
+        val prov = ProviderEntity(id = "p-direct", name = "DirectProvider", baseUrl = "http://127.0.0.1:$upPort/v1", apiFormat = ApiFormat.OPENAI, defaultModel = "gpt-4o", priority = 1, status = ProviderStatus.CONNECTED, enabled = true)
+        db.providerDao().upsert(prov)
+        db.apiKeyDao().upsert(ApiKeyEntity(providerId = prov.id, label = "K", encryptedKey = CryptoManager.encrypt("sk-direct"), maskedPreview = "sk", enabled = true, isDefault = true))
+        db.modelDao().upsertAll(
+            listOf(
+                ModelEntity(id = "${prov.id}::gpt-4o", modelId = "gpt-4o", displayName = "gpt-4o", providerId = prov.id, providerName = prov.name, isDefault = true, enabled = true),
+                ModelEntity(id = "${prov.id}::gpt-4.1-mini", modelId = "gpt-4.1-mini", displayName = "gpt-4.1-mini", providerId = prov.id, providerName = prov.name, enabled = true)
+            )
+        )
+
+        val token = "jhgw_opencode_direct_model"
+        seedAgent(token = token)
+        val (_, baseUrl) = startLocalGateway()
+
+        val reqBody = JSONObject()
+            .put("model", "gpt-4.1-mini")
+            .put("stream", false)
+            .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", "direct")))
+            .toString()
+        val req = Request.Builder()
+            .url("$baseUrl/v1/chat/completions")
+            .header("Authorization", "Bearer $token")
+            .post(reqBody.toRequestBody("application/json".toMediaType()))
+            .build()
+
+        httpClient.newCall(req).execute().use { resp ->
+            assertEquals(200, resp.code)
+            val content = JSONObject(resp.body!!.string())
+                .getJSONArray("choices").getJSONObject(0).getJSONObject("message").getString("content")
+            assertEquals("Direct gpt-4.1-mini", content)
+        }
+        assertEquals(listOf("gpt-4.1-mini"), seen.toList())
     }
 }

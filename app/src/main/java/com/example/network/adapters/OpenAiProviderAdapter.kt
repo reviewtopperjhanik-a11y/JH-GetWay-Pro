@@ -306,6 +306,7 @@ class OpenAiProviderAdapter(
 
     override fun parseChatResponse(bodyStr: String, latencyMs: Long, statusCode: Int): ChatExecutionResult {
         val root = JSONObject(bodyStr)
+        AdapterHelper.parseInlineErrorIfPresent(root, statusCode, latencyMs)?.let { return it }
         val firstChoice = root.optJSONArray("choices")?.optJSONObject(0)
         val messageObj = firstChoice?.optJSONObject("message")
         val contentVal = messageObj?.opt("content")
@@ -371,11 +372,20 @@ class OpenAiProviderAdapter(
     ): NormalizedStreamDelta {
         val json = JSONObject(dataJson)
         val choice = json.optJSONArray("choices")?.optJSONObject(0)
-        val delta = choice?.optJSONObject("delta")
+        val delta = choice?.optJSONObject("delta") ?: choice?.optJSONObject("message")
 
-        val textDelta = delta?.opt("content")?.let {
-            if (it == JSONObject.NULL) "" else it.toString()
-        }.orEmpty()
+        val rawContent = delta?.opt("content")
+        val textDelta = when (rawContent) {
+            null, JSONObject.NULL -> ""
+            is String -> rawContent
+            is JSONArray -> buildString {
+                for (i in 0 until rawContent.length()) {
+                    val item = rawContent.optJSONObject(i)
+                    if (item?.optString("type") == "text") append(item.optString("text"))
+                }
+            }
+            else -> rawContent.toString()
+        }
 
         val tcDeltas = mutableListOf<ToolCallDelta>()
         val tcArr = delta?.optJSONArray("tool_calls")

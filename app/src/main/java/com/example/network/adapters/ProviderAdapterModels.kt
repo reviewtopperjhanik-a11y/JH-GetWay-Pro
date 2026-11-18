@@ -189,12 +189,61 @@ internal object AdapterHelper {
     fun extractUpstreamErrorMessage(bodyStr: String, httpCode: Int, apiKey: String): String {
         val parsed = runCatching {
             val root = JSONObject(bodyStr)
-            root.optJSONObject("error")?.optString("message")?.takeIf { it.isNotBlank() }
+            val errObj = root.optJSONObject("error")
+            errObj?.optString("message")?.takeIf { it.isNotBlank() }
+                ?: root.opt("error")?.takeIf { it != JSONObject.NULL && it !is JSONObject }?.toString()?.takeIf { it.isNotBlank() }
                 ?: root.optString("message").takeIf { it.isNotBlank() }
                 ?: root.optString("detail").takeIf { it.isNotBlank() }
         }.getOrNull()
         val raw = parsed ?: bodyStr.ifBlank { "Upstream provider returned HTTP $httpCode" }
         return MaskingUtils.sanitizeErrorMessage(raw, listOf(apiKey))
+    }
+
+    fun parseInlineErrorIfPresent(
+        root: JSONObject,
+        httpCode: Int,
+        latencyMs: Long,
+        apiKey: String = ""
+    ): ChatExecutionResult? {
+        if (!root.has("error") || root.isNull("error")) return null
+        val errObj = root.optJSONObject("error")
+        val rawMessage = errObj?.optString("message")?.takeIf { it.isNotBlank() }
+            ?: root.opt("error")?.takeIf { it !is JSONObject }?.toString()?.takeIf { it.isNotBlank() }
+            ?: root.optString("message").takeIf { it.isNotBlank() }
+            ?: "Upstream returned an error payload"
+        val numericErrCode = errObj?.optInt("code", -1)?.takeIf { it in 400..599 }
+            ?: errObj?.optInt("status", -1)?.takeIf { it in 400..599 }
+        val strCode = errObj?.optString("code")?.takeIf { it.isNotBlank() }
+            ?: errObj?.optString("type")?.takeIf { it.isNotBlank() }
+            ?: ""
+        val effectiveHttp = numericErrCode ?: if (httpCode in 400..599) httpCode else 502
+        val safeMsg = MaskingUtils.sanitizeErrorMessage(rawMessage, listOf(apiKey))
+        val lowerCombined = "${rawMessage.lowercase()} ${strCode.lowercase()}"
+        val (errCode, retryable) = when {
+            effectiveHttp in 401..599 && effectiveHttp != 400 && (
+                effectiveHttp == 401 || effectiveHttp == 403 || effectiveHttp == 404 ||
+                    effectiveHttp == 408 || effectiveHttp == 429 || effectiveHttp >= 500
+                ) -> defaultNormalizeHttpError(effectiveHttp, root.toString(), latencyMs, apiKey).let {
+                (it.errorCode ?: "HTTP_$effectiveHttp") to it.retryable
+            }
+            lowerCombined.contains("rate") || lowerCombined.contains("429") ||
+                lowerCombined.contains("too many requests") -> "RATE_LIMITED" to true
+            lowerCombined.contains("quota") || lowerCombined.contains("credit") ||
+                lowerCombined.contains("billing") || lowerCombined.contains("insufficient_balance") -> "QUOTA_EXCEEDED" to true
+            lowerCombined.contains("overload") || lowerCombined.contains("busy") ||
+                lowerCombined.contains("unavailable") || lowerCombined.contains("capacity") -> "PROVIDER_SERVER_ERROR" to true
+            lowerCombined.contains("timeout") || lowerCombined.contains("timed out") -> "TIMEOUT" to true
+            lowerCombined.contains("model_not_found") || lowerCombined.contains("not found") -> "MODEL_UNAVAILABLE" to true
+            else -> (strCode.ifBlank { "UPSTREAM_ERROR" }.uppercase()) to (httpCode in 200..299)
+        }
+        return ChatExecutionResult(
+            success = false,
+            latencyMs = latencyMs,
+            statusCode = effectiveHttp,
+            errorCode = errCode,
+            safeErrorMessage = safeMsg,
+            retryable = retryable
+        )
     }
 
     fun defaultNormalizeHttpError(
@@ -204,8 +253,14 @@ internal object AdapterHelper {
         apiKey: String
     ): ChatExecutionResult {
         val safeMsg = extractUpstreamErrorMessage(bodyStr, httpCode, apiKey)
+        val lower = safeMsg.lowercase()
         val (errCode, retryable) = when (httpCode) {
-            400 -> "INVALID_REQUEST" to false
+            400 -> when {
+                lower.contains("rate limit") || lower.contains("rate_limit") -> "RATE_LIMITED" to true
+                lower.contains("quota") || lower.contains("insufficient_balance") || lower.contains("credit balance") -> "QUOTA_EXCEEDED" to true
+                lower.contains("model_not_found") || lower.contains("model does not exist") -> "MODEL_UNAVAILABLE" to true
+                else -> "INVALID_REQUEST" to false
+            }
             401, 403 -> "INVALID_CREDENTIAL" to true
             404 -> "MODEL_UNAVAILABLE" to true
             408 -> "TIMEOUT" to true
