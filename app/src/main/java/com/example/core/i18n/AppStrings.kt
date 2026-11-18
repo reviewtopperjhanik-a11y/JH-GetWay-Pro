@@ -599,6 +599,10 @@ interface AppStrings {
     val agentCopyOpenCodeConfigAction: String
     val agentCopyCodexConfigAction: String
     val agentCopyCodexEnvAction: String
+    val agentRevealTokenAction: String
+    val agentRevealTokenDialogTitle: String
+    val agentRevealTokenSecurityNote: String
+    val agentTokenCopiedMessage: String
     val agentRemoteAuthBoundaryNote: String
     val agentGatewayActiveBadge: String
     val agentGatewayInactiveBadge: String

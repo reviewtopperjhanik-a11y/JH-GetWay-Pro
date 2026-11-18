@@ -1,14 +1,19 @@
 package com.example
 
+import android.content.ClipboardManager
+import android.content.Context
 import android.os.Looper
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertTextContains
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.test.performTouchInput
 import androidx.compose.ui.test.swipeUp
@@ -17,6 +22,7 @@ import androidx.lifecycle.ViewModelStore
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import com.example.core.i18n.AppLanguage
+import com.example.core.i18n.BengaliStrings
 import com.example.core.i18n.EnglishStrings
 import com.example.core.i18n.LocalStrings
 import com.example.core.security.CryptoManager
@@ -939,6 +945,125 @@ class CodingAgentIntegrationAndResetTest {
             composeRule.onNodeWithTag("agent_test_btn_ui-codex-1").assertIsDisplayed()
             composeRule.onNodeWithTag("agent_copy_config_btn_ui-codex-1").assertIsDisplayed()
             composeRule.onNodeWithTag("agent_copy_codex_env_btn_ui-codex-1").assertIsDisplayed()
+            composeRule.onNodeWithTag("agent_reveal_token_btn_ui-codex-1").assertIsDisplayed()
+            composeRule.onNodeWithTag("agent_copy_token_btn_ui-codex-1").assertIsDisplayed()
+        } finally {
+            vmStore.clear()
+        }
+    }
+
+    @Test
+    fun codingAgentsScreen_revealAndCopyTokenWorkForAllAgentTypesWithoutModifyingToken() {
+        val vmStore = ViewModelStore()
+        val viewModel = ViewModelProvider(vmStore, ViewModelProvider.AndroidViewModelFactory.getInstance(app))[GatewayViewModel::class.java]
+        val initDeadlineNs = System.nanoTime() + 10_000_000_000L
+        while (!viewModel.isInitialSettingsLoaded.value && System.nanoTime() < initDeadlineNs) {
+            Thread.sleep(25)
+            composeRule.waitForIdle()
+        }
+
+        val seededByType = CodingAgentType.entries.mapIndexed { idx, type ->
+            val raw = "jhgw_ag_secret_${type.name.lowercase()}_FZ7${idx}"
+            val preview = MaskingUtils.maskSecret(raw)
+            val entity = CodingAgentEntity(
+                id = "agent-type-${type.name.lowercase()}",
+                name = "${type.name} Agent",
+                agentType = type,
+                modelAlias = "jh-coder",
+                encryptedToken = CryptoManager.encrypt(raw),
+                tokenPreview = preview,
+                enabled = true
+            )
+            Triple(type, entity, raw)
+        }
+
+        runBlocking(Dispatchers.IO) {
+            seededByType.forEach { (_, entity, _) ->
+                app.database.codingAgentDao().upsert(entity)
+            }
+        }
+
+        val clipboardManager = app.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+
+        try {
+            composeRule.setContent {
+                CompositionLocalProvider(LocalStrings provides EnglishStrings) {
+                    JhGetWayTheme {
+                        CodingAgentsScreen(viewModel = viewModel)
+                    }
+                }
+            }
+            awaitCondition { viewModel.codingAgents.value.size == CodingAgentType.entries.size }
+            composeRule.waitForIdle()
+
+            seededByType.forEach { (_, entity, rawToken) ->
+                // Plaintext token must remain hidden on the card before Reveal Token is clicked
+                composeRule.onAllNodesWithText(rawToken, substring = true).assertCountEquals(0)
+
+                // Scroll to and verify Copy OpenCode/Config + Reveal Token + Copy Token buttons exist
+                composeRule.onNodeWithTag("coding_agents_list")
+                    .performScrollToNode(hasTestTag("agent_copy_config_btn_${entity.id}"))
+                composeRule.onNodeWithTag("agent_copy_config_btn_${entity.id}")
+                    .performScrollTo()
+                    .assertIsDisplayed()
+
+                composeRule.onNodeWithTag("agent_reveal_token_btn_${entity.id}")
+                    .performScrollTo()
+                    .assertIsDisplayed()
+                    .assertTextContains(EnglishStrings.agentRevealTokenAction)
+
+                composeRule.onNodeWithTag("agent_copy_token_btn_${entity.id}")
+                    .performScrollTo()
+                    .assertIsDisplayed()
+                    .assertTextContains(EnglishStrings.copyTokenLabel)
+
+                // Direct Copy Token button copies full decrypted token and posts confirmation
+                viewModel.clearBanner()
+                composeRule.onNodeWithTag("agent_copy_token_btn_${entity.id}")
+                    .performScrollTo()
+                    .performClick()
+                composeRule.waitForIdle()
+                val clipText = clipboardManager.primaryClip?.getItemAt(0)?.text?.toString()
+                assertEquals(rawToken, clipText)
+                assertEquals(EnglishStrings.agentTokenCopiedMessage, viewModel.uiBannerMessage.value)
+
+                // Reveal Token button opens secure dialog displaying the complete decrypted token
+                composeRule.onNodeWithTag("agent_reveal_token_btn_${entity.id}")
+                    .performScrollTo()
+                    .performClick()
+                composeRule.waitForIdle()
+                composeRule.onNodeWithTag("agent_reveal_token_dialog").assertIsDisplayed()
+                composeRule.onNodeWithTag("agent_revealed_token_text")
+                    .assertIsDisplayed()
+                    .assertTextContains(rawToken)
+
+                // Copy inside dialog copies full token and displays confirmation
+                composeRule.onNodeWithTag("agent_reveal_dialog_copy_btn").performClick()
+                composeRule.waitForIdle()
+                assertEquals(rawToken, clipboardManager.primaryClip?.getItemAt(0)?.text?.toString())
+                composeRule.onNodeWithTag("agent_reveal_dialog_copied_text")
+                    .assertIsDisplayed()
+                    .assertTextContains(EnglishStrings.agentTokenCopiedMessage)
+
+                // Close dialog
+                composeRule.onNodeWithTag("agent_reveal_dialog_close_btn").performClick()
+                composeRule.waitForIdle()
+            }
+
+            // Verify existing encrypted tokens & previews were NEVER modified or regenerated
+            runBlocking(Dispatchers.IO) {
+                seededByType.forEach { (_, original, rawToken) ->
+                    val stored = app.database.codingAgentDao().getById(original.id)!!
+                    assertEquals(original.encryptedToken, stored.encryptedToken)
+                    assertEquals(original.tokenPreview, stored.tokenPreview)
+                    assertEquals(rawToken, viewModel.decryptAgentTokenResult(stored).getOrThrow())
+                }
+            }
+
+            // Quick sanity verify Bengali strings exist and are distinct
+            assertTrue(BengaliStrings.agentRevealTokenAction.isNotBlank())
+            assertTrue(BengaliStrings.copyTokenLabel.isNotBlank())
+            assertTrue(BengaliStrings.agentTokenCopiedMessage.isNotBlank())
         } finally {
             vmStore.clear()
         }

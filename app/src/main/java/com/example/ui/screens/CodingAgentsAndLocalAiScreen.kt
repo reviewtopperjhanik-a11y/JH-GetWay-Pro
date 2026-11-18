@@ -2,10 +2,12 @@
 
 package com.example.ui.screens
 
+import android.view.WindowManager
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -13,9 +15,11 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.DialogWindowProvider
 import com.example.core.i18n.LocalStrings
 import com.example.core.security.EndpointLocality
 import com.example.core.security.NetworkAddressClassifier
@@ -41,6 +45,7 @@ fun CodingAgentsScreen(viewModel: GatewayViewModel) {
     var showDialog by remember { mutableStateOf(false) }
     var editingAgent by remember { mutableStateOf<CodingAgentEntity?>(null) }
     var deletingAgent by remember { mutableStateOf<CodingAgentEntity?>(null) }
+    var revealedTokenState by remember { mutableStateOf<Pair<CodingAgentEntity, String>?>(null) }
 
     Scaffold(
         floatingActionButton = {
@@ -330,6 +335,47 @@ fun CodingAgentsScreen(viewModel: GatewayViewModel) {
                                 }
                             }
 
+                            OutlinedButton(
+                                onClick = {
+                                    viewModel.decryptAgentTokenResult(agent).fold(
+                                        onSuccess = { plainTok ->
+                                            revealedTokenState = agent to plainTok
+                                        },
+                                        onFailure = { err ->
+                                            viewModel.postBanner(err.message ?: s.error)
+                                        }
+                                    )
+                                },
+                                modifier = Modifier
+                                    .minimumInteractiveComponentSize()
+                                    .testTag("agent_reveal_token_btn_${agent.id}")
+                            ) {
+                                Icon(Icons.Default.Visibility, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(Modifier.width(4.dp))
+                                Text(s.agentRevealTokenAction)
+                            }
+
+                            OutlinedButton(
+                                onClick = {
+                                    viewModel.decryptAgentTokenResult(agent).fold(
+                                        onSuccess = { plainTok ->
+                                            clipboard.setText(AnnotatedString(plainTok))
+                                            viewModel.postBanner(s.agentTokenCopiedMessage)
+                                        },
+                                        onFailure = { err ->
+                                            viewModel.postBanner(err.message ?: s.error)
+                                        }
+                                    )
+                                },
+                                modifier = Modifier
+                                    .minimumInteractiveComponentSize()
+                                    .testTag("agent_copy_token_btn_${agent.id}")
+                            ) {
+                                Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(Modifier.width(4.dp))
+                                Text(s.copyTokenLabel)
+                            }
+
                             IconButton(
                                 onClick = { viewModel.toggleAgentEnabled(agent) },
                                 modifier = Modifier.testTag("agent_toggle_btn_${agent.id}")
@@ -400,6 +446,84 @@ fun CodingAgentsScreen(viewModel: GatewayViewModel) {
                 ) { Text(s.save) }
             },
             dismissButton = { TextButton(onClick = { showDialog = false }) { Text(s.cancel) } }
+        )
+    }
+
+    revealedTokenState?.let { (agent, decryptedToken) ->
+        var copiedInDialog by remember(agent.id, decryptedToken) { mutableStateOf(false) }
+        AlertDialog(
+            onDismissRequest = { revealedTokenState = null },
+            modifier = Modifier.testTag("agent_reveal_token_dialog"),
+            title = {
+                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text(s.agentRevealTokenDialogTitle)
+                    Text(
+                        text = "${agent.name} • ${agent.agentType.name}",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
+            },
+            text = {
+                val dialogWindow = (LocalView.current.parent as? DialogWindowProvider)?.window
+                DisposableEffect(dialogWindow) {
+                    dialogWindow?.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+                    onDispose { }
+                }
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Surface(
+                        color = MaterialTheme.colorScheme.surfaceVariant,
+                        shape = MaterialTheme.shapes.small,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        SelectionContainer {
+                            Text(
+                                text = decryptedToken,
+                                style = MonoTextStyle,
+                                color = MaterialTheme.colorScheme.onSurface,
+                                modifier = Modifier
+                                    .padding(12.dp)
+                                    .testTag("agent_revealed_token_text")
+                            )
+                        }
+                    }
+                    if (copiedInDialog) {
+                        Text(
+                            text = s.agentTokenCopiedMessage,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.testTag("agent_reveal_dialog_copied_text")
+                        )
+                    }
+                    Text(
+                        text = s.agentRevealTokenSecurityNote,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        clipboard.setText(AnnotatedString(decryptedToken))
+                        copiedInDialog = true
+                        viewModel.postBanner(s.agentTokenCopiedMessage)
+                    },
+                    modifier = Modifier.testTag("agent_reveal_dialog_copy_btn")
+                ) {
+                    Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text(s.copyTokenLabel)
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = { revealedTokenState = null },
+                    modifier = Modifier.testTag("agent_reveal_dialog_close_btn")
+                ) {
+                    Text(s.close)
+                }
+            }
         )
     }
 
