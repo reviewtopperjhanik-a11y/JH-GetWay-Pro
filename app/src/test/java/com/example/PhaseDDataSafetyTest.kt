@@ -91,9 +91,9 @@ class PhaseDDataSafetyTest {
             .build()
         try {
             val sqlite = migratedDb.openHelper.writableDatabase
-            assertEquals(5, sqlite.version)
+            assertEquals(6, sqlite.version)
 
-            // Verify all expected Phase D indexes exist
+            // Verify all expected indexes exist
             val indexNames = mutableSetOf<String>()
             sqlite.query("SELECT name FROM sqlite_master WHERE type = 'index'").use { c ->
                 while (c.moveToNext()) indexNames.add(c.getString(0))
@@ -116,7 +116,9 @@ class PhaseDDataSafetyTest {
                 "index_activity_logs_category",
                 "index_playground_sessions_updatedAt",
                 "index_playground_messages_sessionId",
-                "index_playground_messages_timestamp"
+                "index_playground_messages_timestamp",
+                "index_service_pool_keys_serviceType_providerId",
+                "index_service_pool_keys_enabled"
             )
             expectedIndexes.forEach { idx ->
                 assertTrue("Missing index $idx after migration", idx in indexNames)
@@ -231,7 +233,7 @@ class PhaseDDataSafetyTest {
 
         val preview = backupManager.previewEncryptedBackup(archive, passphrase)
         assertEquals(2, preview.formatVersion)
-        assertEquals(5, preview.schemaVersion)
+        assertEquals(6, preview.schemaVersion)
         assertEquals(150_000, preview.kdfIterations)
         assertTrue(preview.integrityVerified)
         assertEquals(0, preview.conflicts.totalConflicts)

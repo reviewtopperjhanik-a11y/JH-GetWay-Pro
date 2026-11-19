@@ -135,7 +135,7 @@ fun DevicesScreen(viewModel: GatewayViewModel) {
         var connType by remember { mutableStateOf(DeviceConnectionType.LOCAL_NETWORK) }
         var selectedScopes by remember { mutableStateOf(setOf(DeviceScope.CHAT, DeviceScope.MODELS_READ)) }
         var allowedModelsCsv by remember { mutableStateOf("") }
-        val presets = listOf("JH GetWay Android", "JH One AI", "JUNIOR AI", "OpenCode", "Codex", "Development Computer")
+        val presets = listOf("R7 ATG", "JH GetWay Android", "JH One AI", "JUNIOR AI", "OpenCode", "Codex", "Development Computer")
 
         AlertDialog(
             onDismissRequest = { showAdd = false },
@@ -153,6 +153,38 @@ fun DevicesScreen(viewModel: GatewayViewModel) {
                         items(DeviceConnectionType.entries) { ct ->
                             FilterChip(selected = connType == ct, onClick = { connType = ct }, label = { Text(ct.name) })
                         }
+                    }
+                    Text(s.scopePresetsLabel, style = MaterialTheme.typography.labelMedium)
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        val llmPreset = setOf(DeviceScope.CHAT, DeviceScope.MODELS_READ)
+                        val webOnlyPreset = setOf(DeviceScope.WEB_SEARCH)
+                        val githubOnlyPreset = setOf(DeviceScope.GITHUB_SEARCH)
+                        val allServicesPreset = setOf(
+                            DeviceScope.CHAT,
+                            DeviceScope.MODELS_READ,
+                            DeviceScope.WEB_SEARCH,
+                            DeviceScope.GITHUB_SEARCH
+                        )
+                        FilterChip(
+                            selected = selectedScopes == llmPreset,
+                            onClick = { selectedScopes = llmPreset },
+                            label = { Text(s.scopePresetLlmClient) }
+                        )
+                        FilterChip(
+                            selected = selectedScopes == webOnlyPreset,
+                            onClick = { selectedScopes = webOnlyPreset },
+                            label = { Text(s.scopePresetWebSearchOnly) }
+                        )
+                        FilterChip(
+                            selected = selectedScopes == githubOnlyPreset,
+                            onClick = { selectedScopes = githubOnlyPreset },
+                            label = { Text(s.scopePresetGitHubSearchOnly) }
+                        )
+                        FilterChip(
+                            selected = selectedScopes == allServicesPreset,
+                            onClick = { selectedScopes = allServicesPreset },
+                            label = { Text(s.scopePresetAllServices) }
+                        )
                     }
                     Text(s.deviceScopesLabel, style = MaterialTheme.typography.labelMedium)
                     FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -207,6 +239,38 @@ fun DevicesScreen(viewModel: GatewayViewModel) {
             title = { Text("${s.editPermissions}: ${target.name}") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(s.scopePresetsLabel, style = MaterialTheme.typography.labelMedium)
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        val llmPreset = setOf(DeviceScope.CHAT, DeviceScope.MODELS_READ)
+                        val webOnlyPreset = setOf(DeviceScope.WEB_SEARCH)
+                        val githubOnlyPreset = setOf(DeviceScope.GITHUB_SEARCH)
+                        val allServicesPreset = setOf(
+                            DeviceScope.CHAT,
+                            DeviceScope.MODELS_READ,
+                            DeviceScope.WEB_SEARCH,
+                            DeviceScope.GITHUB_SEARCH
+                        )
+                        FilterChip(
+                            selected = selectedScopes == llmPreset,
+                            onClick = { selectedScopes = llmPreset },
+                            label = { Text(s.scopePresetLlmClient) }
+                        )
+                        FilterChip(
+                            selected = selectedScopes == webOnlyPreset,
+                            onClick = { selectedScopes = webOnlyPreset },
+                            label = { Text(s.scopePresetWebSearchOnly) }
+                        )
+                        FilterChip(
+                            selected = selectedScopes == githubOnlyPreset,
+                            onClick = { selectedScopes = githubOnlyPreset },
+                            label = { Text(s.scopePresetGitHubSearchOnly) }
+                        )
+                        FilterChip(
+                            selected = selectedScopes == allServicesPreset,
+                            onClick = { selectedScopes = allServicesPreset },
+                            label = { Text(s.scopePresetAllServices) }
+                        )
+                    }
                     Text(s.deviceScopesLabel, style = MaterialTheme.typography.labelMedium)
                     FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         DeviceScope.entries.forEach { scopeItem ->

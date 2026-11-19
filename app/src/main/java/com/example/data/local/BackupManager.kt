@@ -49,12 +49,14 @@ data class BackupEntityCounts(
     val playgroundSessions: Int = 0,
     val playgroundMessages: Int = 0,
     val requestMetrics: Int = 0,
+    val servicePoolKeys: Int = 0,
     val preferences: Int = 0
 ) {
     val total: Int
         get() = providers + apiKeys + models + routingRules + codingAgents +
             localAiServers + mcpServers + mcpTools + workflows + devices +
-            workflowRuns + playgroundSessions + playgroundMessages + requestMetrics + preferences
+            workflowRuns + playgroundSessions + playgroundMessages + requestMetrics +
+            servicePoolKeys + preferences
 }
 
 data class BackupConflictSummary(
@@ -72,12 +74,14 @@ data class BackupConflictSummary(
     val playgroundSessions: Int = 0,
     val playgroundMessages: Int = 0,
     val requestMetrics: Int = 0,
+    val servicePoolKeys: Int = 0,
     val preferences: Int = 0
 ) {
     val totalConflicts: Int
         get() = providers + apiKeys + models + routingRules + codingAgents +
             localAiServers + mcpServers + mcpTools + workflows + devices +
-            workflowRuns + playgroundSessions + playgroundMessages + requestMetrics + preferences
+            workflowRuns + playgroundSessions + playgroundMessages + requestMetrics +
+            servicePoolKeys + preferences
 }
 
 data class BackupRestorePreview(
@@ -121,7 +125,7 @@ class BackupManager(
 
     companion object {
         const val CURRENT_BACKUP_FORMAT_VERSION = 2
-        const val CURRENT_DB_SCHEMA_VERSION = 5
+        const val CURRENT_DB_SCHEMA_VERSION = 6
         const val MAX_BACKUP_WORKFLOW_RUNS = 500
         const val MAX_BACKUP_METRICS = 2000
         const val MAX_BACKUP_ATTACHMENTS_TOTAL_BYTES = 24L * 1024L * 1024L
@@ -176,6 +180,7 @@ class BackupManager(
         val playgroundMessages: List<PlaygroundMessageEntity>,
         val attachments: List<StagedAttachment>,
         val requestMetrics: List<RequestMetricEntity>,
+        val servicePoolKeysPlain: List<Pair<ServicePoolKeyEntity, String>>,
         val preferences: StagedPreferences?
     ) {
         fun counts(): BackupEntityCounts = BackupEntityCounts(
@@ -193,6 +198,7 @@ class BackupManager(
             playgroundSessions = playgroundSessions.size,
             playgroundMessages = playgroundMessages.size,
             requestMetrics = requestMetrics.size,
+            servicePoolKeys = servicePoolKeysPlain.size,
             preferences = if (preferences != null) 1 else 0
         )
     }
@@ -608,6 +614,26 @@ class BackupManager(
             includedCategories += "analytics_metrics"
         }
 
+        val poolKeys = db.servicePoolDao().getAllOnce()
+        if (poolKeys.isNotEmpty()) {
+            val poolArr = JSONArray()
+            poolKeys.forEach { pk ->
+                val plainKey = CryptoManager.decrypt(pk.encryptedKey)
+                poolArr.put(JSONObject().apply {
+                    put("id", pk.id)
+                    put("serviceType", pk.serviceType.name)
+                    put("providerId", pk.providerId)
+                    put("label", pk.label)
+                    put("plainKey", plainKey)
+                    put("maskedPreview", pk.maskedPreview.ifBlank { MaskingUtils.maskSecret(plainKey) })
+                    put("priority", pk.priority)
+                    put("enabled", pk.enabled)
+                })
+            }
+            dataObj.put("servicePoolKeys", poolArr)
+            includedCategories += "service_pool_keys_reencrypted"
+        }
+
         if (prefs != null) {
             val s = prefs.settingsFlow.first()
             var remoteTokenPlain: String? = null
@@ -663,6 +689,7 @@ class BackupManager(
                 put("openCodeSelectionMode", s.openCodeSelectionMode)
                 put("autoAllowPaidModels", s.autoAllowPaidModels)
                 put("preferConfiguredDefaultInAuto", s.preferConfiguredDefaultInAuto)
+                put("webSearchDuckDuckGoFallbackEnabled", s.webSearchDuckDuckGoFallbackEnabled)
             })
             includedCategories += "preferences"
         }
@@ -762,6 +789,9 @@ class BackupManager(
         val reEncryptedDevices = staged.devicesPlain.map { (entity, plainToken) ->
             entity.copy(encryptedToken = CryptoManager.encrypt(plainToken))
         }
+        val reEncryptedPoolKeys = staged.servicePoolKeysPlain.map { (entity, plainKey) ->
+            entity.copy(encryptedKey = CryptoManager.encrypt(plainKey))
+        }
         val reEncryptedRemoteGatewayToken = staged.preferences?.remoteAuthTokenPlain?.let { plain ->
             if (plain.isNotBlank()) CryptoManager.encrypt(plain) else ""
         }
@@ -826,6 +856,7 @@ class BackupManager(
                 val existingSessionIds = if (strategy == RestoreConflictStrategy.REPLACE_ALL) emptySet() else db.playgroundDao().getSessionsOnce().map { it.id }.toSet()
                 val existingMessageIds = if (strategy == RestoreConflictStrategy.REPLACE_ALL) emptySet() else db.playgroundDao().getAllMessagesOnce().map { it.id }.toSet()
                 val existingMetricIds = if (strategy == RestoreConflictStrategy.REPLACE_ALL) emptySet() else db.metricAndLogDao().getMetricsOnce().map { it.id }.toSet()
+                val existingPoolKeyIds = if (strategy == RestoreConflictStrategy.REPLACE_ALL) emptySet() else db.servicePoolDao().getAllOnce().map { it.id }.toSet()
 
                 if (strategy == RestoreConflictStrategy.REPLACE_ALL) {
                     val templatesToPreserve = db.workflowDao().getWorkflowsOnce().filter { it.isTemplate }
@@ -843,6 +874,7 @@ class BackupManager(
                     db.playgroundDao().clearMessages()
                     db.playgroundDao().clearSessions()
                     db.metricAndLogDao().clearMetrics()
+                    db.servicePoolDao().clearAll()
                     templatesToPreserve.forEach { db.workflowDao().upsertWorkflow(it) }
                 }
 
@@ -986,6 +1018,16 @@ class BackupManager(
                         importedCount++
                     }
                 }
+                for (pk in reEncryptedPoolKeys) {
+                    val collides = pk.id in existingPoolKeyIds
+                    if (collides && strategy == RestoreConflictStrategy.SKIP_CONFLICTS) {
+                        skippedConflicts++
+                    } else {
+                        if (collides) overwrittenCount++
+                        db.servicePoolDao().upsert(pk)
+                        importedCount++
+                    }
+                }
 
                 beforeCommitHook?.invoke()
 
@@ -1081,6 +1123,7 @@ class BackupManager(
         val sessionIds = db.playgroundDao().getSessionsOnce().map { it.id }.toSet()
         val messageIds = db.playgroundDao().getAllMessagesOnce().map { it.id }.toSet()
         val metricIds = db.metricAndLogDao().getMetricsOnce().map { it.id }.toSet()
+        val poolKeyIds = db.servicePoolDao().getAllOnce().map { it.id }.toSet()
         val prefConflict = if (staged.preferences != null && prefs != null) {
             if (hasCustomizedPortablePreferences(prefs.settingsFlow.first())) 1 else 0
         } else 0
@@ -1100,6 +1143,7 @@ class BackupManager(
             playgroundSessions = staged.playgroundSessions.count { it.id in sessionIds },
             playgroundMessages = staged.playgroundMessages.count { it.id in messageIds },
             requestMetrics = staged.requestMetrics.count { it.id in metricIds },
+            servicePoolKeys = staged.servicePoolKeysPlain.count { it.first.id in poolKeyIds },
             preferences = prefConflict
         )
     }
@@ -1626,10 +1670,36 @@ class BackupManager(
                 autoFreeIncludeLocal = o.optBoolean("autoFreeIncludeLocal", false),
                 openCodeSelectionMode = o.optString("openCodeSelectionMode", "auto"),
                 autoAllowPaidModels = o.optBoolean("autoAllowPaidModels", true),
-                preferConfiguredDefaultInAuto = o.optBoolean("preferConfiguredDefaultInAuto", true)
+                preferConfiguredDefaultInAuto = o.optBoolean("preferConfiguredDefaultInAuto", true),
+                webSearchDuckDuckGoFallbackEnabled = o.optBoolean("webSearchDuckDuckGoFallbackEnabled", false)
             )
             val remotePlain = o.optString("gatewayRemoteAuthTokenPlain").takeIf { o.has("gatewayRemoteAuthTokenPlain") && it.isNotBlank() }
             StagedPreferences(state = state, remoteAuthTokenPlain = remotePlain)
+        }
+
+        val servicePoolKeysPlain = buildList {
+            dataObj.optJSONArray("servicePoolKeys")?.let { arr ->
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: throw IllegalArgumentException("Invalid service pool key record at index $i")
+                    val id = o.requireNonBlank("id", "servicePoolKey")
+                    val label = o.requireNonBlank("label", "servicePoolKey")
+                    val providerId = o.requireNonBlank("providerId", "servicePoolKey")
+                    val plainKey = o.optString("plainKey")
+                    require(plainKey.isNotBlank()) { "Backup service pool key '$label' is empty or corrupted" }
+                    add(
+                        ServicePoolKeyEntity(
+                            id = id,
+                            serviceType = parseEnum(o.optString("serviceType"), ServicePoolType.WEB_SEARCH),
+                            providerId = providerId,
+                            label = label,
+                            encryptedKey = "",
+                            maskedPreview = o.optString("maskedPreview").ifBlank { MaskingUtils.maskSecret(plainKey) },
+                            priority = o.optInt("priority", 1),
+                            enabled = o.optBoolean("enabled", true)
+                        ) to plainKey
+                    )
+                }
+            }
         }
 
         val manifest = BackupManifest(
@@ -1667,6 +1737,7 @@ class BackupManager(
             playgroundMessages = playgroundMessages,
             attachments = attachments,
             requestMetrics = requestMetrics,
+            servicePoolKeysPlain = servicePoolKeysPlain,
             preferences = preferences
         )
     }

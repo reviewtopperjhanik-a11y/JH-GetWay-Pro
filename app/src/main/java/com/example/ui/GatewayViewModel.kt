@@ -144,6 +144,8 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
     private val httpClient = app.providerHttpClient
     private val mcpClient = app.mcpHttpClient
     val router = app.smartRouter
+    val webSearchRouter = app.webSearchRouter
+    val githubSearchRouter = app.githubSearchRouter
     val gatewayServer = app.gatewayServer
     val workflowEngine = app.workflowEngine
     private val backupManager = app.backupManager
@@ -159,6 +161,9 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     val apiKeys: StateFlow<List<ApiKeyEntity>> = db.apiKeyDao().observeAll()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val servicePoolKeys: StateFlow<List<ServicePoolKeyEntity>> = db.servicePoolDao().observeAll()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     val models: StateFlow<List<ModelEntity>> = db.modelDao().observeAll()
@@ -2100,7 +2105,7 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
         }
         val base = rt.boundAddress
         val token = if (s.gatewayMode == GatewayMode.LOCAL) {
-            val method = if (endpointPath == "/v1/models" || endpointPath == "/health") "GET" else "POST"
+            val method = if (endpointPath == "/v1/models" || endpointPath == "/health" || endpointPath.endsWith("/health")) "GET" else "POST"
             val reqScope = DeviceScopePolicy.requiredScopeForGatewayPath(endpointPath, method)
             val enabledDevices = devices.value.filter { !it.revoked && it.enabled }
             val activeDev = if (reqScope != null) {
@@ -2128,10 +2133,20 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
         val reqBuilder = Request.Builder().url("${base.trimEnd('/')}$endpointPath")
         if (token.isNotBlank()) reqBuilder.header("Authorization", "Bearer $token")
 
-        if (endpointPath == "/v1/models" || endpointPath == "/health") {
+        if (endpointPath == "/v1/models" || endpointPath == "/health" || endpointPath.endsWith("/health")) {
             reqBuilder.get()
         } else {
             val payload = when (endpointPath) {
+                "/v1/search/web" -> JSONObject()
+                    .put("query", prompt.ifBlank { "kotlin coroutines" })
+                    .put("max_results", 5)
+                    .put("search_depth", "basic")
+                    .put("include_content", true)
+                "/v1/search/github" -> JSONObject()
+                    .put("query", prompt.ifBlank { "ktor" })
+                    .put("mode", "repositories")
+                    .put("max_results", 5)
+                    .put("include_readme", true)
                 "/v1/messages" -> JSONObject()
                     .put("model", modelId)
                     .put("max_tokens", 256)
@@ -2151,6 +2166,109 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
             }
         }.getOrElse { "Request failed: ${MaskingUtils.sanitizeErrorMessage(it.message, listOf(token))}" }
         withContext(Dispatchers.Main) { onResult(outText) }
+    }
+
+    // Service Pools (Service A Web Search & Service B GitHub Search PATs)
+    fun addServicePoolKeysBatch(
+        serviceType: ServicePoolType,
+        providerId: String,
+        baseLabel: String,
+        rawKeysMultiLine: String,
+        priority: Int = 1
+    ) = viewModelScope.launch(Dispatchers.IO) {
+        val normalizedProvider = if (serviceType == ServicePoolType.GITHUB_SEARCH) {
+            "github"
+        } else {
+            providerId.trim().lowercase().ifBlank { "tavily" }
+        }
+        val keys = rawKeysMultiLine
+            .split('\n', ',', ';')
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+        if (keys.isEmpty()) {
+            postBanner("Enter at least one API key or PAT.")
+            return@launch
+        }
+        val cleanBaseLabel = baseLabel.trim().ifBlank {
+            if (serviceType == ServicePoolType.GITHUB_SEARCH) "GitHub PAT" else normalizedProvider.replaceFirstChar { it.uppercase() }
+        }
+        var addedCount = 0
+        keys.forEachIndexed { idx, plainKey ->
+            val enc = runCatching { CryptoManager.encrypt(plainKey) }.getOrElse { err ->
+                postBanner(MaskingUtils.sanitizeErrorMessage(err.message, listOf(plainKey)))
+                return@launch
+            }
+            val label = if (keys.size == 1) cleanBaseLabel else "$cleanBaseLabel #${idx + 1}"
+            db.servicePoolDao().upsert(
+                ServicePoolKeyEntity(
+                    serviceType = serviceType,
+                    providerId = normalizedProvider,
+                    label = label,
+                    encryptedKey = enc,
+                    maskedPreview = MaskingUtils.maskSecret(plainKey),
+                    priority = priority.coerceIn(1, 100),
+                    enabled = true,
+                    status = KeyStatus.UNKNOWN
+                )
+            )
+            addedCount++
+        }
+        logEvent(
+            ActivityCategory.KEY_UPDATE,
+            cleanBaseLabel,
+            "POOL_KEYS_ADDED",
+            "Added $addedCount ${serviceType.name} key(s) for $normalizedProvider"
+        )
+        postBanner("Added $addedCount key(s) to ${if (serviceType == ServicePoolType.GITHUB_SEARCH) "GitHub" else normalizedProvider} pool")
+    }
+
+    fun toggleServicePoolKeyEnabled(key: ServicePoolKeyEntity, enabled: Boolean) = viewModelScope.launch(Dispatchers.IO) {
+        db.servicePoolDao().upsert(key.copy(enabled = enabled))
+    }
+
+    fun resetServicePoolKeyCooldown(key: ServicePoolKeyEntity) = viewModelScope.launch(Dispatchers.IO) {
+        db.servicePoolDao().upsert(
+            key.copy(
+                cooldownUntilMs = null,
+                lastError = null,
+                status = if (key.status == KeyStatus.RATE_LIMITED || key.status == KeyStatus.INVALID || key.status == KeyStatus.EXPIRED) KeyStatus.UNKNOWN else key.status
+            )
+        )
+        postBanner("Cleared cooldown for ${key.label}")
+    }
+
+    fun deleteServicePoolKey(key: ServicePoolKeyEntity) = viewModelScope.launch(Dispatchers.IO) {
+        db.servicePoolDao().deleteById(key.id)
+        logEvent(ActivityCategory.KEY_UPDATE, key.label, "POOL_KEY_DELETED", "Removed ${key.providerId} key from ${key.serviceType.name} pool")
+        postBanner("Removed ${key.label}")
+    }
+
+    fun testServicePoolKey(key: ServicePoolKeyEntity) = viewModelScope.launch(Dispatchers.IO) {
+        val result = if (key.serviceType == ServicePoolType.GITHUB_SEARCH) {
+            githubSearchRouter.testPat(key.id)
+        } else {
+            webSearchRouter.testKey(key.id)
+        }
+        result.fold(
+            onSuccess = { msg -> postBanner(msg) },
+            onFailure = { err -> postBanner(MaskingUtils.sanitizeErrorMessage(err.message)) }
+        )
+    }
+
+    fun setWebSearchDuckDuckGoFallbackEnabled(enabled: Boolean) = viewModelScope.launch {
+        prefs.setWebSearchDuckDuckGoFallbackEnabled(enabled)
+        logEvent(
+            ActivityCategory.SYSTEM_EVENT,
+            "Web Search",
+            "DDG_FALLBACK_UPDATED",
+            "DuckDuckGo keyless fallback ${if (enabled) "enabled" else "disabled"}"
+        )
+    }
+
+    fun clearSearchCaches() = viewModelScope.launch {
+        val cleared = webSearchRouter.clearCache() + githubSearchRouter.clearCache()
+        postBanner("Cleared $cleared cached search entries.")
     }
 
     fun clearGatewayConfigTestResult() {
@@ -2600,8 +2718,11 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
             db.metricAndLogDao().clearLogs()
             db.playgroundDao().clearMessages()
             db.playgroundDao().clearSessions()
+            db.servicePoolDao().clearAll()
             workflowEngine.builtInTemplates().forEach { db.workflowDao().upsertWorkflow(it) }
         }
+        webSearchRouter.clearCache()
+        githubSearchRouter.clearCache()
         PlaygroundAttachmentManager.cleanupAllOwnedAttachments(app)
         postBanner("Local data cleared")
     }

@@ -15,6 +15,8 @@ enum class DeviceScope {
     MCP_READ,
     MCP_EXECUTE,
     ANALYTICS_READ,
+    WEB_SEARCH,
+    GITHUB_SEARCH,
     ADMIN
 }
 
@@ -77,6 +79,10 @@ object DeviceScopePolicy {
                     (upperMethod == "POST" && !clean.contains("/discover") && !clean.endsWith("/list"))
                 if (isExecPath) DeviceScope.MCP_EXECUTE else DeviceScope.MCP_READ
             }
+            clean == "/v1/search/web" ||
+                clean == "/v1/search/web/health" -> DeviceScope.WEB_SEARCH
+            clean == "/v1/search/github" ||
+                clean == "/v1/search/github/health" -> DeviceScope.GITHUB_SEARCH
             clean.startsWith("/v1/analytics") -> DeviceScope.ANALYTICS_READ
             clean.startsWith("/v1/") -> DeviceScope.CHAT
             else -> DeviceScope.ADMIN

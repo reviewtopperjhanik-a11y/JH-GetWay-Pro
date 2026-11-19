@@ -338,3 +338,35 @@ data class PlaygroundMessageEntity(
     val timestamp: Long = System.currentTimeMillis(),
     val attachmentsMetadataJson: String = "[]"
 )
+
+enum class ServicePoolType {
+    WEB_SEARCH,
+    GITHUB_SEARCH
+}
+
+@Entity(
+    tableName = "service_pool_keys",
+    indices = [
+        Index(value = ["serviceType", "providerId"]),
+        Index(value = ["enabled"])
+    ]
+)
+data class ServicePoolKeyEntity(
+    @PrimaryKey val id: String = UUID.randomUUID().toString(),
+    val serviceType: ServicePoolType,
+    val providerId: String, // tavily, brave, serper, exa, github
+    val label: String,
+    val encryptedKey: String,
+    val maskedPreview: String,
+    val priority: Int = 1,
+    val enabled: Boolean = true,
+    val status: KeyStatus = KeyStatus.UNKNOWN,
+    val usageCount: Long = 0,
+    val lastUsedAt: Long? = null,
+    val lastError: String? = null,
+    val cooldownUntilMs: Long? = null,
+    val rateLimitRemaining: Int? = null,
+    val rateLimitResetAtMs: Long? = null,
+    val createdAt: Long = System.currentTimeMillis()
+)
+

@@ -210,7 +210,9 @@ class LocalGatewayHttpServer(
     private val db: JhGetWayDatabase,
     private val router: SmartRouterEngine,
     private val preferences: AppPreferences,
-    private val healthChecker: RemoteGatewayHealthChecker = OkHttpRemoteHealthChecker()
+    private val healthChecker: RemoteGatewayHealthChecker = OkHttpRemoteHealthChecker(),
+    private val webSearchRouter: WebSearchRouterService = WebSearchRouterService(db.servicePoolDao(), preferences),
+    private val githubSearchRouter: GitHubSearchRouterService = GitHubSearchRouterService(db.servicePoolDao())
 ) {
     private val lifecycleMutex = Mutex()
     private val concurrencyLimiter = Semaphore(32)
@@ -315,6 +317,18 @@ class LocalGatewayHttpServer(
                         }
                         post("/v1/messages") {
                             handleWithConcurrencyLimit(call) { handleAuthenticatedAnthropicMessages(call) }
+                        }
+                        get("/v1/search/web/health") {
+                            handleWithConcurrencyLimit(call) { handleWebSearchHealth(call) }
+                        }
+                        post("/v1/search/web") {
+                            handleWithConcurrencyLimit(call) { handleWebSearch(call) }
+                        }
+                        get("/v1/search/github/health") {
+                            handleWithConcurrencyLimit(call) { handleGitHubSearchHealth(call) }
+                        }
+                        post("/v1/search/github") {
+                            handleWithConcurrencyLimit(call) { handleGitHubSearch(call) }
                         }
                         GatewayApiContract.unsupportedEndpoints.forEach { unsupportedPath ->
                             post(unsupportedPath) {
@@ -651,6 +665,13 @@ class LocalGatewayHttpServer(
                 "supported_endpoints",
                 JSONArray(GatewayApiContract.supportedEndpoints)
             )
+            .put(
+                "services",
+                JSONObject()
+                    .put("llm", true)
+                    .put("web_search", true)
+                    .put("github_search", true)
+            )
         respondJson(call, HttpStatusCode.OK, payload.toString())
     }
 
@@ -658,7 +679,8 @@ class LocalGatewayHttpServer(
         call: ApplicationCall,
         settings: GatewaySettingsState,
         requiredScope: DeviceScope,
-        anthropicErrorFormat: Boolean = false
+        anthropicErrorFormat: Boolean = false,
+        searchErrorFormat: Boolean = false
     ): AuthenticatedClient? {
         val authHeader = call.request.headers[HttpHeaders.Authorization]
         val xApiKeyHeader = call.request.headers["x-api-key"]
@@ -675,10 +697,10 @@ class LocalGatewayHttpServer(
                     )
                 )
                 val msg = "Daily token quota exceeded for ${outcome.agentName} (${outcome.usedTokens}/${outcome.dailyLimit} tokens on ${outcome.utcDate} UTC)."
-                val errBody = if (anthropicErrorFormat) {
-                    GatewayApiContract.formatAnthropicError("rate_limit_error", msg)
-                } else {
-                    JSONObject().put(
+                val errBody = when {
+                    searchErrorFormat -> GatewayApiContract.formatSearchErrorEnvelope("rate_limit_exhausted", msg, 60)
+                    anthropicErrorFormat -> GatewayApiContract.formatAnthropicError("rate_limit_error", msg)
+                    else -> JSONObject().put(
                         "error",
                         JSONObject()
                             .put("message", msg)
@@ -686,6 +708,7 @@ class LocalGatewayHttpServer(
                             .put("code", "daily_token_limit_exceeded")
                     ).toString()
                 }
+                if (searchErrorFormat) call.response.header(HttpHeaders.RetryAfter, "60")
                 respondJson(call, HttpStatusCode.TooManyRequests, errBody)
                 return null
             }
@@ -698,10 +721,16 @@ class LocalGatewayHttpServer(
                         safeMessage = "Rejected request without valid active Bearer token"
                     )
                 )
-                val errBody = if (anthropicErrorFormat) {
-                    GatewayApiContract.formatAnthropicError("authentication_error", "Invalid or missing Gateway Bearer token")
-                } else {
-                    """{"error":{"message":"Invalid or missing Gateway Bearer token","type":"authentication_error"}}"""
+                val errBody = when {
+                    searchErrorFormat -> GatewayApiContract.formatSearchErrorEnvelope(
+                        "unauthorized",
+                        "Invalid or missing Gateway Bearer token"
+                    )
+                    anthropicErrorFormat -> GatewayApiContract.formatAnthropicError(
+                        "authentication_error",
+                        "Invalid or missing Gateway Bearer token"
+                    )
+                    else -> """{"error":{"message":"Invalid or missing Gateway Bearer token","type":"authentication_error"}}"""
                 }
                 respondJson(call, HttpStatusCode.Unauthorized, errBody)
                 return null
@@ -719,10 +748,10 @@ class LocalGatewayHttpServer(
                 )
             )
             val errMsg = "Client '${effectiveClient.label}' lacks required scope ${requiredScope.name}"
-            val errBody = if (anthropicErrorFormat) {
-                GatewayApiContract.formatAnthropicError("permission_error", errMsg)
-            } else {
-                JSONObject().put(
+            val errBody = when {
+                searchErrorFormat -> GatewayApiContract.formatSearchErrorEnvelope("forbidden", errMsg)
+                anthropicErrorFormat -> GatewayApiContract.formatAnthropicError("permission_error", errMsg)
+                else -> JSONObject().put(
                     "error",
                     JSONObject()
                         .put("message", errMsg)
@@ -735,11 +764,16 @@ class LocalGatewayHttpServer(
         }
 
         if (!checkRateLimit(effectiveClient.label, settings.gatewayRateLimitPerMin)) {
-            val errBody = if (anthropicErrorFormat) {
-                GatewayApiContract.formatAnthropicError("rate_limit_error", "Gateway rate limit exceeded")
-            } else {
-                """{"error":{"message":"Gateway rate limit exceeded","type":"rate_limit_error"}}"""
+            val errBody = when {
+                searchErrorFormat -> GatewayApiContract.formatSearchErrorEnvelope(
+                    "rate_limit_exhausted",
+                    "Gateway rate limit exceeded",
+                    60
+                )
+                anthropicErrorFormat -> GatewayApiContract.formatAnthropicError("rate_limit_error", "Gateway rate limit exceeded")
+                else -> """{"error":{"message":"Gateway rate limit exceeded","type":"rate_limit_error"}}"""
             }
+            if (searchErrorFormat) call.response.header(HttpHeaders.RetryAfter, "60")
             respondJson(call, HttpStatusCode.TooManyRequests, errBody)
             return null
         }
@@ -901,6 +935,194 @@ class LocalGatewayHttpServer(
         handleAnthropicMessages(call, body, client, settings)
     }
 
+    private suspend fun handleWebSearchHealth(call: ApplicationCall) {
+        val settings = preferences.settingsFlow.first()
+        authenticateAndAuthorize(call, settings, DeviceScope.WEB_SEARCH, searchErrorFormat = true) ?: return
+        val status = webSearchRouter.getHealthStatus()
+        respondJson(call, HttpStatusCode.OK, status.toString())
+    }
+
+    private suspend fun handleWebSearch(call: ApplicationCall) {
+        val settings = preferences.settingsFlow.first()
+        val client = authenticateAndAuthorize(call, settings, DeviceScope.WEB_SEARCH, searchErrorFormat = true) ?: return
+        val body = readBoundedBody(call, settings.gatewayMaxRequestKb * 1024, searchErrorFormat = true) ?: return
+        val parsed = when (val res = GatewayApiContract.parseWebSearchRequest(body)) {
+            is ContractParseResult.Invalid -> {
+                respondJson(
+                    call,
+                    res.statusCode,
+                    GatewayApiContract.formatSearchErrorEnvelope(res.errorCode, res.message)
+                )
+                return
+            }
+            is ContractParseResult.Valid -> res.value
+        }
+
+        val reqId = UUID.randomUUID().toString().take(8)
+        when (val result = webSearchRouter.search(parsed)) {
+            is WebSearchGatewayResult.Success -> {
+                db.metricAndLogDao().insertMetric(
+                    RequestMetricEntity(
+                        requestId = reqId,
+                        providerId = result.providerUsed,
+                        providerName = result.providerUsed.replaceFirstChar { it.uppercase() },
+                        modelId = "web_search:${parsed.searchDepth}",
+                        deviceName = client.label,
+                        endpoint = "/v1/search/web",
+                        statusCode = 200,
+                        success = true,
+                        latencyMs = result.latencyMs,
+                        fallbackAttempts = (result.attempts - 1).coerceAtLeast(0),
+                        routingMode = "KEY_ROTATION",
+                        routingReason = if (result.cached) "cache_hit" else "pool_rotation"
+                    )
+                )
+                db.metricAndLogDao().insertLog(
+                    ActivityLogEntity(
+                        category = ActivityCategory.GATEWAY_REQUEST,
+                        relatedEntity = client.label,
+                        status = "WEB_SEARCH_OK",
+                        safeMessage = "Web Search (${result.providerUsed}, cached=${result.cached}) in ${result.latencyMs}ms"
+                    )
+                )
+                respondJson(call, HttpStatusCode.OK, result.payload.toString())
+            }
+            is WebSearchGatewayResult.Failure -> {
+                db.metricAndLogDao().insertMetric(
+                    RequestMetricEntity(
+                        requestId = reqId,
+                        providerId = "web_search",
+                        providerName = "Web Search",
+                        modelId = "web_search:${parsed.searchDepth}",
+                        deviceName = client.label,
+                        endpoint = "/v1/search/web",
+                        statusCode = result.statusCode,
+                        success = false,
+                        latencyMs = 0L,
+                        fallbackAttempts = result.attempts,
+                        routingMode = "KEY_ROTATION",
+                        errorCode = result.errorCode,
+                        safeErrorMessage = result.safeMessage
+                    )
+                )
+                db.metricAndLogDao().insertLog(
+                    ActivityLogEntity(
+                        category = ActivityCategory.PROVIDER_ERROR,
+                        relatedEntity = client.label,
+                        status = "WEB_SEARCH_FAILED",
+                        safeMessage = "${result.errorCode}: ${result.safeMessage}"
+                    )
+                )
+                result.retryAfterSeconds?.let { sec ->
+                    call.response.header(HttpHeaders.RetryAfter, sec.toString())
+                }
+                respondJson(
+                    call,
+                    HttpStatusCode.fromValue(result.statusCode.coerceIn(400, 599)),
+                    GatewayApiContract.formatSearchErrorEnvelope(
+                        code = result.errorCode,
+                        message = result.safeMessage,
+                        retryAfterSeconds = result.retryAfterSeconds
+                    )
+                )
+            }
+        }
+    }
+
+    private suspend fun handleGitHubSearchHealth(call: ApplicationCall) {
+        val settings = preferences.settingsFlow.first()
+        authenticateAndAuthorize(call, settings, DeviceScope.GITHUB_SEARCH, searchErrorFormat = true) ?: return
+        val status = githubSearchRouter.getHealthStatus()
+        respondJson(call, HttpStatusCode.OK, status.toString())
+    }
+
+    private suspend fun handleGitHubSearch(call: ApplicationCall) {
+        val settings = preferences.settingsFlow.first()
+        val client = authenticateAndAuthorize(call, settings, DeviceScope.GITHUB_SEARCH, searchErrorFormat = true) ?: return
+        val body = readBoundedBody(call, settings.gatewayMaxRequestKb * 1024, searchErrorFormat = true) ?: return
+        val parsed = when (val res = GatewayApiContract.parseGitHubSearchRequest(body)) {
+            is ContractParseResult.Invalid -> {
+                respondJson(
+                    call,
+                    res.statusCode,
+                    GatewayApiContract.formatSearchErrorEnvelope(res.errorCode, res.message)
+                )
+                return
+            }
+            is ContractParseResult.Valid -> res.value
+        }
+
+        val reqId = UUID.randomUUID().toString().take(8)
+        when (val result = githubSearchRouter.search(parsed)) {
+            is GitHubSearchGatewayResult.Success -> {
+                db.metricAndLogDao().insertMetric(
+                    RequestMetricEntity(
+                        requestId = reqId,
+                        providerId = "github",
+                        providerName = "GitHub Search",
+                        modelId = "github:${parsed.mode}",
+                        deviceName = client.label,
+                        endpoint = "/v1/search/github",
+                        statusCode = 200,
+                        success = true,
+                        latencyMs = result.latencyMs,
+                        fallbackAttempts = (result.attempts - 1).coerceAtLeast(0),
+                        routingMode = "PAT_ROTATION",
+                        routingReason = if (result.cached) "cache_hit" else "pat_pool_rotation"
+                    )
+                )
+                db.metricAndLogDao().insertLog(
+                    ActivityLogEntity(
+                        category = ActivityCategory.GATEWAY_REQUEST,
+                        relatedEntity = client.label,
+                        status = "GITHUB_SEARCH_OK",
+                        safeMessage = "GitHub Search (${parsed.mode}, cached=${result.cached}) in ${result.latencyMs}ms"
+                    )
+                )
+                respondJson(call, HttpStatusCode.OK, result.payload.toString())
+            }
+            is GitHubSearchGatewayResult.Failure -> {
+                db.metricAndLogDao().insertMetric(
+                    RequestMetricEntity(
+                        requestId = reqId,
+                        providerId = "github",
+                        providerName = "GitHub Search",
+                        modelId = "github:${parsed.mode}",
+                        deviceName = client.label,
+                        endpoint = "/v1/search/github",
+                        statusCode = result.statusCode,
+                        success = false,
+                        latencyMs = 0L,
+                        fallbackAttempts = result.attempts,
+                        routingMode = "PAT_ROTATION",
+                        errorCode = result.errorCode,
+                        safeErrorMessage = result.safeMessage
+                    )
+                )
+                db.metricAndLogDao().insertLog(
+                    ActivityLogEntity(
+                        category = ActivityCategory.PROVIDER_ERROR,
+                        relatedEntity = client.label,
+                        status = "GITHUB_SEARCH_FAILED",
+                        safeMessage = "${result.errorCode}: ${result.safeMessage}"
+                    )
+                )
+                result.retryAfterSeconds?.let { sec ->
+                    call.response.header(HttpHeaders.RetryAfter, sec.toString())
+                }
+                respondJson(
+                    call,
+                    HttpStatusCode.fromValue(result.statusCode.coerceIn(400, 599)),
+                    GatewayApiContract.formatSearchErrorEnvelope(
+                        code = result.errorCode,
+                        message = result.safeMessage,
+                        retryAfterSeconds = result.retryAfterSeconds
+                    )
+                )
+            }
+        }
+    }
+
     private suspend fun respondUnsupportedEndpoint(
         call: ApplicationCall,
         endpoint: String,
@@ -921,16 +1143,30 @@ class LocalGatewayHttpServer(
         respondJson(call, HttpStatusCode.NotImplemented, payload.toString())
     }
 
-    private suspend fun readBoundedBody(call: ApplicationCall, maxBytes: Int): String? {
+    private suspend fun readBoundedBody(
+        call: ApplicationCall,
+        maxBytes: Int,
+        searchErrorFormat: Boolean = false
+    ): String? {
         val contentLengthHeader = call.request.headers[HttpHeaders.ContentLength]
         if (contentLengthHeader != null) {
             val declaredLen = contentLengthHeader.toLongOrNull()
             if (declaredLen == null || declaredLen < 0L) {
-                respondJson(call, HttpStatusCode.BadRequest, """{"error":{"message":"Invalid Content-Length header","type":"invalid_request_error"}}""")
+                val body = if (searchErrorFormat) {
+                    GatewayApiContract.formatSearchErrorEnvelope("invalid_request", "Invalid Content-Length header")
+                } else {
+                    """{"error":{"message":"Invalid Content-Length header","type":"invalid_request_error"}}"""
+                }
+                respondJson(call, HttpStatusCode.BadRequest, body)
                 return null
             }
             if (declaredLen > maxBytes) {
-                respondJson(call, HttpStatusCode.PayloadTooLarge, """{"error":{"message":"Request body exceeds limit of $maxBytes bytes","type":"invalid_request_error"}}""")
+                val body = if (searchErrorFormat) {
+                    GatewayApiContract.formatSearchErrorEnvelope("payload_too_large", "Request body exceeds limit of $maxBytes bytes")
+                } else {
+                    """{"error":{"message":"Request body exceeds limit of $maxBytes bytes","type":"invalid_request_error"}}"""
+                }
+                respondJson(call, HttpStatusCode.PayloadTooLarge, body)
                 return null
             }
         }
@@ -943,11 +1179,12 @@ class LocalGatewayHttpServer(
             if (read == -1) break
             if (read == 0) continue
             if (out.size() + read > maxBytes) {
-                respondJson(
-                    call,
-                    HttpStatusCode.PayloadTooLarge,
+                val body = if (searchErrorFormat) {
+                    GatewayApiContract.formatSearchErrorEnvelope("payload_too_large", "Request body exceeds limit of $maxBytes bytes")
+                } else {
                     """{"error":{"message":"Request body exceeds limit of $maxBytes bytes","type":"invalid_request_error"}}"""
-                )
+                }
+                respondJson(call, HttpStatusCode.PayloadTooLarge, body)
                 return null
             }
             out.write(buf, 0, read)

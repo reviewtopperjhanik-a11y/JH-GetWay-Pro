@@ -1,0 +1,130 @@
+Upgrade JH GetWay Pro into a 3-Service Key-Rotation Gateway by adding two new independent, token-scoped gateway APIs alongside the existing LLM API (/health, /v1/models, /v1/chat/completions, /v1/responses, /v1/messages), so an external Android client (R7 ATG) can consume LLM, Web Search, and GitHub Search through separate endpoints and scoped bearer tokens.
+
+Do NOT break or modify the existing LLM gateway routes, scopes (CHAT, MODELS_READ, ADMIN), or authentication flow.
+
+1. New Scopes & Separate Token Management
+Add two new device/API scopes:
+- WEB_SEARCH: allows access only to Web Search endpoints (/v1/search/web, /v1/search/web/health).
+- GITHUB_SEARCH: allows access only to GitHub Search endpoints (/v1/search/github, /v1/search/github/health).
+
+In the Gateway UI/Token Manager:
+- Allow generating separate scoped Bearer tokens (e.g., a token with only WEB_SEARCH, a token with only GITHUB_SEARCH, and the existing LLM tokens).
+- Allow adding, removing, enabling, and disabling multiple upstream API keys per provider with per-key health status, usage count, last error, and cooldown state.
+
+2. Service A — Rotated Web Search API
+Create a provider adapter + multi-key rotation pool supporting multiple web search providers (e.g., Tavily, Brave Search, Serper, Exa, and an optional key-less fallback like DuckDuckGo HTML/Instant if configured).
+
+Key Rotation & Caching Rules:
+- Rotate across healthy keys and fallback automatically to the next healthy key/provider if an upstream call returns HTTP 401, 402, 403, 429, or 5xx.
+- Put failed or rate-limited keys on temporary cooldown (e.g., 60s-300s or per Retry-After header) without failing the client request unless ALL keys are exhausted.
+- Add an in-memory or SQLite TTL response cache (e.g., 15 minutes) keyed by normalized (query, max_results, search_depth) so repeated queries do not waste free search credits.
+- Never log or leak upstream provider API keys in responses or client errors.
+
+Web Search Endpoints:
+A) GET /v1/search/web/health
+- Requires Authorization: Bearer <token> with WEB_SEARCH or ADMIN scope.
+- Returns 200 OK JSON:
+  {
+    "status": "ok",
+    "service": "web_search",
+    "active_providers": ["tavily", "brave", "serper"],
+    "available_keys_count": 6,
+    "cache_enabled": true
+  }
+
+B) POST /v1/search/web
+- Requires Authorization: Bearer <token> with WEB_SEARCH scope.
+- Request JSON:
+  {
+    "query": "string (required)",
+    "max_results": 5,
+    "search_depth": "basic",
+    "include_content": true,
+    "freshness_days": 365
+  }
+- Normalized Response JSON (200 OK):
+  {
+    "query": "...",
+    "provider_used": "tavily",
+    "cached": false,
+    "latency_ms": 420,
+    "results": [
+      {
+        "title": "...",
+        "url": "https://...",
+        "snippet": "...",
+        "content": "Bounded readable summary/excerpt (max ~1500 chars)",
+        "published_date": "2025-11-04",
+        "score": 0.92
+      }
+    ]
+  }
+
+3. Service B — Rotated GitHub Search API
+Create a GitHub PAT (Personal Access Token) rotation pool where the user can store 5-10+ free GitHub PATs (public_repo / read-only).
+
+Key Rotation & Caching Rules:
+- Track X-RateLimit-Remaining and X-RateLimit-Reset headers from GitHub REST API (https://api.github.com) for each PAT in the pool.
+- Always pick the healthy PAT with the highest remaining quota (or round-robin among non-throttled PATs). If a PAT gets 401, 403, 429, or remaining == 0, mark it in cooldown until X-RateLimit-Reset and immediately retry with the next healthy PAT.
+- If include_readme is true (for mode == "repositories"), fetch each top repository's README (GET /repos/{owner}/{repo}/readme with Accept: application/vnd.github.raw+json), strip excessive whitespace/images, and bound readme_excerpt to ~2000 characters.
+- Add a TTL cache (e.g., 15-30 minutes) for both search results and README excerpts to conserve quota.
+
+GitHub Search Endpoints:
+A) GET /v1/search/github/health
+- Requires Authorization: Bearer <token> with GITHUB_SEARCH or ADMIN scope.
+- Returns 200 OK JSON:
+  {
+    "status": "ok",
+    "service": "github_search",
+    "pat_pool_size": 5,
+    "healthy_tokens": 5,
+    "cache_enabled": true
+  }
+
+B) POST /v1/search/github
+- Requires Authorization: Bearer <token> with GITHUB_SEARCH scope.
+- Request JSON:
+  {
+    "query": "string (required)",
+    "mode": "repositories",
+    "language": "Kotlin",
+    "sort": "stars",
+    "max_results": 5,
+    "include_readme": true
+  }
+  (Support mode: "repositories" -> GitHub /search/repositories, and "code" -> GitHub /search/code)
+- Normalized Response JSON (200 OK):
+  {
+    "query": "...",
+    "mode": "repositories",
+    "cached": false,
+    "latency_ms": 380,
+    "total_count": 42,
+    "results": [
+      {
+        "full_name": "owner/repo-name",
+        "html_url": "https://github.com/owner/repo-name",
+        "description": "...",
+        "stars": 1840,
+        "forks": 145,
+        "language": "Kotlin",
+        "license": "MIT",
+        "updated_at": "2026-08-19T12:00:00Z",
+        "topics": ["android", "kotlin"],
+        "readme_excerpt": "Bounded README summary (max ~2000 chars)..."
+      }
+    ]
+  }
+
+4. Standard Error & Root Health Compatibility
+- On GET /health (existing root health endpoint), preserve existing fields and optionally include capability flags:
+  "services": { "llm": true, "web_search": true, "github_search": true }
+- For all errors (401, 403, 429, 400, 502), return a consistent JSON error envelope:
+  {
+    "error": {
+      "code": "rate_limit_exhausted",
+      "message": "Safe human-readable error message without exposing upstream keys",
+      "retry_after_seconds": 30
+    }
+  }
+- Include unit/integration tests verifying: scope isolation (WEB_SEARCH token cannot call /v1/chat/completions or /v1/search/github and vice-versa), automatic key rotation when a key returns 429, cache hit behavior, and normalized JSON schemas.

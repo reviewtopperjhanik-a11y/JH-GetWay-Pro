@@ -182,6 +182,10 @@ fun GatewayScreen(
                     "/v1/chat/completions" to true,
                     "/v1/responses" to true,
                     "/v1/messages" to true,
+                    "/v1/search/web" to true,
+                    "/v1/search/web/health" to true,
+                    "/v1/search/github" to true,
+                    "/v1/search/github/health" to true,
                     "/v1/embeddings" to false,
                     "/v1/images/generations" to false,
                     "/v1/audio/transcriptions" to false,
@@ -211,9 +215,15 @@ fun GatewayScreen(
                     }
                 }
                 Spacer(Modifier.height(10.dp))
-                if (selectedEndpoint != "/v1/models" && selectedEndpoint != "/health") {
-                    OutlinedTextField(value = testModel, onValueChange = { testModel = it }, label = { Text(s.modelId) }, textStyle = MonoTextStyle, singleLine = true, modifier = Modifier.fillMaxWidth())
-                    Spacer(Modifier.height(6.dp))
+                val isGetEndpoint = selectedEndpoint == "/v1/models" ||
+                    selectedEndpoint == "/health" ||
+                    selectedEndpoint.endsWith("/health")
+                val isSearchPostEndpoint = selectedEndpoint == "/v1/search/web" || selectedEndpoint == "/v1/search/github"
+                if (!isGetEndpoint) {
+                    if (!isSearchPostEndpoint) {
+                        OutlinedTextField(value = testModel, onValueChange = { testModel = it }, label = { Text(s.modelId) }, textStyle = MonoTextStyle, singleLine = true, modifier = Modifier.fillMaxWidth())
+                        Spacer(Modifier.height(6.dp))
+                    }
                     OutlinedTextField(value = testPrompt, onValueChange = { testPrompt = it }, label = { Text(s.payloadPromptLabel) }, singleLine = true, modifier = Modifier.fillMaxWidth())
                     Spacer(Modifier.height(8.dp))
                 }

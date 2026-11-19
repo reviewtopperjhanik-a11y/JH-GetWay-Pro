@@ -4,8 +4,10 @@ import android.app.Application
 import com.example.data.local.AppPreferences
 import com.example.data.local.BackupManager
 import com.example.data.local.JhGetWayDatabase
+import com.example.gateway.GitHubSearchRouterService
 import com.example.gateway.LocalGatewayHttpServer
 import com.example.gateway.SmartRouterEngine
+import com.example.gateway.WebSearchRouterService
 import com.example.gateway.WorkflowEngine
 import com.example.network.McpHttpClient
 import com.example.network.ProviderHttpClient
@@ -22,7 +24,17 @@ class JhGetWayApplication : Application() {
     val providerHttpClient by lazy { ProviderHttpClient() }
     val mcpHttpClient by lazy { McpHttpClient() }
     val smartRouter by lazy { SmartRouterEngine(database, providerHttpClient) }
-    val gatewayServer by lazy { LocalGatewayHttpServer(database, smartRouter, preferences) }
+    val webSearchRouter by lazy { WebSearchRouterService(database.servicePoolDao(), preferences) }
+    val githubSearchRouter by lazy { GitHubSearchRouterService(database.servicePoolDao()) }
+    val gatewayServer by lazy {
+        LocalGatewayHttpServer(
+            db = database,
+            router = smartRouter,
+            preferences = preferences,
+            webSearchRouter = webSearchRouter,
+            githubSearchRouter = githubSearchRouter
+        )
+    }
     val workflowEngine by lazy { WorkflowEngine(database, smartRouter, mcpHttpClient) }
     val backupManager by lazy { BackupManager(database, preferences, context = this) }
 

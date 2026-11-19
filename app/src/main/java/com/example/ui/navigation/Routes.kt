@@ -19,6 +19,7 @@ object Routes {
     const val ANALYTICS = "analytics"
     const val DEVICES = "devices"
     const val VAULT = "vault"
+    const val SEARCH_POOLS = "search_pools"
     const val ACTIVITY_LOGS = "activity_logs"
     const val SETTINGS = "settings"
 

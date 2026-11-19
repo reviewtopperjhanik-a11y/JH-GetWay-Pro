@@ -657,6 +657,38 @@ interface AppStrings {
     val openCodeCuratedCountFormat: String
     val openCodeResolvedTargetPrefix: String
     val openCodeDefaultBadge: String
+
+    // Search & GitHub Pools & Scoped Token Presets
+    val navSearchPools: String
+    val searchPoolsTitle: String
+    val searchPoolsSubtitle: String
+    val searchPoolFilterAll: String
+    val searchPoolFilterWeb: String
+    val searchPoolFilterGithub: String
+    val addPoolKeyAction: String
+    val addPoolKeysBatchHint: String
+    val poolProviderLabel: String
+    val poolKeysInputLabel: String
+    val poolKeyLabelHint: String
+    val poolPriorityLabel: String
+    val poolDuckDuckGoFallbackTitle: String
+    val poolDuckDuckGoFallbackDesc: String
+    val poolClearCacheAction: String
+    val poolCacheClearedMessage: String
+    val poolStatusCooldownPrefix: String
+    val poolQuotaRemainingFormat: String
+    val poolUsageCountFormat: String
+    val poolTestKeyAction: String
+    val poolResetCooldownAction: String
+    val poolEmptyTitle: String
+    val poolEmptyMessage: String
+    val deletePoolKeyConfirmTitle: String
+    val deletePoolKeyConfirmMessage: String
+    val scopePresetsLabel: String
+    val scopePresetLlmClient: String
+    val scopePresetWebSearchOnly: String
+    val scopePresetGitHubSearchOnly: String
+    val scopePresetAllServices: String
 }
 
 val LocalStrings = staticCompositionLocalOf<AppStrings> { EnglishStrings }

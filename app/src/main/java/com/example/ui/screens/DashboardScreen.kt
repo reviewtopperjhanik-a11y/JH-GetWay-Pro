@@ -304,6 +304,7 @@ fun DashboardScreen(
                 Triple(s.navWorkflows, Icons.Default.AccountTree, Routes.WORKFLOWS),
                 Triple(s.navVault, Icons.Default.VpnKey, Routes.VAULT),
                 Triple(s.navDevices, Icons.Default.Devices, Routes.DEVICES),
+                Triple(s.navSearchPools, Icons.Default.Search, Routes.SEARCH_POOLS),
                 Triple(s.navActivityLogs, Icons.Default.History, Routes.ACTIVITY_LOGS)
             )
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {

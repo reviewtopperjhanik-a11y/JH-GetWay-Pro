@@ -72,7 +72,8 @@ data class GatewaySettingsState(
     val autoFreeIncludeLocal: Boolean = false,
     val openCodeSelectionMode: String = "auto",
     val autoAllowPaidModels: Boolean = true,
-    val preferConfiguredDefaultInAuto: Boolean = true
+    val preferConfiguredDefaultInAuto: Boolean = true,
+    val webSearchDuckDuckGoFallbackEnabled: Boolean = false
 )
 
 class AppPreferences(private val context: Context) {
@@ -126,6 +127,7 @@ class AppPreferences(private val context: Context) {
         val OPENCODE_SELECTION_MODE = stringPreferencesKey("opencode_selection_mode")
         val AUTO_ALLOW_PAID_MODELS = booleanPreferencesKey("auto_allow_paid_models")
         val PREFER_CONFIGURED_DEFAULT_IN_AUTO = booleanPreferencesKey("prefer_configured_default_in_auto")
+        val WEB_SEARCH_DDG_FALLBACK = booleanPreferencesKey("web_search_ddg_fallback")
     }
 
     val settingsFlow: Flow<GatewaySettingsState> = context.dataStore.data.map { p ->
@@ -178,7 +180,8 @@ class AppPreferences(private val context: Context) {
             autoFreeIncludeLocal = p[Keys.AUTO_FREE_INCLUDE_LOCAL] ?: false,
             openCodeSelectionMode = p[Keys.OPENCODE_SELECTION_MODE] ?: "auto",
             autoAllowPaidModels = p[Keys.AUTO_ALLOW_PAID_MODELS] ?: true,
-            preferConfiguredDefaultInAuto = p[Keys.PREFER_CONFIGURED_DEFAULT_IN_AUTO] ?: true
+            preferConfiguredDefaultInAuto = p[Keys.PREFER_CONFIGURED_DEFAULT_IN_AUTO] ?: true,
+            webSearchDuckDuckGoFallbackEnabled = p[Keys.WEB_SEARCH_DDG_FALLBACK] ?: false
         )
     }
 
@@ -311,6 +314,10 @@ class AppPreferences(private val context: Context) {
         it[Keys.PREFER_CONFIGURED_DEFAULT_IN_AUTO] = preferConfiguredDefaultInAuto
     }
 
+    suspend fun setWebSearchDuckDuckGoFallbackEnabled(enabled: Boolean) = context.dataStore.edit {
+        it[Keys.WEB_SEARCH_DDG_FALLBACK] = enabled
+    }
+
     suspend fun restorePortablePreferences(
         snapshot: GatewaySettingsState,
         remoteAuthTokenEnc: String?
@@ -358,6 +365,7 @@ class AppPreferences(private val context: Context) {
         p[Keys.OPENCODE_SELECTION_MODE] = snapshot.openCodeSelectionMode
         p[Keys.AUTO_ALLOW_PAID_MODELS] = snapshot.autoAllowPaidModels
         p[Keys.PREFER_CONFIGURED_DEFAULT_IN_AUTO] = snapshot.preferConfiguredDefaultInAuto
+        p[Keys.WEB_SEARCH_DDG_FALLBACK] = snapshot.webSearchDuckDuckGoFallbackEnabled
     }
 
     suspend fun resetSafeAppSettings() {
@@ -443,7 +451,8 @@ class AppPreferences(private val context: Context) {
             "log_retention_days",
             "usage_retention_days",
             "playground_retention_days",
-            "github_update_repo"
+            "github_update_repo",
+            "web_search_ddg_fallback"
         )
     }
 }

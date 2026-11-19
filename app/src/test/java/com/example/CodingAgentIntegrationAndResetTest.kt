@@ -652,7 +652,7 @@ class CodingAgentIntegrationAndResetTest {
     fun resetSafeAppSettings_resetsOnlyUiAndGeneralPrefsAndPreservesAllDbAndProtectedSettingsIdempotently() {
         // Check complete classification coverage between SAFE_RESET_KEY_NAMES & PROTECTED_KEY_NAMES
         assertTrue(AppPreferences.SAFE_RESET_KEY_NAMES.intersect(AppPreferences.PROTECTED_KEY_NAMES).isEmpty())
-        assertEquals(49, AppPreferences.SAFE_RESET_KEY_NAMES.size + AppPreferences.PROTECTED_KEY_NAMES.size)
+        assertEquals(50, AppPreferences.SAFE_RESET_KEY_NAMES.size + AppPreferences.PROTECTED_KEY_NAMES.size)
 
         val vmStore = ViewModelStore()
         val vm = ViewModelProvider(vmStore, ViewModelProvider.AndroidViewModelFactory.getInstance(app))[GatewayViewModel::class.java]

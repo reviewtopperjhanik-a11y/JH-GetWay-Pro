@@ -28,8 +28,13 @@ object MaskingUtils {
         sanitized = sanitized
             .replace(Regex("(sk-[A-Za-z0-9_\\-]{8,})"), "[REDACTED_KEY]")
             .replace(Regex("(AIza[A-Za-z0-9_\\-]{12,})"), "[REDACTED_KEY]")
+            .replace(Regex("(gh[pousr]_[A-Za-z0-9_]{10,})"), "[REDACTED_GITHUB_TOKEN]")
+            .replace(Regex("(github_pat_[A-Za-z0-9_]{10,})"), "[REDACTED_GITHUB_TOKEN]")
+            .replace(Regex("(tvly-[A-Za-z0-9_\\-]{8,})"), "[REDACTED_KEY]")
+            .replace(Regex("(BSA[A-Za-z0-9_\\-]{8,})"), "[REDACTED_KEY]")
             .replace(Regex("(jhgw_[A-Za-z0-9_\\-]{8,})"), "[REDACTED_TOKEN]")
             .replace(Regex("(Bearer\\s+[A-Za-z0-9._\\-]{8,})", RegexOption.IGNORE_CASE), "Bearer [REDACTED]")
+            .replace(Regex("(token\\s+[A-Za-z0-9._\\-]{8,})", RegexOption.IGNORE_CASE), "token [REDACTED]")
             .replace(Regex("([?&]key=)[^&\\s]+", RegexOption.IGNORE_CASE), "$1[REDACTED]")
         return sanitized.take(320)
     }

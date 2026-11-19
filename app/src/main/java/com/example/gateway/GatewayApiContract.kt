@@ -38,6 +38,23 @@ sealed interface ContractParseResult<out T> {
     ) : ContractParseResult<Nothing>
 }
 
+data class ParsedWebSearchRequest(
+    val query: String,
+    val maxResults: Int = 5,
+    val searchDepth: String = "basic",
+    val includeContent: Boolean = true,
+    val freshnessDays: Int? = null
+)
+
+data class ParsedGitHubSearchRequest(
+    val query: String,
+    val mode: String = "repositories",
+    val language: String? = null,
+    val sort: String = "stars",
+    val maxResults: Int = 5,
+    val includeReadme: Boolean = true
+)
+
 object GatewayApiContract {
 
     val supportedEndpoints: List<String> = listOf(
@@ -45,7 +62,11 @@ object GatewayApiContract {
         "/v1/models",
         "/v1/chat/completions",
         "/v1/responses",
-        "/v1/messages"
+        "/v1/messages",
+        "/v1/search/web",
+        "/v1/search/web/health",
+        "/v1/search/github",
+        "/v1/search/github/health"
     )
 
     val unsupportedEndpoints: List<String> = listOf(
@@ -1332,4 +1353,88 @@ object GatewayApiContract {
         is JSONArray -> (0 until raw.length()).mapNotNull { raw.optString(it).takeIf(String::isNotEmpty) }
         else -> emptyList()
     }
+
+    // -------------------------------------------------------------------------
+    // Search Services (/v1/search/web, /v1/search/github)
+    // -------------------------------------------------------------------------
+
+    fun formatSearchErrorEnvelope(
+        code: String,
+        message: String,
+        retryAfterSeconds: Int? = null
+    ): String {
+        val err = JSONObject()
+            .put("code", code)
+            .put("message", message)
+        if (retryAfterSeconds != null) {
+            err.put("retry_after_seconds", retryAfterSeconds.coerceAtLeast(0))
+        }
+        return JSONObject().put("error", err).toString()
+    }
+
+    fun parseWebSearchRequest(body: String): ContractParseResult<ParsedWebSearchRequest> {
+        val req = runCatching { JSONObject(body) }.getOrNull()
+            ?: return ContractParseResult.Invalid(
+                HttpStatusCode.BadRequest, "invalid_request_error", "invalid_json", "Invalid JSON body"
+            )
+        val query = req.optString("query").trim()
+        if (query.isBlank()) {
+            return ContractParseResult.Invalid(
+                HttpStatusCode.BadRequest, "invalid_request_error", "invalid_request", "Missing required non-empty 'query' field"
+            )
+        }
+        val maxResults = req.optInt("max_results", 5).coerceIn(1, 20)
+        val rawDepth = req.optString("search_depth", "basic").trim().lowercase()
+        val searchDepth = if (rawDepth == "advanced") "advanced" else "basic"
+        val includeContent = req.optBoolean("include_content", true)
+        val freshnessDays = if (req.has("freshness_days") && !req.isNull("freshness_days")) {
+            req.optInt("freshness_days").takeIf { it > 0 }
+        } else null
+        return ContractParseResult.Valid(
+            ParsedWebSearchRequest(
+                query = query,
+                maxResults = maxResults,
+                searchDepth = searchDepth,
+                includeContent = includeContent,
+                freshnessDays = freshnessDays
+            )
+        )
+    }
+
+    fun parseGitHubSearchRequest(body: String): ContractParseResult<ParsedGitHubSearchRequest> {
+        val req = runCatching { JSONObject(body) }.getOrNull()
+            ?: return ContractParseResult.Invalid(
+                HttpStatusCode.BadRequest, "invalid_request_error", "invalid_json", "Invalid JSON body"
+            )
+        val query = req.optString("query").trim()
+        if (query.isBlank()) {
+            return ContractParseResult.Invalid(
+                HttpStatusCode.BadRequest, "invalid_request_error", "invalid_request", "Missing required non-empty 'query' field"
+            )
+        }
+        val rawMode = req.optString("mode", "repositories").trim().lowercase()
+        if (rawMode != "repositories" && rawMode != "code") {
+            return ContractParseResult.Invalid(
+                HttpStatusCode.BadRequest,
+                "invalid_request_error",
+                "invalid_request",
+                "Unsupported GitHub search mode '$rawMode'; expected 'repositories' or 'code'"
+            )
+        }
+        val language = req.optString("language").trim().takeIf { it.isNotEmpty() && !req.isNull("language") }
+        val sort = req.optString("sort", "stars").trim().lowercase().ifBlank { "stars" }
+        val maxResults = req.optInt("max_results", 5).coerceIn(1, 20)
+        val includeReadme = req.optBoolean("include_readme", true)
+        return ContractParseResult.Valid(
+            ParsedGitHubSearchRequest(
+                query = query,
+                mode = rawMode,
+                language = language,
+                sort = sort,
+                maxResults = maxResults,
+                includeReadme = includeReadme
+            )
+        )
+    }
 }
+

@@ -48,6 +48,7 @@ import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Hub
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Memory
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.VpnKey
 import androidx.compose.material3.AlertDialog
@@ -120,6 +121,7 @@ import com.example.ui.screens.PlaygroundScreen
 import com.example.ui.screens.ProviderDetailScreen
 import com.example.ui.screens.ProviderDirectoryHelper
 import com.example.ui.screens.ProvidersScreen
+import com.example.ui.screens.SearchAndGithubPoolsScreen
 import com.example.ui.screens.SettingsScreen
 import com.example.ui.screens.SmartRouterScreen
 import com.example.ui.screens.VaultScreen
@@ -450,6 +452,7 @@ private fun MainGatewayScaffold(viewModel: GatewayViewModel) {
         NavMenuItem(Routes.MCP_SERVERS, s.navMcpServers, Icons.Default.Extension, "more_nav_mcp"),
         NavMenuItem(Routes.WORKFLOWS, s.navWorkflows, Icons.Default.AccountTree, "more_nav_workflows"),
         NavMenuItem(Routes.DEVICES, s.navDevices, Icons.Default.Devices, "more_nav_devices"),
+        NavMenuItem(Routes.SEARCH_POOLS, s.navSearchPools, Icons.Default.Search, "more_nav_search_pools"),
         NavMenuItem(Routes.VAULT, s.navVault, Icons.Default.VpnKey, "more_nav_vault"),
         NavMenuItem(Routes.ACTIVITY_LOGS, s.navActivityLogs, Icons.Default.History, "more_nav_logs"),
         NavMenuItem(Routes.SETTINGS, s.navSettings, Icons.Default.Settings, "more_nav_settings")
@@ -481,6 +484,7 @@ private fun MainGatewayScaffold(viewModel: GatewayViewModel) {
             Routes.PLAYGROUND -> s.navPlayground
             Routes.ANALYTICS -> s.navAnalytics
             Routes.DEVICES -> s.navDevices
+            Routes.SEARCH_POOLS -> s.navSearchPools
             Routes.VAULT -> s.navVault
             Routes.ACTIVITY_LOGS -> s.navActivityLogs
             Routes.SETTINGS -> s.navSettings
@@ -614,6 +618,9 @@ private fun MainGatewayScaffold(viewModel: GatewayViewModel) {
             }
             composable(Routes.DEVICES) {
                 DevicesScreen(viewModel = viewModel)
+            }
+            composable(Routes.SEARCH_POOLS) {
+                SearchAndGithubPoolsScreen(viewModel = viewModel)
             }
             composable(Routes.VAULT) {
                 VaultScreen(viewModel = viewModel)

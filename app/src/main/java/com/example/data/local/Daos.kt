@@ -343,3 +343,74 @@ interface PlaygroundDao {
     @Query("DELETE FROM playground_messages")
     suspend fun clearMessages()
 }
+
+@Dao
+interface ServicePoolDao {
+    @Query("SELECT * FROM service_pool_keys ORDER BY priority ASC, createdAt ASC")
+    fun observeAll(): Flow<List<ServicePoolKeyEntity>>
+
+    @Query("SELECT * FROM service_pool_keys WHERE serviceType = :serviceType ORDER BY priority ASC, createdAt ASC")
+    fun observeByService(serviceType: ServicePoolType): Flow<List<ServicePoolKeyEntity>>
+
+    @Query("SELECT * FROM service_pool_keys ORDER BY priority ASC, createdAt ASC")
+    suspend fun getAllOnce(): List<ServicePoolKeyEntity>
+
+    @Query("SELECT * FROM service_pool_keys WHERE serviceType = :serviceType ORDER BY priority ASC, createdAt ASC")
+    suspend fun getByServiceOnce(serviceType: ServicePoolType): List<ServicePoolKeyEntity>
+
+    @Query("SELECT * FROM service_pool_keys WHERE id = :id LIMIT 1")
+    suspend fun getByIdOnce(id: String): ServicePoolKeyEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsert(key: ServicePoolKeyEntity)
+
+    @Query("DELETE FROM service_pool_keys WHERE id = :id")
+    suspend fun deleteById(id: String)
+
+    @Query("DELETE FROM service_pool_keys WHERE serviceType = :serviceType")
+    suspend fun clearByService(serviceType: ServicePoolType)
+
+    @Query("DELETE FROM service_pool_keys")
+    suspend fun clearAll()
+
+    @Query(
+        "UPDATE service_pool_keys SET " +
+            "status = :status, " +
+            "usageCount = usageCount + 1, " +
+            "lastUsedAt = :nowMs, " +
+            "lastError = NULL, " +
+            "cooldownUntilMs = :cooldownUntilMs, " +
+            "rateLimitRemaining = :rateLimitRemaining, " +
+            "rateLimitResetAtMs = :rateLimitResetAtMs " +
+            "WHERE id = :id"
+    )
+    suspend fun recordSuccess(
+        id: String,
+        status: KeyStatus,
+        nowMs: Long,
+        cooldownUntilMs: Long?,
+        rateLimitRemaining: Int?,
+        rateLimitResetAtMs: Long?
+    )
+
+    @Query(
+        "UPDATE service_pool_keys SET " +
+            "status = :status, " +
+            "lastUsedAt = :nowMs, " +
+            "lastError = :lastError, " +
+            "cooldownUntilMs = :cooldownUntilMs, " +
+            "rateLimitRemaining = :rateLimitRemaining, " +
+            "rateLimitResetAtMs = :rateLimitResetAtMs " +
+            "WHERE id = :id"
+    )
+    suspend fun recordFailureOrCooldown(
+        id: String,
+        status: KeyStatus,
+        nowMs: Long,
+        lastError: String?,
+        cooldownUntilMs: Long?,
+        rateLimitRemaining: Int?,
+        rateLimitResetAtMs: Long?
+    )
+}
+

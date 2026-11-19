@@ -36,6 +36,8 @@ class EnumConverters {
     @TypeConverter fun toActivityCategory(v: String): ActivityCategory = ActivityCategory.valueOf(v)
     @TypeConverter fun fromAccessTier(v: AccessTier): String = v.name
     @TypeConverter fun toAccessTier(v: String): AccessTier = runCatching { AccessTier.valueOf(v) }.getOrDefault(AccessTier.UNKNOWN)
+    @TypeConverter fun fromServicePoolType(v: ServicePoolType): String = v.name
+    @TypeConverter fun toServicePoolType(v: String): ServicePoolType = runCatching { ServicePoolType.valueOf(v) }.getOrDefault(ServicePoolType.WEB_SEARCH)
 }
 
 @Database(
@@ -54,9 +56,10 @@ class EnumConverters {
         RequestMetricEntity::class,
         ActivityLogEntity::class,
         PlaygroundSessionEntity::class,
-        PlaygroundMessageEntity::class
+        PlaygroundMessageEntity::class,
+        ServicePoolKeyEntity::class
     ],
-    version = 5,
+    version = 6,
     exportSchema = true
 )
 @TypeConverters(EnumConverters::class)
@@ -72,6 +75,7 @@ abstract class JhGetWayDatabase : RoomDatabase() {
     abstract fun deviceDao(): DeviceDao
     abstract fun metricAndLogDao(): MetricAndLogDao
     abstract fun playgroundDao(): PlaygroundDao
+    abstract fun servicePoolDao(): ServicePoolDao
 
     companion object {
         @Volatile private var INSTANCE: JhGetWayDatabase? = null
@@ -137,7 +141,37 @@ abstract class JhGetWayDatabase : RoomDatabase() {
             }
         }
 
-        val ALL_MIGRATIONS = arrayOf(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
+        val MIGRATION_5_6 = object : Migration(5, 6) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `service_pool_keys` (
+                        `id` TEXT NOT NULL,
+                        `serviceType` TEXT NOT NULL,
+                        `providerId` TEXT NOT NULL,
+                        `label` TEXT NOT NULL,
+                        `encryptedKey` TEXT NOT NULL,
+                        `maskedPreview` TEXT NOT NULL,
+                        `priority` INTEGER NOT NULL,
+                        `enabled` INTEGER NOT NULL,
+                        `status` TEXT NOT NULL,
+                        `usageCount` INTEGER NOT NULL,
+                        `lastUsedAt` INTEGER,
+                        `lastError` TEXT,
+                        `cooldownUntilMs` INTEGER,
+                        `rateLimitRemaining` INTEGER,
+                        `rateLimitResetAtMs` INTEGER,
+                        `createdAt` INTEGER NOT NULL,
+                        PRIMARY KEY(`id`)
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_service_pool_keys_serviceType_providerId` ON `service_pool_keys` (`serviceType`, `providerId`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_service_pool_keys_enabled` ON `service_pool_keys` (`enabled`)")
+            }
+        }
+
+        val ALL_MIGRATIONS = arrayOf(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6)
 
         fun getInstance(context: Context): JhGetWayDatabase {
             return INSTANCE ?: synchronized(this) {
