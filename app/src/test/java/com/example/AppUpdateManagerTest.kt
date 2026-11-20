@@ -689,4 +689,97 @@ class AppUpdateManagerTest {
         assertTrue((intent.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION) != 0)
         assertEquals("${context.packageName}.fileprovider", intent.data?.authority)
     }
+
+    @Test
+    fun createUnknownSourcesSettingsIntent_respectsActivityResultFlag() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val launcherIntent = AppUpdateManager.createUnknownSourcesSettingsIntent(context, forActivityResult = true)
+        assertEquals(0, launcherIntent.flags and Intent.FLAG_ACTIVITY_NEW_TASK)
+
+        val directIntent = AppUpdateManager.createUnknownSourcesSettingsIntent(context, forActivityResult = false)
+        assertTrue((directIntent.flags and Intent.FLAG_ACTIVITY_NEW_TASK) != 0)
+    }
+
+    @Test
+    fun checkForUpdate_retryWithoutEtagHandles429AndManifestHttpErrorsClearly() {
+        runBlocking {
+            val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+            val port = server.address.port
+            var mode = "304_then_429"
+            server.createContext("/repos/jhsoft/jh-getway/releases/latest") { exchange ->
+                val ifNoneMatch = exchange.requestHeaders.getFirst("If-None-Match")
+                if (mode == "304_then_429") {
+                    if (ifNoneMatch != null) {
+                        exchange.sendResponseHeaders(304, -1)
+                        exchange.close()
+                    } else {
+                        val body = """{"message":"API rate limit exceeded"}""".toByteArray()
+                        exchange.responseHeaders.add("X-RateLimit-Remaining", "0")
+                        exchange.responseHeaders.add("Retry-After", "60")
+                        exchange.sendResponseHeaders(429, body.size.toLong())
+                        exchange.responseBody.use { it.write(body) }
+                    }
+                } else {
+                    val body = """
+                        {
+                          "tag_name": "v1.0.30",
+                          "html_url": "https://github.com/jhsoft/jh-getway/releases/tag/v1.0.30",
+                          "assets": [
+                            {"name": "JH-GetWay-v1.0.30-release.apk", "browser_download_url": "http://127.0.0.1:$port/dl/release.apk", "size": 1024},
+                            {"name": "update-manifest.json", "browser_download_url": "http://127.0.0.1:$port/dl/manifest.json", "size": 300}
+                          ]
+                        }
+                    """.trimIndent().toByteArray()
+                    exchange.responseHeaders.add("Content-Type", "application/json")
+                    exchange.sendResponseHeaders(200, body.size.toLong())
+                    exchange.responseBody.use { it.write(body) }
+                }
+            }
+            server.createContext("/dl/manifest.json") { exchange ->
+                val body = "Internal Server Error".toByteArray()
+                exchange.sendResponseHeaders(500, body.size.toLong())
+                exchange.responseBody.use { it.write(body) }
+            }
+            server.start()
+
+            try {
+                val base = "http://127.0.0.1:$port"
+                val store = com.example.updater.InMemoryUpdateCacheStore()
+                store.put(
+                    "${base}|jhsoft/jh-getway|debug=false",
+                    com.example.updater.UpdateCacheEntry(
+                        etag = "\"stale-etag\"",
+                        lastCheckedAtMs = 1L
+                    )
+                )
+
+                val rlRes = AppUpdateManager.checkForUpdate(
+                    repoInput = "jhsoft/jh-getway",
+                    currentVersionCode = 100,
+                    currentVersionName = "1.0.0",
+                    apiBaseUrl = base,
+                    cacheStore = store,
+                    forceRefresh = true
+                )
+                assertTrue("304 retry encountering 429 must return RateLimited, got $rlRes", rlRes is AppUpdateCheckResult.RateLimited)
+
+                mode = "manifest_500"
+                val store2 = com.example.updater.InMemoryUpdateCacheStore()
+                val errRes = AppUpdateManager.checkForUpdate(
+                    repoInput = "jhsoft/jh-getway",
+                    currentVersionCode = 100,
+                    currentVersionName = "1.0.0",
+                    apiBaseUrl = base,
+                    cacheStore = store2,
+                    forceRefresh = true
+                )
+                assertTrue(errRes is AppUpdateCheckResult.Error)
+                assertTrue(
+                    (errRes as AppUpdateCheckResult.Error).message.contains("HTTP 500")
+                )
+            } finally {
+                server.stop(0)
+            }
+        }
+    }
 }

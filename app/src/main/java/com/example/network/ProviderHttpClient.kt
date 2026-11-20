@@ -23,7 +23,9 @@ import com.example.network.adapters.ToolCallDelta
 import com.example.network.adapters.ToolCallPayload
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
@@ -38,6 +40,9 @@ import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.net.SocketTimeoutException
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
+import kotlin.coroutines.coroutineContext
 
 data class ConnectionTestResult(
     val status: ProviderStatus,
@@ -103,6 +108,10 @@ class ProviderHttpClient(
     private val dnsResolver: DnsResolver = SystemDnsResolver
 ) {
     private val jsonMedia = "application/json; charset=utf-8".toMediaType()
+    private val baseClient: OkHttpClient = OkHttpClient.Builder()
+        .followRedirects(false)
+        .followSslRedirects(false)
+        .build()
 
     companion object {
         private const val MAX_RESPONSE_BYTES = 2 * 1024 * 1024 // 2 MB cap for non-streaming bodies
@@ -114,13 +123,11 @@ class ProviderHttpClient(
         connectTimeoutSec: Int = minOf(timeoutSec, 10),
         callTimeoutSec: Int? = null
     ): OkHttpClient {
-        val builder = OkHttpClient.Builder()
+        val builder = baseClient.newBuilder()
             .connectTimeout(connectTimeoutSec.toLong().coerceIn(2, 15), TimeUnit.SECONDS)
             .readTimeout(timeoutSec.toLong().coerceIn(2, 300), TimeUnit.SECONDS)
             .writeTimeout(timeoutSec.toLong().coerceIn(2, 120), TimeUnit.SECONDS)
             .dns(NetworkAddressClassifier.pinnedSafeDns(allowLocalHttp, dnsResolver))
-            .followRedirects(false)
-            .followSslRedirects(false)
         if (callTimeoutSec != null) {
             builder.callTimeout(callTimeoutSec.toLong().coerceIn(2, 300), TimeUnit.SECONDS)
         }
@@ -361,25 +368,35 @@ class ProviderHttpClient(
                 connectTimeoutSec = connectTimeoutSec,
                 callTimeoutSec = timeoutSec
             )
-            client.newCall(request).execute().use { resp ->
-                val latency = (System.nanoTime() - start) / 1_000_000L
-                val bodyStr = readBoundedBody(resp)
-                if (!resp.isSuccessful) {
-                    return@withContext adapter.normalizeHttpError(resp.code, bodyStr, latency, apiKey)
-                }
-                val parsed = adapter.parseChatResponse(bodyStr, latency, resp.code)
-                if (parsed.success && parsed.content.isEmpty() && parsed.toolCalls.isEmpty()) {
-                    return@withContext ChatExecutionResult(
-                        success = false,
-                        latencyMs = latency,
-                        statusCode = 502,
-                        errorCode = "EMPTY_RESPONSE",
-                        safeErrorMessage = "Upstream provider returned an empty response with no text or tool calls",
-                        retryable = true
-                    )
-                }
-                parsed
+            val call = client.newCall(request)
+            val cancelHandle = coroutineContext[Job]?.invokeOnCompletion { cause ->
+                if (cause != null) call.cancel()
             }
+            try {
+                call.execute().use { resp ->
+                    val latency = (System.nanoTime() - start) / 1_000_000L
+                    val bodyStr = readBoundedBody(resp)
+                    if (!resp.isSuccessful) {
+                        return@withContext adapter.normalizeHttpError(resp.code, bodyStr, latency, apiKey)
+                    }
+                    val parsed = adapter.parseChatResponse(bodyStr, latency, resp.code)
+                    if (parsed.success && parsed.content.isEmpty() && parsed.toolCalls.isEmpty()) {
+                        return@withContext ChatExecutionResult(
+                            success = false,
+                            latencyMs = latency,
+                            statusCode = 502,
+                            errorCode = "EMPTY_RESPONSE",
+                            safeErrorMessage = "Upstream provider returned an empty response with no text or tool calls",
+                            retryable = true
+                        )
+                    }
+                    parsed
+                }
+            } finally {
+                cancelHandle?.dispose()
+            }
+        } catch (ce: CancellationException) {
+            throw ce
         } catch (e: IllegalArgumentException) {
             val latency = (System.nanoTime() - start) / 1_000_000L
             ChatExecutionResult(
@@ -394,9 +411,11 @@ class ProviderHttpClient(
             val latency = (System.nanoTime() - start) / 1_000_000L
             ChatExecutionResult(false, latencyMs = latency, statusCode = 504, errorCode = "TIMEOUT", safeErrorMessage = "Request timed out", retryable = true)
         } catch (e: java.io.InterruptedIOException) {
+            coroutineContext.ensureActive()
             val latency = (System.nanoTime() - start) / 1_000_000L
             ChatExecutionResult(false, latencyMs = latency, statusCode = 504, errorCode = "TIMEOUT", safeErrorMessage = "Request timed out", retryable = true)
         } catch (e: Exception) {
+            coroutineContext.ensureActive()
             val latency = (System.nanoTime() - start) / 1_000_000L
             ChatExecutionResult(
                 success = false,
@@ -504,20 +523,53 @@ class ProviderHttpClient(
             close()
             return@callbackFlow
         }
+        val streamReadTimeoutSec = if (timeoutSec >= 15) maxOf(timeoutSec, 45) else timeoutSec
         val client = buildClient(
-            timeoutSec = timeoutSec,
+            timeoutSec = streamReadTimeoutSec,
             allowLocalHttp = allowLocalHttp,
             connectTimeoutSec = connectTimeoutSec,
             callTimeoutSec = null
         )
-        var activeCall: okhttp3.Call? = null
+        val activeCallRef = AtomicReference<okhttp3.Call?>(null)
+        val emittedAny = AtomicBoolean(false)
+        val terminalSent = AtomicBoolean(false)
+        val timedOutBeforeFirstChunk = AtomicBoolean(false)
+        val start = System.nanoTime()
+
+        val preStreamTimeoutJob = launch {
+            delay(timeoutSec.toLong().coerceAtLeast(2) * 1000L + 200L)
+            if (!emittedAny.get() && terminalSent.compareAndSet(false, true)) {
+                timedOutBeforeFirstChunk.set(true)
+                activeCallRef.getAndSet(null)?.cancel()
+                val latency = (System.nanoTime() - start) / 1_000_000L
+                send(
+                    StreamEvent.Failed(
+                        ChatExecutionResult(
+                            success = false,
+                            latencyMs = latency,
+                            statusCode = 504,
+                            errorCode = "TIMEOUT",
+                            safeErrorMessage = "Upstream stream timed out before producing output (${timeoutSec}s)",
+                            retryable = true
+                        ),
+                        emittedAnyChunk = false
+                    )
+                )
+                close()
+            }
+        }
+
+        suspend fun sendTerminal(event: StreamEvent) {
+            preStreamTimeoutJob.cancel()
+            if (terminalSent.compareAndSet(false, true)) {
+                send(event)
+            }
+        }
 
         val job = launch(Dispatchers.IO) {
-            val start = System.nanoTime()
-            var emittedAny = false
             try {
                 val firstCall = client.newCall(initialRequest)
-                activeCall = firstCall
+                activeCallRef.set(firstCall)
                 var resp = firstCall.execute()
                 if (!resp.isSuccessful &&
                     resp.code == 400 &&
@@ -533,11 +585,11 @@ class ProviderHttpClient(
                     val fallbackReq = if (mentionsStreamOptions) buildRequestWithoutStreamOptions(initialRequest) else null
                     if (fallbackReq != null) {
                         val retryCall = client.newCall(fallbackReq)
-                        activeCall = retryCall
+                        activeCallRef.set(retryCall)
                         resp = retryCall.execute()
                     } else {
                         val latency = (System.nanoTime() - start) / 1_000_000L
-                        send(StreamEvent.Failed(adapter.normalizeHttpError(400, errBody, latency, apiKey), emittedAnyChunk = false))
+                        sendTerminal(StreamEvent.Failed(adapter.normalizeHttpError(400, errBody, latency, apiKey), emittedAnyChunk = false))
                         close()
                         return@launch
                     }
@@ -547,7 +599,7 @@ class ProviderHttpClient(
                     val latency = (System.nanoTime() - start) / 1_000_000L
                     if (!okResp.isSuccessful) {
                         val errBody = readBoundedBody(okResp)
-                        send(StreamEvent.Failed(adapter.normalizeHttpError(okResp.code, errBody, latency, apiKey), emittedAnyChunk = false))
+                        sendTerminal(StreamEvent.Failed(adapter.normalizeHttpError(okResp.code, errBody, latency, apiKey), emittedAnyChunk = false))
                         close()
                         return@launch
                     }
@@ -557,12 +609,12 @@ class ProviderHttpClient(
                         val jsonBody = readBoundedBody(okResp)
                         val nonStreamRes = adapter.parseChatResponse(jsonBody, latency, okResp.code)
                         if (!nonStreamRes.success) {
-                            send(StreamEvent.Failed(nonStreamRes, emittedAnyChunk = false))
+                            sendTerminal(StreamEvent.Failed(nonStreamRes, emittedAnyChunk = false))
                             close()
                             return@launch
                         }
                         if (nonStreamRes.content.isEmpty() && nonStreamRes.toolCalls.isEmpty()) {
-                            send(
+                            sendTerminal(
                                 StreamEvent.Failed(
                                     ChatExecutionResult(
                                         success = false,
@@ -578,18 +630,20 @@ class ProviderHttpClient(
                             close()
                             return@launch
                         }
+                        emittedAny.set(true)
+                        preStreamTimeoutJob.cancel()
                         val tcDeltas = nonStreamRes.toolCalls.map {
                             ToolCallDelta(it.index, it.id, it.name, it.argumentsJson)
                         }
                         send(StreamEvent.Delta(text = nonStreamRes.content, toolCallDeltas = tcDeltas, finishReason = nonStreamRes.finishReason))
-                        send(StreamEvent.Completed(nonStreamRes))
+                        sendTerminal(StreamEvent.Completed(nonStreamRes))
                         close()
                         return@launch
                     }
 
                     val stream = okResp.body?.byteStream()
                     if (stream == null) {
-                        send(
+                        sendTerminal(
                             StreamEvent.Failed(
                                 ChatExecutionResult(false, latencyMs = latency, statusCode = 502, errorCode = "EMPTY_STREAM", safeErrorMessage = "Empty response stream", retryable = true),
                                 emittedAnyChunk = false
@@ -608,6 +662,7 @@ class ProviderHttpClient(
                     var line: String?
                     while (reader.readLine().also { line = it } != null) {
                         ensureActive()
+                        if (timedOutBeforeFirstChunk.get()) break
                         val rawLine = line ?: continue
                         val trimmed = rawLine.trim()
                         if (trimmed.isEmpty()) {
@@ -663,7 +718,8 @@ class ProviderHttpClient(
                         }.getOrNull()
                         if (inlineError != null) {
                             val errLatency = (System.nanoTime() - start) / 1_000_000L
-                            send(
+                            val hasEmitted = emittedAny.get()
+                            sendTerminal(
                                 StreamEvent.Failed(
                                     ChatExecutionResult(
                                         success = false,
@@ -671,9 +727,9 @@ class ProviderHttpClient(
                                         statusCode = 502,
                                         errorCode = "STREAM_ERROR",
                                         safeErrorMessage = MaskingUtils.sanitizeErrorMessage(inlineError, listOf(apiKey)),
-                                        retryable = !emittedAny
+                                        retryable = !hasEmitted
                                     ),
-                                    emittedAnyChunk = emittedAny
+                                    emittedAnyChunk = hasEmitted
                                 )
                             )
                             close()
@@ -681,7 +737,9 @@ class ProviderHttpClient(
                         }
                         if (parsed != null) {
                             if (parsed.textDelta.isNotEmpty() || parsed.toolCallDeltas.isNotEmpty()) {
-                                emittedAny = true
+                                if (timedOutBeforeFirstChunk.get() || terminalSent.get()) break
+                                emittedAny.set(true)
+                                preStreamTimeoutJob.cancel()
                                 accumulated.append(parsed.textDelta)
                                 send(
                                     StreamEvent.Delta(
@@ -690,35 +748,39 @@ class ProviderHttpClient(
                                         finishReason = parsed.finishReason
                                     )
                                 )
-                            } else if (parsed.finishReason != null && !emittedAny) {
-                                // Track terminal finishReason on state even without delta text
                             }
                             if (parsed.isTerminal) break
                         }
                     }
 
+                    if (timedOutBeforeFirstChunk.get() || terminalSent.get()) {
+                        return@launch
+                    }
+
                     val totalLatency = (System.nanoTime() - start) / 1_000_000L
-                    if (!sawAnySseLine && !emittedAny && nonSseBuffer.isNotBlank()) {
+                    if (!sawAnySseLine && !emittedAny.get() && nonSseBuffer.isNotBlank()) {
                         val fallbackRes = adapter.parseChatResponse(nonSseBuffer.toString(), totalLatency, okResp.code)
                         if (!fallbackRes.success) {
-                            send(StreamEvent.Failed(fallbackRes, emittedAnyChunk = false))
+                            sendTerminal(StreamEvent.Failed(fallbackRes, emittedAnyChunk = false))
                             close()
                             return@launch
                         }
                         if (fallbackRes.content.isNotEmpty() || fallbackRes.toolCalls.isNotEmpty()) {
+                            emittedAny.set(true)
+                            preStreamTimeoutJob.cancel()
                             val tcDeltas = fallbackRes.toolCalls.map {
                                 ToolCallDelta(it.index, it.id, it.name, it.argumentsJson)
                             }
                             send(StreamEvent.Delta(text = fallbackRes.content, toolCallDeltas = tcDeltas, finishReason = fallbackRes.finishReason))
-                            send(StreamEvent.Completed(fallbackRes))
+                            sendTerminal(StreamEvent.Completed(fallbackRes))
                             close()
                             return@launch
                         }
                     }
 
                     val finalizedTools = streamState.finalizedToolCalls()
-                    if (!emittedAny && accumulated.isEmpty() && finalizedTools.isEmpty()) {
-                        send(
+                    if (!emittedAny.get() && accumulated.isEmpty() && finalizedTools.isEmpty()) {
+                        sendTerminal(
                             StreamEvent.Failed(
                                 ChatExecutionResult(
                                     success = false,
@@ -737,7 +799,7 @@ class ProviderHttpClient(
 
                     val finalReason = streamState.finishReason
                         ?: if (finalizedTools.isNotEmpty()) "tool_calls" else "stop"
-                    send(
+                    sendTerminal(
                         StreamEvent.Completed(
                             ChatExecutionResult(
                                 success = true,
@@ -754,45 +816,55 @@ class ProviderHttpClient(
                     )
                 }
             } catch (ce: CancellationException) {
-                activeCall?.cancel()
+                preStreamTimeoutJob.cancel()
+                activeCallRef.getAndSet(null)?.cancel()
                 throw ce
             } catch (e: SocketTimeoutException) {
-                val latency = (System.nanoTime() - start) / 1_000_000L
-                send(
-                    StreamEvent.Failed(
-                        ChatExecutionResult(
-                            success = false,
-                            latencyMs = latency,
-                            statusCode = 504,
-                            errorCode = "TIMEOUT",
-                            safeErrorMessage = "Upstream stream timed out",
-                            retryable = !emittedAny
-                        ),
-                        emittedAnyChunk = emittedAny
+                if (!timedOutBeforeFirstChunk.get()) {
+                    val latency = (System.nanoTime() - start) / 1_000_000L
+                    val hasEmitted = emittedAny.get()
+                    sendTerminal(
+                        StreamEvent.Failed(
+                            ChatExecutionResult(
+                                success = false,
+                                latencyMs = latency,
+                                statusCode = 504,
+                                errorCode = "TIMEOUT",
+                                safeErrorMessage = "Upstream stream timed out",
+                                retryable = !hasEmitted
+                            ),
+                            emittedAnyChunk = hasEmitted
+                        )
                     )
-                )
+                }
             } catch (e: Exception) {
-                val latency = (System.nanoTime() - start) / 1_000_000L
-                send(
-                    StreamEvent.Failed(
-                        ChatExecutionResult(
-                            success = false,
-                            latencyMs = latency,
-                            statusCode = 502,
-                            errorCode = "STREAM_ERROR",
-                            safeErrorMessage = MaskingUtils.sanitizeErrorMessage(e.message, listOf(apiKey)),
-                            retryable = !emittedAny
-                        ),
-                        emittedAnyChunk = emittedAny
+                if (!timedOutBeforeFirstChunk.get()) {
+                    val latency = (System.nanoTime() - start) / 1_000_000L
+                    val hasEmitted = emittedAny.get()
+                    sendTerminal(
+                        StreamEvent.Failed(
+                            ChatExecutionResult(
+                                success = false,
+                                latencyMs = latency,
+                                statusCode = 502,
+                                errorCode = "STREAM_ERROR",
+                                safeErrorMessage = MaskingUtils.sanitizeErrorMessage(e.message, listOf(apiKey)),
+                                retryable = !hasEmitted
+                            ),
+                            emittedAnyChunk = hasEmitted
+                        )
                     )
-                )
+                }
+            } finally {
+                preStreamTimeoutJob.cancel()
             }
             close()
         }
 
         awaitClose {
+            preStreamTimeoutJob.cancel()
             job.cancel()
-            activeCall?.cancel()
+            activeCallRef.getAndSet(null)?.cancel()
         }
     }
 

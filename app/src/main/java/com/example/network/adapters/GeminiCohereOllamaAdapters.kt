@@ -245,7 +245,7 @@ class GeminiProviderAdapter : ProviderAdapter {
             if (params.stopSequences.isNotEmpty()) genCfg.put("stopSequences", JSONArray(params.stopSequences))
             if (params.jsonOutput || params.responseFormat?.type == "json_object" || params.responseFormat?.type == "json_schema") {
                 genCfg.put("responseMimeType", "application/json")
-                params.responseFormat?.schemaJson?.let { genCfg.put("responseSchema", it) }
+                params.responseFormat?.schemaJson?.let { genCfg.put("responseSchema", sanitizeGeminiSchema(it)) }
             }
             if (genCfg.length() > 0) put("generationConfig", genCfg)
 
@@ -257,7 +257,7 @@ class GeminiProviderAdapter : ProviderAdapter {
                         JSONObject().apply {
                             put("name", t.name)
                             if (t.description.isNotBlank()) put("description", t.description)
-                            put("parameters", t.parametersSchema)
+                            put("parameters", sanitizeGeminiSchema(t.parametersSchema))
                         }
                     )
                 }
@@ -286,6 +286,63 @@ class GeminiProviderAdapter : ProviderAdapter {
         applyAuthHeaders(builder, apiKey)
         AdapterHelper.applyCustomHeaders(builder, customHeadersJson)
         return builder.build()
+    }
+
+    private fun sanitizeGeminiSchema(schema: JSONObject): JSONObject {
+        val unsupportedKeys = setOf(
+            "\$schema", "\$id", "\$defs", "definitions", "\$comment", "\$ref",
+            "additionalProperties", "default", "title", "examples",
+            "readOnly", "writeOnly", "deprecated", "const", "propertyNames",
+            "patternProperties", "unevaluatedProperties", "minProperties", "maxProperties"
+        )
+        val out = JSONObject()
+        val keys = schema.keys()
+        while (keys.hasNext()) {
+            val key = keys.next()
+            if (key in unsupportedKeys) continue
+            val value = schema.opt(key) ?: continue
+            when {
+                key == "type" && value is JSONArray -> {
+                    var chosen: String? = null
+                    var hasNull = false
+                    for (i in 0 until value.length()) {
+                        val t = value.optString(i)
+                        if (t.equals("null", ignoreCase = true)) {
+                            hasNull = true
+                        } else if (chosen == null && t.isNotBlank()) {
+                            chosen = t
+                        }
+                    }
+                    if (chosen != null) out.put("type", chosen)
+                    if (hasNull) out.put("nullable", true)
+                }
+                key == "properties" && value is JSONObject -> {
+                    val sanitizedProps = JSONObject()
+                    val propKeys = value.keys()
+                    while (propKeys.hasNext()) {
+                        val pKey = propKeys.next()
+                        val propObj = value.optJSONObject(pKey)
+                        if (propObj != null) {
+                            sanitizedProps.put(pKey, sanitizeGeminiSchema(propObj))
+                        }
+                    }
+                    out.put("properties", sanitizedProps)
+                }
+                key == "items" && value is JSONObject -> {
+                    out.put("items", sanitizeGeminiSchema(value))
+                }
+                (key == "anyOf" || key == "oneOf" || key == "allOf") && value is JSONArray -> {
+                    val sanitizedArr = JSONArray()
+                    for (i in 0 until value.length()) {
+                        value.optJSONObject(i)?.let { sanitizedArr.put(sanitizeGeminiSchema(it)) }
+                    }
+                    if (sanitizedArr.length() > 0) out.put(key, sanitizedArr)
+                }
+                value is JSONObject -> out.put(key, sanitizeGeminiSchema(value))
+                else -> out.put(key, value)
+            }
+        }
+        return out
     }
 
     override fun parseChatResponse(bodyStr: String, latencyMs: Long, statusCode: Int): ChatExecutionResult {

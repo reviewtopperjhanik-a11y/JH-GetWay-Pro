@@ -55,8 +55,9 @@ fun SettingsScreen(
     var showClearConfirm by remember { mutableStateOf(false) }
     var infoModalTitle by remember { mutableStateOf<String?>(null) }
     var infoModalBody by remember { mutableStateOf("") }
-    var repoInput by remember(settings.githubUpdateRepo) {
-        mutableStateOf(viewModel.effectiveGithubUpdateRepo(settings))
+    val effectiveRepo = viewModel.effectiveGithubUpdateRepo(settings)
+    var repoInput by remember(effectiveRepo) {
+        mutableStateOf(effectiveRepo)
     }
 
     LazyColumn(
@@ -379,12 +380,12 @@ fun SettingsScreen(
                     }
                     Button(
                         onClick = {
-                            if (repoInput.trim() != viewModel.effectiveGithubUpdateRepo(settings)) {
-                                viewModel.setGithubUpdateRepo(repoInput)
-                            }
-                            viewModel.checkForAppUpdates(silent = false)
+                            viewModel.checkForAppUpdates(
+                                silent = false,
+                                repoInputOverride = repoInput
+                            )
                         },
-                        enabled = !updateState.isChecking && !updateState.isDownloading,
+                        enabled = (!updateState.isChecking || updateState.isSilentCheck) && !updateState.isDownloading,
                         modifier = Modifier.weight(1f).testTag("settings_check_updates_btn")
                     ) {
                         Icon(Icons.Default.SystemUpdate, contentDescription = null, modifier = Modifier.size(16.dp))
@@ -405,7 +406,7 @@ fun SettingsScreen(
                         modifier = Modifier.testTag("settings_auto_update_switch")
                     )
                 }
-                if (viewModel.effectiveGithubUpdateRepo(settings).isBlank()) {
+                if (effectiveRepo.isBlank() && updateState.errorMessage == null) {
                     Text(
                         text = s.repoNotConfiguredMessage,
                         style = MaterialTheme.typography.bodySmall,
@@ -518,23 +519,32 @@ fun SettingsScreen(
                                     Spacer(Modifier.width(6.dp))
                                     Text(s.openReleasePageLabel)
                                 }
-                            } else if (updateState.downloadedApkFile != null) {
-                                Button(
-                                    onClick = { viewModel.launchDownloadedApkInstall() },
-                                    modifier = Modifier.fillMaxWidth().testTag("settings_install_apk_btn")
-                                ) {
-                                    Icon(Icons.Default.InstallMobile, contentDescription = null, modifier = Modifier.size(16.dp))
-                                    Spacer(Modifier.width(6.dp))
-                                    Text(s.installDownloadedAction)
-                                }
                             } else {
-                                Button(
-                                    onClick = { viewModel.downloadAndInstallUpdate() },
-                                    modifier = Modifier.fillMaxWidth().testTag("settings_download_install_btn")
-                                ) {
-                                    Icon(Icons.Default.Download, contentDescription = null, modifier = Modifier.size(16.dp))
-                                    Spacer(Modifier.width(6.dp))
-                                    Text(s.downloadAndInstallAction)
+                                if (updateState.errorMessage == null && !updateState.statusMessage.isNullOrBlank()) {
+                                    Text(
+                                        text = updateState.statusMessage!!,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.primary
+                                    )
+                                }
+                                if (updateState.downloadedApkFile != null) {
+                                    Button(
+                                        onClick = { viewModel.launchDownloadedApkInstall() },
+                                        modifier = Modifier.fillMaxWidth().testTag("settings_install_apk_btn")
+                                    ) {
+                                        Icon(Icons.Default.InstallMobile, contentDescription = null, modifier = Modifier.size(16.dp))
+                                        Spacer(Modifier.width(6.dp))
+                                        Text(s.installDownloadedAction)
+                                    }
+                                } else {
+                                    Button(
+                                        onClick = { viewModel.downloadAndInstallUpdate() },
+                                        modifier = Modifier.fillMaxWidth().testTag("settings_download_install_btn")
+                                    ) {
+                                        Icon(Icons.Default.Download, contentDescription = null, modifier = Modifier.size(16.dp))
+                                        Spacer(Modifier.width(6.dp))
+                                        Text(s.downloadAndInstallAction)
+                                    }
                                 }
                             }
                         }

@@ -13,10 +13,12 @@ import com.example.network.adapters.NormalizedToolDefinition
 import com.example.network.adapters.ProviderAdapterRegistry
 import com.example.network.adapters.ProviderCapabilities
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.*
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.coroutines.coroutineContext
 
 data class RouterDecisionSnapshot(
     val requestId: String,
@@ -365,11 +367,12 @@ class SmartRouterEngine(
                 failedModels = failedModels
             )
             val hasMoreBackupCandidates = allowFallback && attemptCount < maxAttempts && remainingDistinctModels > 0
+            val plannedRemainingAttempts = minOf(remainingDistinctModels, (maxAttempts - attemptCount).coerceAtLeast(0))
             val remainingBudgetSec = ((remainingNs + 999_999_999L) / 1_000_000_000L).toInt().coerceAtLeast(2)
             val attemptTimeoutSec = if (hasMoreBackupCandidates) {
                 minOf(
                     remainingBudgetSec,
-                    minOf(25, (totalBudgetSec * 2 / (remainingDistinctModels + 2)).coerceAtLeast(2))
+                    minOf(25, (totalBudgetSec * 2 / (plannedRemainingAttempts + 2)).coerceAtLeast(2))
                 )
             } else {
                 remainingBudgetSec
@@ -617,11 +620,12 @@ class SmartRouterEngine(
                 failedModels = failedModels
             )
             val hasMoreBackupCandidates = allowFallback && attempt < maxAttempts && remainingDistinctModels > 0
+            val plannedRemainingAttempts = minOf(remainingDistinctModels, (maxAttempts - attempt).coerceAtLeast(0))
             val remainingBudgetSec = ((remainingNs + 999_999_999L) / 1_000_000_000L).toInt().coerceAtLeast(2)
             val attemptTimeoutSec = if (hasMoreBackupCandidates) {
                 minOf(
                     remainingBudgetSec,
-                    minOf(25, (totalBudgetSec * 2 / (remainingDistinctModels + 2)).coerceAtLeast(2))
+                    minOf(25, (totalBudgetSec * 2 / (plannedRemainingAttempts + 2)).coerceAtLeast(2))
                 )
             } else {
                 remainingBudgetSec
@@ -903,11 +907,26 @@ class SmartRouterEngine(
 
         val providers = allProviders.filter { it.enabled }
         val localServers = allLocalServers.filter { it.enabled }
-        val disabledModelKeys = allStoredModels
-            .filter { !it.enabled }
-            .map { "${it.providerId}::${it.modelId.lowercase(Locale.US)}" }
-            .toSet()
-        val enabledModels = allStoredModels.filter { it.enabled }
+        val disabledModelKeys = HashSet<String>()
+        val enabledModels = mutableListOf<ModelEntity>()
+        val enabledModelsByProvider = HashMap<String, MutableList<ModelEntity>>()
+        for (m in allStoredModels) {
+            if (!m.enabled) {
+                disabledModelKeys += "${m.providerId}::${m.modelId.lowercase(Locale.US)}"
+            } else {
+                enabledModels += m
+                enabledModelsByProvider.getOrPut(m.providerId) { mutableListOf() }.add(m)
+            }
+        }
+        val keysByProvider = allKeys.groupBy { it.providerId }
+        val decryptedKeyCache = HashMap<String, String?>(allKeys.size)
+        fun decryptKeyOnce(key: ApiKeyEntity): String? =
+            decryptedKeyCache.getOrPut(key.id) { CryptoManager.decryptResult(key.encryptedKey).getOrNull() }
+        val decryptedLocalCache = HashMap<String, String?>(localServers.size)
+        fun decryptLocalOnce(srv: LocalAiServerEntity): String? =
+            if (!srv.hasAuth) "" else decryptedLocalCache.getOrPut(srv.id) {
+                CryptoManager.decryptResult(srv.encryptedAuthToken).getOrNull()
+            }
 
         val targetAliasOrModel = normalizedRequest.ifBlank { settings.defaultModelId.trim() }
         val matchedRule = rules.firstOrNull { it.modelAlias.equals(targetAliasOrModel, ignoreCase = true) }
@@ -954,10 +973,9 @@ class SmartRouterEngine(
         }
         val hasEligibleCatalogMatch = isSpecificModelRequest && (
             providers.any { p ->
-                p.id in matchedProviderIds && selectKeysForProvider(allKeys.filter { it.providerId == p.id }).isNotEmpty()
+                p.id in matchedProviderIds && selectKeysForProvider(keysByProvider[p.id].orEmpty()).isNotEmpty()
             } || localServers.any { srv ->
-                "local:${srv.id}" in matchedProviderIds &&
-                    (!srv.hasAuth || CryptoManager.decryptResult(srv.encryptedAuthToken).getOrNull() != null)
+                "local:${srv.id}" in matchedProviderIds && decryptLocalOnce(srv) != null
             }
         )
 
@@ -970,6 +988,7 @@ class SmartRouterEngine(
 
         val candidates = mutableListOf<RouteCandidate>()
         for (provider in providers) {
+            coroutineContext.ensureActive()
             if (explicitProviderId != null && provider.id != explicitProviderId) continue
             if (matchedRule != null && matchedRule.allowedProviderIdsCsv.isNotBlank()) {
                 val allowed = matchedRule.allowedProviderIdsCsv.split(",").map { it.trim() }
@@ -986,10 +1005,10 @@ class SmartRouterEngine(
                 continue
             }
 
-            val selectedKeys = selectKeysForProvider(allKeys.filter { it.providerId == provider.id })
+            val selectedKeys = selectKeysForProvider(keysByProvider[provider.id].orEmpty())
             if (selectedKeys.isEmpty()) continue
 
-            val providerModels = enabledModels.filter { it.providerId == provider.id }
+            val providerModels = enabledModelsByProvider[provider.id].orEmpty()
             val matchedCatalogModel = aliasedModels.firstOrNull { it.providerId == provider.id }
             val defaultAllowed = provider.defaultModel.trim().let { def ->
                 def.isNotBlank() && !disabledModelKeys.contains("${provider.id}::${def.lowercase(Locale.US)}")
@@ -1033,7 +1052,7 @@ class SmartRouterEngine(
                 ?: CodingCapabilityProfile(false, 0, "")
 
             for (key in selectedKeys) {
-                val decrypted = CryptoManager.decryptResult(key.encryptedKey).getOrNull().orEmpty()
+                val decrypted = decryptKeyOnce(key).orEmpty()
                 if (decrypted.isBlank()) continue
                 candidates += RouteCandidate(
                     id = provider.id,
@@ -1063,12 +1082,13 @@ class SmartRouterEngine(
         // Local AI servers (strictly isolated: only local server encryptedAuthToken is used; never cloud keys or headers)
         val localCandidates = mutableListOf<RouteCandidate>()
         for (srv in localServers) {
+            coroutineContext.ensureActive()
             val localKey = "local:${srv.id}"
             if (explicitProviderId != null && explicitProviderId != localKey) continue
             if (explicitProviderId == null && hasEligibleCatalogMatch && localKey !in matchedProviderIds) {
                 continue
             }
-            val srvModels = enabledModels.filter { it.providerId == localKey }
+            val srvModels = enabledModelsByProvider[localKey].orEmpty()
             val matchedLocalModel = aliasedModels.firstOrNull { it.providerId == localKey }
             val localDefAllowed = srv.defaultModel.trim().let { def ->
                 def.isNotBlank() && !disabledModelKeys.contains("$localKey::${def.lowercase(Locale.US)}")
@@ -1098,9 +1118,7 @@ class SmartRouterEngine(
             if (explicitProviderId == null && disabledModelKeys.contains("$localKey::${modelId.lowercase(Locale.US)}")) {
                 continue
             }
-            val authToken = if (srv.hasAuth) {
-                CryptoManager.decryptResult(srv.encryptedAuthToken).getOrNull() ?: continue
-            } else ""
+            val authToken = decryptLocalOnce(srv) ?: continue
             val format = if (srv.engineType == LocalEngineType.OLLAMA) ApiFormat.OLLAMA else ApiFormat.OPENAI
             val localCaps = ProviderAdapterRegistry.adapterFor(format).capabilitiesForModel(modelId, resolvedModel)
             if (explicitProviderId == null && !candidateSupportsAttachments(localCaps, intent.needsVision, intent.requiredDocMimes)) {
@@ -1200,7 +1218,7 @@ class SmartRouterEngine(
         return sorted to reason
     }
 
-    private fun resolveLogicalSelectorCandidates(
+    private suspend fun resolveLogicalSelectorCandidates(
         selector: String,
         providers: List<ProviderEntity>,
         localServers: List<LocalAiServerEntity>,
@@ -1211,6 +1229,7 @@ class SmartRouterEngine(
         intent: AnalyzedIntent,
         nowMs: Long
     ): Pair<List<RouteCandidate>, String> {
+        coroutineContext.ensureActive()
         val (eligibleRecords, canonicalDefaultRec) = OpenCodeModelCatalogResolver.resolveEligibleRecords(
             providers = providers,
             localServers = localServers,
@@ -1383,13 +1402,21 @@ class SmartRouterEngine(
             }
         }
 
-        // Expand each ordered EligibleModelRecord to RouteCandidate(s) using active provider keys
+        // Expand each ordered EligibleModelRecord to RouteCandidate(s) using cached per-provider active keys
+        val keysByProvider = allKeys.groupBy { it.providerId }
+        val selectedKeysByProvider = HashMap<String, List<ApiKeyEntity>>(providerMap.size)
+        val decryptedKeyCache = HashMap<String, String?>(allKeys.size)
+        val decryptedLocalCache = HashMap<String, String?>(localMap.size)
+
         val expanded = mutableListOf<RouteCandidate>()
         for (rec in orderedRecords) {
+            coroutineContext.ensureActive()
             if (rec.isLocal) {
                 val srv = localMap[rec.providerId] ?: continue
                 val authToken = if (srv.hasAuth) {
-                    CryptoManager.decryptResult(srv.encryptedAuthToken).getOrNull() ?: continue
+                    decryptedLocalCache.getOrPut(srv.id) {
+                        CryptoManager.decryptResult(srv.encryptedAuthToken).getOrNull()
+                    } ?: continue
                 } else ""
                 expanded += RouteCandidate(
                     id = rec.providerId,
@@ -1415,9 +1442,13 @@ class SmartRouterEngine(
                 )
             } else {
                 val prov = providerMap[rec.providerId] ?: continue
-                val selectedKeys = selectKeysForProvider(allKeys.filter { it.providerId == prov.id })
+                val selectedKeys = selectedKeysByProvider.getOrPut(prov.id) {
+                    selectKeysForProvider(keysByProvider[prov.id].orEmpty())
+                }
                 for (key in selectedKeys) {
-                    val decrypted = CryptoManager.decryptResult(key.encryptedKey).getOrNull().orEmpty()
+                    val decrypted = decryptedKeyCache.getOrPut(key.id) {
+                        CryptoManager.decryptResult(key.encryptedKey).getOrNull()
+                    }.orEmpty()
                     if (decrypted.isBlank()) continue
                     expanded += RouteCandidate(
                         id = prov.id,
@@ -1498,25 +1529,33 @@ class SmartRouterEngine(
         nowMs: Long
     ): Pair<List<RouteCandidate>, String> {
         val candidates = mutableListOf<RouteCandidate>()
-        val disabledModelKeys = allModels
-            .filter { !it.enabled }
-            .map { "${it.providerId}::${it.modelId.lowercase(Locale.US)}" }
-            .toSet()
+        val disabledModelKeys = HashSet<String>()
+        val enabledModelsByProvider = HashMap<String, MutableList<ModelEntity>>()
+        for (m in allModels) {
+            if (!m.enabled) {
+                disabledModelKeys += "${m.providerId}::${m.modelId.lowercase(Locale.US)}"
+            } else {
+                enabledModelsByProvider.getOrPut(m.providerId) { mutableListOf() }.add(m)
+            }
+        }
+        val keysByProvider = allKeys.groupBy { it.providerId }
 
         for (provider in providers) {
             if (isProviderCoolingDown(provider, nowMs)) continue
-            val selectedKeys = selectKeysForProvider(allKeys.filter { it.providerId == provider.id })
+            val selectedKeys = selectKeysForProvider(keysByProvider[provider.id].orEmpty())
             if (selectedKeys.isEmpty()) continue
+            var decryptedKey = ""
             val primaryKey = selectedKeys.firstOrNull { key ->
-                CryptoManager.decryptResult(key.encryptedKey).getOrNull()?.isNotBlank() == true
+                val plain = CryptoManager.decryptResult(key.encryptedKey).getOrNull().orEmpty()
+                if (plain.isNotBlank()) {
+                    decryptedKey = plain
+                    true
+                } else false
             } ?: continue
-            val decryptedKey = CryptoManager.decryptResult(primaryKey.encryptedKey).getOrNull().orEmpty()
             if (decryptedKey.isBlank()) continue
 
-            val freeModels = allModels.filter { m ->
-                m.providerId == provider.id &&
-                    m.enabled &&
-                    m.supportsChat &&
+            val freeModels = enabledModelsByProvider[provider.id].orEmpty().filter { m ->
+                m.supportsChat &&
                     !ModelCapabilityRegistry.isNonChatModel(m.modelType, m.modelId, m.supportsChat) &&
                     m.accessTier == AccessTier.FREE_TIER &&
                     m.freeTierVerified
@@ -1560,10 +1599,8 @@ class SmartRouterEngine(
                 } else ""
                 val format = if (srv.engineType == LocalEngineType.OLLAMA) ApiFormat.OLLAMA else ApiFormat.OPENAI
                 val adapter = ProviderAdapterRegistry.adapterFor(format)
-                val srvModels = allModels.filter { m ->
-                    m.providerId == localKey &&
-                        m.enabled &&
-                        m.supportsChat &&
+                val srvModels = enabledModelsByProvider[localKey].orEmpty().filter { m ->
+                    m.supportsChat &&
                         !ModelCapabilityRegistry.isNonChatModel(m.modelType, m.modelId, m.supportsChat) &&
                         m.accessTier == AccessTier.LOCAL
                 }.distinctBy { it.modelId.lowercase(Locale.US) }

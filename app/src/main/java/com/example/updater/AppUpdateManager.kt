@@ -11,7 +11,10 @@ import android.provider.Settings
 import androidx.annotation.VisibleForTesting
 import androidx.core.content.FileProvider
 import com.example.BuildConfig
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -180,11 +183,11 @@ class SharedPreferencesUpdateCacheStore(context: Context) : UpdateCacheStore {
     }
 
     override fun put(cacheKey: String, entry: UpdateCacheEntry) {
-        prefs.edit().putString(cacheKey, encodeEntry(entry).toString()).apply()
+        prefs.edit().putString(cacheKey, encodeEntry(entry).toString()).commit()
     }
 
     override fun clearAll() {
-        prefs.edit().clear().apply()
+        prefs.edit().clear().commit()
     }
 
     companion object {
@@ -271,6 +274,11 @@ internal data class ParsedRateLimitInfo(
     val resetAtMs: Long?,
     val retryAfterEpochMs: Long?
 )
+
+private sealed interface ManifestFetchResult {
+    data class Success(val json: JSONObject) : ManifestFetchResult
+    data class Failure(val message: String) : ManifestFetchResult
+}
 
 object AppUpdateManager {
 
@@ -639,11 +647,11 @@ object AppUpdateManager {
             return builder.build()
         }
 
-        runCatching {
-            var responseResult: AppUpdateCheckResult? = null
-            var retryWithoutEtag = false
-
-            apiClient.newCall(buildRequest(includeEtag = true)).execute().use { resp ->
+        try {
+            fun handleReleasesResponse(
+                resp: okhttp3.Response,
+                allowRetry304: Boolean
+            ): Pair<AppUpdateCheckResult?, Boolean> {
                 val remainingHeader = resp.header("X-RateLimit-Remaining")
                 val resetHeader = resp.header("X-RateLimit-Reset")
                 val retryAfterHeader = resp.header("Retry-After")
@@ -674,39 +682,42 @@ object AppUpdateManager {
                             checkedAtMs = nowMs
                         )
                     }
-                    when {
-                        cachedEval != null -> {
-                            responseResult = cachedEval
-                        }
+                    return when {
+                        cachedEval != null -> cachedEval to false
                         !updatedCache.cachedLatestTag.isNullOrBlank() &&
                             updatedCache.cachedVersionCode != null &&
                             updatedCache.cachedVersionCode <= currentVersionCode -> {
-                            responseResult = AppUpdateCheckResult.UpToDate(
+                            AppUpdateCheckResult.UpToDate(
                                 currentVersionName = currentVersionName,
                                 latestTag = updatedCache.cachedLatestTag,
                                 fromCache = true,
                                 checkedAtMs = nowMs
-                            )
+                            ) to false
                         }
-                        else -> {
-                            retryWithoutEtag = true
-                        }
+                        allowRetry304 -> null to true
+                        else -> AppUpdateCheckResult.Error(
+                            message = "Unable to refresh GitHub release metadata (HTTP 304).",
+                            httpCode = 304,
+                            cachedRelease = cachedAvailableUpdate,
+                            releasesUrl = releasesUrl
+                        ) to false
                     }
-                    return@use
                 }
 
                 if (resp.code == 404) {
                     store.put(
                         cacheKey,
                         (existingCache ?: UpdateCacheEntry()).copy(
+                            cachedRelease = null,
+                            cachedLatestTag = null,
+                            cachedVersionCode = null,
                             lastCheckedAtMs = nowMs,
                             rateLimitRemaining = remainingVal,
                             rateLimitResetAtMs = resetEpochMs,
                             retryAfterUntilMs = preemptiveCooldownUntil
                         )
                     )
-                    responseResult = AppUpdateCheckResult.NoReleasesPublished(repoSlug, nowMs)
-                    return@use
+                    return AppUpdateCheckResult.NoReleasesPublished(repoSlug, nowMs) to false
                 }
 
                 if (resp.code == 403 || resp.code == 429) {
@@ -719,7 +730,7 @@ object AppUpdateManager {
                         bodyText = errBody,
                         nowMs = nowMs
                     )
-                    if (parsed.isRateLimited) {
+                    return if (parsed.isRateLimited) {
                         val deadline = parsed.retryAfterEpochMs ?: (nowMs + DEFAULT_RATE_LIMIT_COOLDOWN_MS)
                         store.put(
                             cacheKey,
@@ -729,53 +740,50 @@ object AppUpdateManager {
                                 retryAfterUntilMs = deadline
                             )
                         )
-                        responseResult = AppUpdateCheckResult.RateLimited(
+                        AppUpdateCheckResult.RateLimited(
                             repoSlug = repoSlug,
                             retryAfterEpochMs = deadline,
                             message = formatRetryMessage(deadline, nowMs),
                             cachedRelease = cachedAvailableUpdate,
                             releasesUrl = releasesUrl
-                        )
+                        ) to false
                     } else {
                         val detail = runCatching { JSONObject(errBody).optString("message", "").trim() }
                             .getOrNull()
                             ?.takeIf { it.isNotBlank() }
                         val msg = buildString {
-                            append("GitHub access forbidden (HTTP 403)")
+                            append("GitHub access forbidden (HTTP ${resp.code})")
                             if (detail != null) append(": $detail")
                             append(". Repository may be private or restricted. Open Official GitHub Releases manually.")
                         }
-                        responseResult = AppUpdateCheckResult.Error(
+                        AppUpdateCheckResult.Error(
                             message = msg,
-                            httpCode = 403,
+                            httpCode = resp.code,
                             cachedRelease = cachedAvailableUpdate,
                             releasesUrl = releasesUrl
-                        )
+                        ) to false
                     }
-                    return@use
                 }
 
                 if (!resp.isSuccessful) {
-                    responseResult = AppUpdateCheckResult.Error(
+                    return AppUpdateCheckResult.Error(
                         message = "GitHub check failed (HTTP ${resp.code}).",
                         httpCode = resp.code,
                         cachedRelease = cachedAvailableUpdate,
                         releasesUrl = releasesUrl
-                    )
-                    return@use
+                    ) to false
                 }
 
                 val body = resp.body?.string().orEmpty()
                 if (body.isBlank()) {
-                    responseResult = AppUpdateCheckResult.Error(
+                    return AppUpdateCheckResult.Error(
                         message = "Empty response from GitHub Releases API.",
                         cachedRelease = cachedAvailableUpdate,
                         releasesUrl = releasesUrl
-                    )
-                    return@use
+                    ) to false
                 }
 
-                responseResult = parseAndValidateReleaseResponse(
+                return parseAndValidateReleaseResponse(
                     body = body,
                     repoSlug = repoSlug,
                     currentVersionCode = currentVersionCode,
@@ -792,49 +800,20 @@ object AppUpdateManager {
                     cacheKey = cacheKey,
                     existingCache = existingCache,
                     releasesUrl = releasesUrl
-                )
+                ) to false
+            }
+
+            var responseResult: AppUpdateCheckResult?
+            var retryWithoutEtag: Boolean
+            apiClient.newCall(buildRequest(includeEtag = true)).execute().use { resp ->
+                val pair = handleReleasesResponse(resp, allowRetry304 = true)
+                responseResult = pair.first
+                retryWithoutEtag = pair.second
             }
 
             if (retryWithoutEtag) {
                 apiClient.newCall(buildRequest(includeEtag = false)).execute().use { resp ->
-                    if (!resp.isSuccessful) {
-                        return@withContext AppUpdateCheckResult.Error(
-                            message = "GitHub check failed (HTTP ${resp.code}).",
-                            httpCode = resp.code,
-                            cachedRelease = cachedAvailableUpdate,
-                            releasesUrl = releasesUrl
-                        )
-                    }
-                    val body = resp.body?.string().orEmpty()
-                    if (body.isBlank()) {
-                        return@withContext AppUpdateCheckResult.Error(
-                            message = "Empty response from GitHub Releases API.",
-                            cachedRelease = cachedAvailableUpdate,
-                            releasesUrl = releasesUrl
-                        )
-                    }
-                    val remainingVal = resp.header("X-RateLimit-Remaining")?.trim()?.toIntOrNull()
-                    val resetEpochMs = parseEpochSecondsOrMsHeader(resp.header("X-RateLimit-Reset")) ?: 0L
-                    val etagHeader = resp.header("ETag")?.trim()?.takeIf { it.isNotBlank() }
-                    val preemptiveCooldownUntil = if (remainingVal == 0 && resetEpochMs > nowMs) resetEpochMs else 0L
-                    return@withContext parseAndValidateReleaseResponse(
-                        body = body,
-                        repoSlug = repoSlug,
-                        currentVersionCode = currentVersionCode,
-                        currentVersionName = currentVersionName,
-                        expectedPackageId = expectedPackageId,
-                        isDebugFlow = isDebugFlow,
-                        allowLocalTestHttp = allowLocalTestHttp,
-                        etagHeader = etagHeader,
-                        remainingVal = remainingVal,
-                        resetEpochMs = resetEpochMs,
-                        preemptiveCooldownUntil = preemptiveCooldownUntil,
-                        nowMs = nowMs,
-                        store = store,
-                        cacheKey = cacheKey,
-                        existingCache = existingCache,
-                        releasesUrl = releasesUrl
-                    )
+                    responseResult = handleReleasesResponse(resp, allowRetry304 = false).first
                 }
             }
 
@@ -843,7 +822,9 @@ object AppUpdateManager {
                 cachedRelease = cachedAvailableUpdate,
                 releasesUrl = releasesUrl
             )
-        }.getOrElse { err ->
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (err: Throwable) {
             AppUpdateCheckResult.Error(
                 message = err.message ?: "Unable to reach GitHub Releases.",
                 cachedRelease = cachedAvailableUpdate,
@@ -929,12 +910,16 @@ object AppUpdateManager {
             )
         }
 
-        val manifestObj = fetchUpdateManifest(manifestUrl, currentVersionName)
-            ?: return AppUpdateCheckResult.Error(
-                message = "Release manifest is missing or malformed.",
-                cachedRelease = preservedCached,
-                releasesUrl = fallbackReleasesUrl
-            )
+        val manifestObj = when (val manifestRes = fetchUpdateManifest(manifestUrl, currentVersionName)) {
+            is ManifestFetchResult.Success -> manifestRes.json
+            is ManifestFetchResult.Failure -> {
+                return AppUpdateCheckResult.Error(
+                    message = manifestRes.message,
+                    cachedRelease = preservedCached,
+                    releasesUrl = fallbackReleasesUrl
+                )
+            }
+        }
 
         val manifestVersionCode = manifestObj.optInt("versionCode", -1).takeIf { it > 0 }
             ?: return AppUpdateCheckResult.Error(
@@ -1089,19 +1074,35 @@ object AppUpdateManager {
         )
     }
 
-    private fun fetchUpdateManifest(manifestUrl: String, currentVersionName: String): JSONObject? {
-        return runCatching {
+    private fun fetchUpdateManifest(manifestUrl: String, currentVersionName: String): ManifestFetchResult {
+        return try {
             val req = Request.Builder()
                 .url(manifestUrl)
+                .header("Accept", "application/json")
                 .header("User-Agent", "JH-GetWay-Android/$currentVersionName")
                 .get()
                 .build()
             apiClient.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) return@runCatching null
+                if (!resp.isSuccessful) {
+                    return ManifestFetchResult.Failure(
+                        "Failed to fetch release manifest (HTTP ${resp.code})."
+                    )
+                }
                 val raw = resp.body?.string().orEmpty()
-                if (raw.isBlank()) null else JSONObject(raw)
+                if (raw.isBlank()) {
+                    return ManifestFetchResult.Failure("Release update-manifest.json is empty.")
+                }
+                ManifestFetchResult.Success(JSONObject(raw))
             }
-        }.getOrNull()
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: org.json.JSONException) {
+            ManifestFetchResult.Failure("Release manifest is malformed.")
+        } catch (err: Throwable) {
+            ManifestFetchResult.Failure(
+                "Unable to download release manifest: ${err.message ?: "network error"}."
+            )
+        }
     }
 
     suspend fun downloadApkWithProgress(
@@ -1110,6 +1111,7 @@ object AppUpdateManager {
         onProgress: (Int) -> Unit,
         allowLocalHttpForTesting: Boolean = false
     ): Result<File> = withContext(Dispatchers.IO) {
+        val dlContext = coroutineContext
         runCatching {
             val isLocalTestUrl = allowLocalHttpForTesting &&
                 (release.apkDownloadUrl.startsWith("http://127.0.0.1") || release.apkDownloadUrl.startsWith("http://localhost"))
@@ -1218,7 +1220,7 @@ object AppUpdateManager {
                     }
                 }
                 return downloadClient.newCall(reqBuilder.build()).execute().use { resp ->
-                    if (resp.code == 416 && offsetBytes > 0L) {
+                    if ((resp.code == 416 || resp.code == 412) && offsetBytes > 0L) {
                         tempFile.delete()
                         metaFile.delete()
                         return@use executeDownloadAttempt(0L, null)
@@ -1260,6 +1262,7 @@ object AppUpdateManager {
                             FileOutputStream(tempFile, appendResume).use { output ->
                                 val buffer = ByteArray(16 * 1024)
                                 while (true) {
+                                    dlContext.ensureActive()
                                     val read = input.read(buffer)
                                     if (read <= 0) break
                                     downloaded += read
@@ -1318,6 +1321,8 @@ object AppUpdateManager {
             }
 
             executeDownloadAttempt(resumeOffset, resumeEtag)
+        }.onFailure { err ->
+            if (err is CancellationException) throw err
         }
     }
 
@@ -1329,15 +1334,22 @@ object AppUpdateManager {
         }
     }
 
-    fun createUnknownSourcesSettingsIntent(context: Context): Intent {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+    fun createUnknownSourcesSettingsIntent(
+        context: Context,
+        forActivityResult: Boolean = false
+    ): Intent {
+        val intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Intent(
                 Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
                 Uri.parse("package:${context.packageName}")
-            ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
         } else {
-            Intent(Settings.ACTION_SECURITY_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            Intent(Settings.ACTION_SECURITY_SETTINGS)
         }
+        if (!forActivityResult) {
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        return intent
     }
 
     fun hasMatchingSigningCertificate(
@@ -1375,7 +1387,7 @@ object AppUpdateManager {
     @Suppress("DEPRECATION")
     private fun packageManagerSigningFlags(): Int {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            PackageManager.GET_SIGNING_CERTIFICATES
+            PackageManager.GET_SIGNING_CERTIFICATES or PackageManager.GET_SIGNATURES
         } else {
             PackageManager.GET_SIGNATURES
         }

@@ -112,6 +112,7 @@ data class AppLockUiState(
 
 data class AppUpdateUiState(
     val isChecking: Boolean = false,
+    val isSilentCheck: Boolean = false,
     val isDownloading: Boolean = false,
     val downloadProgressPct: Int = 0,
     val availableRelease: AppReleaseInfo? = null,
@@ -120,6 +121,7 @@ data class AppUpdateUiState(
     val errorMessage: String? = null,
     val showPromptDialog: Boolean = false,
     val needsInstallPermission: Boolean = false,
+    val pendingInstallAfterPermission: Boolean = false,
     val signingConflict: Boolean = false,
     val manualReleasesUrl: String? = null,
     val rateLimitResetAtMs: Long? = null,
@@ -187,6 +189,7 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
         settings
     ) { _, _, _, _, s -> s }
         .mapLatest { s -> router.countEligibleAutoFreeModels(s) }
+        .flowOn(Dispatchers.Default)
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0)
 
     val openCodeCuratedCatalog: StateFlow<CuratedModelCatalog> = combine(
@@ -201,7 +204,9 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
             routingRules = r,
             settings = s
         )
-    }.stateIn(
+    }
+        .flowOn(Dispatchers.Default)
+        .stateIn(
         viewModelScope,
         SharingStarted.WhileSubscribed(5000),
         CuratedModelCatalog(
@@ -335,6 +340,11 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
     private var lastCompareRequestConfig = CompareRequestConfig()
     private var workflowJob: Job? = null
     private var updateJob: Job? = null
+    private var downloadUpdateJob: Job? = null
+    private var currentUpdateCheckSilent: Boolean = false
+    private val updateCheckSeq = java.util.concurrent.atomic.AtomicLong(0L)
+    @androidx.annotation.VisibleForTesting
+    internal var updateApiBaseUrlOverride: String? = null
 
     private data class CompareRequestConfig(
         val temperature: Float? = null,
@@ -2765,10 +2775,21 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun setGithubUpdateRepo(rawInput: String) = viewModelScope.launch {
+        val previousRepo = effectiveGithubUpdateRepo(settings.value)
         val trimmed = rawInput.trim()
         if (trimmed.isEmpty()) {
             prefs.setGithubUpdateRepo("")
-            _appUpdateUiState.update { it.copy(errorMessage = null, statusMessage = null) }
+            val nextRepo = BuildConfig.GITHUB_REPO.trim()
+            val repoChanged = !nextRepo.equals(previousRepo, ignoreCase = true)
+            _appUpdateUiState.update { prev ->
+                if (repoChanged) {
+                    AppUpdateUiState(
+                        manualReleasesUrl = nextRepo.takeIf { it.isNotBlank() }?.let { AppUpdateManager.officialReleasesUrl(it) }
+                    )
+                } else {
+                    prev.copy(errorMessage = null, statusMessage = null)
+                }
+            }
             postBanner("GitHub repository cleared")
             return@launch
         }
@@ -2778,7 +2799,16 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
             return@launch
         }
         prefs.setGithubUpdateRepo(normalized)
-        _appUpdateUiState.update { it.copy(errorMessage = null) }
+        val repoChanged = !normalized.equals(previousRepo, ignoreCase = true)
+        _appUpdateUiState.update { prev ->
+            if (repoChanged) {
+                AppUpdateUiState(
+                    manualReleasesUrl = AppUpdateManager.officialReleasesUrl(normalized)
+                )
+            } else {
+                prev.copy(errorMessage = null)
+            }
+        }
         postBanner("Update repository saved: $normalized")
     }
 
@@ -2786,187 +2816,361 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
         prefs.setAutoCheckUpdates(enabled)
     }
 
-    fun checkForAppUpdates(silent: Boolean = false) {
-        if (_appUpdateUiState.value.isChecking || _appUpdateUiState.value.isDownloading) return
-        val currentSettings = settings.value
-        val repoSlug = effectiveGithubUpdateRepo(currentSettings)
-        if (repoSlug.isBlank()) {
-            if (!silent) {
-                _appUpdateUiState.update {
-                    it.copy(errorMessage = "Set a GitHub repository (owner/repo) first.", statusMessage = null)
-                }
-            }
-            return
+    fun checkForAppUpdates(
+        silent: Boolean = false,
+        repoInputOverride: String? = null
+    ) {
+        checkForAppUpdatesInternal(
+            silent = silent,
+            repoInputOverride = repoInputOverride,
+            apiBaseUrl = updateApiBaseUrlOverride ?: "https://api.github.com"
+        )
+    }
+
+    internal fun checkForAppUpdatesInternal(
+        silent: Boolean = false,
+        repoInputOverride: String? = null,
+        apiBaseUrl: String = "https://api.github.com",
+        expectedPackageId: String = BuildConfig.APPLICATION_ID
+    ): Job? {
+        if (_appUpdateUiState.value.isDownloading) return null
+        if (_appUpdateUiState.value.isChecking) {
+            if (silent) return null
+            if (!currentUpdateCheckSilent && repoInputOverride == null) return null
         }
+
         updateJob?.cancel()
-        updateJob = viewModelScope.launch {
-            _appUpdateUiState.update {
-                it.copy(isChecking = true, errorMessage = null, statusMessage = null)
-            }
-            val res = AppUpdateManager.checkForUpdate(
-                repoInput = repoSlug,
-                currentVersionCode = BuildConfig.VERSION_CODE,
-                currentVersionName = BuildConfig.VERSION_NAME,
-                context = app,
-                forceRefresh = !silent
-            )
-            when (res) {
-                is AppUpdateCheckResult.UpdateAvailable -> {
-                    val skipped = currentSettings.skippedUpdateTag.isNotBlank() &&
-                        currentSettings.skippedUpdateTag == res.release.tagName
-                    _appUpdateUiState.update {
-                        it.copy(
-                            isChecking = false,
-                            availableRelease = res.release,
-                            downloadedApkFile = null,
-                            statusMessage = "Update ${res.release.tagName} available",
-                            errorMessage = null,
-                            showPromptDialog = !silent || !skipped,
-                            signingConflict = false,
-                            manualReleasesUrl = res.release.htmlUrl.ifBlank { AppUpdateManager.officialReleasesUrl(res.release.repoSlug) },
-                            rateLimitResetAtMs = null,
-                            lastCheckedAtMs = res.checkedAtMs,
-                            isUsingCachedRelease = res.fromCache
-                        )
+        val mySeq = updateCheckSeq.incrementAndGet()
+        currentUpdateCheckSilent = silent
+
+        val job = viewModelScope.launch {
+            try {
+                val currentSettings = settings.value
+                val previousEffectiveRepo = effectiveGithubUpdateRepo(currentSettings)
+                val repoSlug = if (repoInputOverride != null) {
+                    val trimmedOverride = repoInputOverride.trim()
+                    if (trimmedOverride.isEmpty()) {
+                        if (currentSettings.githubUpdateRepo.isNotBlank()) {
+                            prefs.setGithubUpdateRepo("")
+                        }
+                        val fallback = BuildConfig.GITHUB_REPO.trim()
+                        if (fallback.isBlank()) {
+                            _appUpdateUiState.update {
+                                AppUpdateUiState(
+                                    errorMessage = if (silent) null else "Set a GitHub repository (owner/repo) first."
+                                )
+                            }
+                            return@launch
+                        }
+                        AppUpdateManager.normalizeGithubRepo(fallback) ?: run {
+                            if (!silent) {
+                                _appUpdateUiState.update {
+                                    it.copy(
+                                        isChecking = false,
+                                        isSilentCheck = false,
+                                        errorMessage = "Invalid format. Use owner/repo (e.g. user/jh-getway).",
+                                        statusMessage = null
+                                    )
+                                }
+                            }
+                            return@launch
+                        }
+                    } else {
+                        val normalized = AppUpdateManager.normalizeGithubRepo(trimmedOverride)
+                        if (normalized == null) {
+                            _appUpdateUiState.update {
+                                it.copy(
+                                    isChecking = false,
+                                    isSilentCheck = false,
+                                    errorMessage = "Invalid format. Use owner/repo (e.g. user/jh-getway).",
+                                    statusMessage = null
+                                )
+                            }
+                            return@launch
+                        }
+                        if (normalized != currentSettings.githubUpdateRepo.trim()) {
+                            prefs.setGithubUpdateRepo(normalized)
+                        }
+                        normalized
                     }
-                    logEvent(
-                        ActivityCategory.SYSTEM_EVENT,
-                        "App Updater",
-                        "UPDATE_FOUND",
-                        "Release ${res.release.tagName} available from $repoSlug" + if (res.fromCache) " (cached)" else ""
-                    )
+                } else {
+                    val rawRepo = previousEffectiveRepo
+                    if (rawRepo.isBlank()) {
+                        if (!silent) {
+                            _appUpdateUiState.update {
+                                it.copy(
+                                    isChecking = false,
+                                    isSilentCheck = false,
+                                    errorMessage = "Set a GitHub repository (owner/repo) first.",
+                                    statusMessage = null
+                                )
+                            }
+                        }
+                        return@launch
+                    }
+                    AppUpdateManager.normalizeGithubRepo(rawRepo) ?: run {
+                        if (!silent) {
+                            _appUpdateUiState.update {
+                                it.copy(
+                                    isChecking = false,
+                                    isSilentCheck = false,
+                                    errorMessage = "Invalid format. Use owner/repo (e.g. user/jh-getway).",
+                                    statusMessage = null
+                                )
+                            }
+                        }
+                        return@launch
+                    }
                 }
-                is AppUpdateCheckResult.UpToDate -> {
-                    _appUpdateUiState.update {
-                        it.copy(
-                            isChecking = false,
-                            availableRelease = null,
-                            statusMessage = "Up to date (v${res.currentVersionName})",
-                            errorMessage = null,
-                            showPromptDialog = false,
-                            signingConflict = false,
-                            manualReleasesUrl = AppUpdateManager.officialReleasesUrl(repoSlug),
-                            rateLimitResetAtMs = null,
-                            lastCheckedAtMs = res.checkedAtMs,
-                            isUsingCachedRelease = res.fromCache
+
+                val switchedRepo = previousEffectiveRepo.isNotBlank() &&
+                    !repoSlug.equals(previousEffectiveRepo, ignoreCase = true)
+
+                _appUpdateUiState.update { prev ->
+                    if (switchedRepo) {
+                        AppUpdateUiState(
+                            isChecking = true,
+                            isSilentCheck = silent,
+                            manualReleasesUrl = AppUpdateManager.officialReleasesUrl(repoSlug)
                         )
-                    }
-                    if (!silent) {
-                        postBanner("You are on the latest version (${res.latestTag})")
-                    }
-                }
-                is AppUpdateCheckResult.NoReleasesPublished -> {
-                    _appUpdateUiState.update {
-                        it.copy(
-                            isChecking = false,
-                            availableRelease = null,
-                            statusMessage = if (silent) null else "No releases published yet for ${res.repoSlug}.",
-                            errorMessage = null,
-                            showPromptDialog = false,
-                            signingConflict = false,
-                            manualReleasesUrl = AppUpdateManager.officialReleasesUrl(res.repoSlug),
-                            rateLimitResetAtMs = null,
-                            lastCheckedAtMs = res.checkedAtMs,
-                            isUsingCachedRelease = false
-                        )
-                    }
-                }
-                is AppUpdateCheckResult.RateLimited -> {
-                    _appUpdateUiState.update { prev ->
-                        val preserved = res.cachedRelease ?: prev.availableRelease
+                    } else {
                         prev.copy(
-                            isChecking = false,
-                            availableRelease = preserved,
-                            errorMessage = if (silent) null else res.message,
-                            showPromptDialog = false,
-                            signingConflict = false,
-                            manualReleasesUrl = res.releasesUrl,
-                            rateLimitResetAtMs = res.retryAfterEpochMs,
-                            isUsingCachedRelease = preserved != null
+                            isChecking = true,
+                            isSilentCheck = silent,
+                            errorMessage = null,
+                            statusMessage = null,
+                            signingConflict = false
                         )
-                    }
-                    if (!silent) {
-                        postBanner(res.message)
                     }
                 }
-                is AppUpdateCheckResult.Error -> {
-                    _appUpdateUiState.update { prev ->
-                        val preserved = res.cachedRelease ?: prev.availableRelease
-                        prev.copy(
-                            isChecking = false,
-                            availableRelease = preserved,
-                            errorMessage = if (silent) null else res.message,
-                            showPromptDialog = false,
-                            signingConflict = false,
-                            manualReleasesUrl = res.releasesUrl ?: AppUpdateManager.officialReleasesUrl(repoSlug),
-                            rateLimitResetAtMs = null,
-                            isUsingCachedRelease = preserved != null
+
+                val res = AppUpdateManager.checkForUpdate(
+                    repoInput = repoSlug,
+                    currentVersionCode = BuildConfig.VERSION_CODE,
+                    currentVersionName = BuildConfig.VERSION_NAME,
+                    apiBaseUrl = apiBaseUrl,
+                    expectedPackageId = expectedPackageId,
+                    context = app,
+                    forceRefresh = !silent
+                )
+
+                val refreshedSettings = settings.value
+                when (res) {
+                    is AppUpdateCheckResult.UpdateAvailable -> {
+                        val skipped = refreshedSettings.skippedUpdateTag.isNotBlank() &&
+                            refreshedSettings.skippedUpdateTag == res.release.tagName
+                        _appUpdateUiState.update { prev ->
+                            val existingApk = prev.downloadedApkFile?.takeIf { file ->
+                                file.exists() && file.isFile &&
+                                    prev.availableRelease?.tagName == res.release.tagName &&
+                                    prev.availableRelease?.versionCode == res.release.versionCode &&
+                                    prev.availableRelease?.expectedSha256 == res.release.expectedSha256
+                            }
+                            prev.copy(
+                                isChecking = false,
+                                isSilentCheck = false,
+                                availableRelease = res.release,
+                                downloadedApkFile = existingApk,
+                                downloadProgressPct = if (existingApk != null) 100 else 0,
+                                statusMessage = "Update ${res.release.tagName} available",
+                                errorMessage = null,
+                                showPromptDialog = !silent || !skipped,
+                                needsInstallPermission = false,
+                                pendingInstallAfterPermission = false,
+                                signingConflict = false,
+                                manualReleasesUrl = res.release.htmlUrl.ifBlank { AppUpdateManager.officialReleasesUrl(res.release.repoSlug) },
+                                rateLimitResetAtMs = null,
+                                lastCheckedAtMs = res.checkedAtMs,
+                                isUsingCachedRelease = res.fromCache
+                            )
+                        }
+                        logEvent(
+                            ActivityCategory.SYSTEM_EVENT,
+                            "App Updater",
+                            "UPDATE_FOUND",
+                            "Release ${res.release.tagName} available from $repoSlug" + if (res.fromCache) " (cached)" else ""
                         )
+                    }
+                    is AppUpdateCheckResult.UpToDate -> {
+                        _appUpdateUiState.update {
+                            it.copy(
+                                isChecking = false,
+                                isSilentCheck = false,
+                                availableRelease = null,
+                                downloadedApkFile = null,
+                                downloadProgressPct = 0,
+                                statusMessage = "Up to date (v${res.currentVersionName})",
+                                errorMessage = null,
+                                showPromptDialog = false,
+                                needsInstallPermission = false,
+                                pendingInstallAfterPermission = false,
+                                signingConflict = false,
+                                manualReleasesUrl = AppUpdateManager.officialReleasesUrl(repoSlug),
+                                rateLimitResetAtMs = null,
+                                lastCheckedAtMs = res.checkedAtMs,
+                                isUsingCachedRelease = res.fromCache
+                            )
+                        }
+                        if (!silent) {
+                            postBanner("You are on the latest version (${res.latestTag})")
+                        }
+                    }
+                    is AppUpdateCheckResult.NoReleasesPublished -> {
+                        _appUpdateUiState.update {
+                            it.copy(
+                                isChecking = false,
+                                isSilentCheck = false,
+                                availableRelease = null,
+                                downloadedApkFile = null,
+                                downloadProgressPct = 0,
+                                statusMessage = if (silent) null else "No releases published yet for ${res.repoSlug}.",
+                                errorMessage = null,
+                                showPromptDialog = false,
+                                needsInstallPermission = false,
+                                pendingInstallAfterPermission = false,
+                                signingConflict = false,
+                                manualReleasesUrl = AppUpdateManager.officialReleasesUrl(res.repoSlug),
+                                rateLimitResetAtMs = null,
+                                lastCheckedAtMs = res.checkedAtMs,
+                                isUsingCachedRelease = false
+                            )
+                        }
+                    }
+                    is AppUpdateCheckResult.RateLimited -> {
+                        _appUpdateUiState.update { prev ->
+                            val preserved = res.cachedRelease ?: prev.availableRelease
+                            prev.copy(
+                                isChecking = false,
+                                isSilentCheck = false,
+                                availableRelease = preserved,
+                                downloadedApkFile = if (preserved != null) prev.downloadedApkFile else null,
+                                errorMessage = if (silent) null else res.message,
+                                showPromptDialog = false,
+                                signingConflict = false,
+                                manualReleasesUrl = res.releasesUrl,
+                                rateLimitResetAtMs = res.retryAfterEpochMs,
+                                isUsingCachedRelease = preserved != null
+                            )
+                        }
+                        if (!silent) {
+                            postBanner(res.message)
+                        }
+                    }
+                    is AppUpdateCheckResult.Error -> {
+                        _appUpdateUiState.update { prev ->
+                            val preserved = res.cachedRelease ?: prev.availableRelease
+                            prev.copy(
+                                isChecking = false,
+                                isSilentCheck = false,
+                                availableRelease = preserved,
+                                downloadedApkFile = if (preserved != null) prev.downloadedApkFile else null,
+                                errorMessage = if (silent) null else res.message,
+                                showPromptDialog = false,
+                                signingConflict = false,
+                                manualReleasesUrl = res.releasesUrl ?: AppUpdateManager.officialReleasesUrl(repoSlug),
+                                rateLimitResetAtMs = null,
+                                isUsingCachedRelease = preserved != null
+                            )
+                        }
+                    }
+                }
+            } finally {
+                if (updateCheckSeq.get() == mySeq) {
+                    currentUpdateCheckSilent = false
+                    if (_appUpdateUiState.value.isChecking) {
+                        _appUpdateUiState.update { it.copy(isChecking = false, isSilentCheck = false) }
                     }
                 }
             }
         }
+        updateJob = job
+        return job
     }
 
     fun downloadAndInstallUpdate() {
         val release = _appUpdateUiState.value.availableRelease ?: return
         if (_appUpdateUiState.value.isDownloading) return
-        viewModelScope.launch {
+        downloadUpdateJob?.cancel()
+        downloadUpdateJob = viewModelScope.launch {
             _appUpdateUiState.update {
                 it.copy(
                     isDownloading = true,
                     downloadProgressPct = 0,
                     errorMessage = null,
                     signingConflict = false,
+                    needsInstallPermission = false,
+                    pendingInstallAfterPermission = false,
                     statusMessage = "Downloading ${release.apkFileName}..."
                 )
             }
-            val dlRes = AppUpdateManager.downloadApkWithProgress(
-                context = app,
-                release = release,
-                onProgress = { pct ->
-                    _appUpdateUiState.update { it.copy(downloadProgressPct = pct) }
-                }
-            )
-            dlRes.fold(
-                onSuccess = { apkFile ->
-                    _appUpdateUiState.update {
-                        it.copy(
-                            isDownloading = false,
-                            downloadProgressPct = 100,
-                            downloadedApkFile = apkFile,
-                            statusMessage = "Verified ${release.apkFileName}; launching installer...",
-                            errorMessage = null,
-                            signingConflict = false
-                        )
+            try {
+                val dlRes = AppUpdateManager.downloadApkWithProgress(
+                    context = app,
+                    release = release,
+                    onProgress = { pct ->
+                        _appUpdateUiState.update { it.copy(downloadProgressPct = pct) }
                     }
-                    logEvent(ActivityCategory.SYSTEM_EVENT, "App Updater", "APK_VERIFIED", "Downloaded & verified ${release.apkFileName}")
-                    launchDownloadedApkInstall()
-                },
-                onFailure = { err ->
-                    val safeMsg = MaskingUtils.sanitizeErrorMessage(err.message)
-                    _appUpdateUiState.update {
-                        it.copy(
-                            isDownloading = false,
-                            errorMessage = safeMsg,
-                            statusMessage = null,
-                            signingConflict = false
-                        )
+                )
+                dlRes.fold(
+                    onSuccess = { apkFile ->
+                        _appUpdateUiState.update {
+                            it.copy(
+                                isDownloading = false,
+                                downloadProgressPct = 100,
+                                downloadedApkFile = apkFile,
+                                statusMessage = "Verified ${release.apkFileName}; launching installer...",
+                                errorMessage = null,
+                                signingConflict = false
+                            )
+                        }
+                        logEvent(ActivityCategory.SYSTEM_EVENT, "App Updater", "APK_VERIFIED", "Downloaded & verified ${release.apkFileName}")
+                        launchDownloadedApkInstall()
+                    },
+                    onFailure = { err ->
+                        val safeMsg = MaskingUtils.sanitizeErrorMessage(err.message)
+                        _appUpdateUiState.update {
+                            it.copy(
+                                isDownloading = false,
+                                errorMessage = safeMsg,
+                                statusMessage = null,
+                                signingConflict = false
+                            )
+                        }
+                        postBanner("Update download failed: $safeMsg")
                     }
-                    postBanner("Update download failed: $safeMsg")
+                )
+            } finally {
+                if (_appUpdateUiState.value.isDownloading) {
+                    _appUpdateUiState.update { it.copy(isDownloading = false) }
                 }
-            )
+            }
         }
     }
 
     fun launchDownloadedApkInstall() {
         val apkFile = _appUpdateUiState.value.downloadedApkFile ?: return
+        if (!apkFile.exists() || !apkFile.isFile || !apkFile.canRead()) {
+            _appUpdateUiState.update {
+                it.copy(
+                    downloadedApkFile = null,
+                    downloadProgressPct = 0,
+                    needsInstallPermission = false,
+                    pendingInstallAfterPermission = false,
+                    errorMessage = "Downloaded APK file is missing. Please download it again.",
+                    statusMessage = null
+                )
+            }
+            postBanner("Downloaded APK file is missing. Please download it again.")
+            return
+        }
         val release = _appUpdateUiState.value.availableRelease
         when (val launch = AppUpdateManager.launchApkInstaller(app, apkFile, release)) {
             is ApkInstallLaunchResult.Launched -> {
                 _appUpdateUiState.update {
                     it.copy(
                         needsInstallPermission = false,
+                        pendingInstallAfterPermission = false,
+                        showPromptDialog = false,
                         errorMessage = null,
                         signingConflict = false,
                         statusMessage = "Installer launched for ${release?.tagName ?: apkFile.name}"
@@ -2980,7 +3184,10 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
                 _appUpdateUiState.update {
                     it.copy(
                         needsInstallPermission = true,
+                        pendingInstallAfterPermission = true,
+                        showPromptDialog = false,
                         signingConflict = false,
+                        errorMessage = null,
                         statusMessage = null
                     )
                 }
@@ -2990,6 +3197,8 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
                 _appUpdateUiState.update {
                     it.copy(
                         signingConflict = true,
+                        needsInstallPermission = false,
+                        pendingInstallAfterPermission = false,
                         errorMessage = msg,
                         statusMessage = null
                     )
@@ -3000,8 +3209,18 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
                 postBanner(msg)
             }
             is ApkInstallLaunchResult.Failed -> {
+                val shouldResetArtifact = !apkFile.exists() ||
+                    launch.message.contains("missing", ignoreCase = true) ||
+                    launch.message.contains("corrupted", ignoreCase = true) ||
+                    launch.message.contains("checksum", ignoreCase = true) ||
+                    launch.message.contains("inspect", ignoreCase = true) ||
+                    launch.message.contains("size", ignoreCase = true)
                 _appUpdateUiState.update {
                     it.copy(
+                        downloadedApkFile = if (shouldResetArtifact) null else it.downloadedApkFile,
+                        downloadProgressPct = if (shouldResetArtifact) 0 else it.downloadProgressPct,
+                        needsInstallPermission = false,
+                        pendingInstallAfterPermission = false,
                         errorMessage = launch.message,
                         signingConflict = false,
                         statusMessage = null
@@ -3012,8 +3231,50 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    fun onInstallPermissionSettingsOpened() {
+        _appUpdateUiState.update {
+            it.copy(
+                needsInstallPermission = false,
+                pendingInstallAfterPermission = true
+            )
+        }
+    }
+
     fun dismissInstallPermissionPrompt() {
-        _appUpdateUiState.update { it.copy(needsInstallPermission = false) }
+        _appUpdateUiState.update {
+            it.copy(
+                needsInstallPermission = false,
+                pendingInstallAfterPermission = false
+            )
+        }
+    }
+
+    fun onUnknownSourcesPermissionReturned(canInstallOverride: Boolean? = null) {
+        val state = _appUpdateUiState.value
+        if (!state.pendingInstallAfterPermission) return
+        val apkFile = state.downloadedApkFile
+        val canInstall = canInstallOverride ?: AppUpdateManager.canRequestPackageInstalls(app)
+        if (canInstall && apkFile != null) {
+            _appUpdateUiState.update {
+                it.copy(
+                    needsInstallPermission = false,
+                    pendingInstallAfterPermission = false
+                )
+            }
+            launchDownloadedApkInstall()
+        } else {
+            _appUpdateUiState.update {
+                it.copy(
+                    needsInstallPermission = false,
+                    pendingInstallAfterPermission = false,
+                    errorMessage = if (!canInstall) {
+                        "Enable 'Install unknown apps' for JH GetWay in Settings to install the update."
+                    } else {
+                        it.errorMessage
+                    }
+                )
+            }
+        }
     }
 
     fun dismissUpdateDialog() {

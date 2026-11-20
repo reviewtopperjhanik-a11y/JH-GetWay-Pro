@@ -328,12 +328,12 @@ class OpenAiProviderAdapter(
             for (i in 0 until tcArr.length()) {
                 val tcObj = tcArr.optJSONObject(i) ?: continue
                 val fn = tcObj.optJSONObject("function") ?: continue
-                val name = fn.optString("name")
+                val name = fn.optNonNullString("name").orEmpty()
                 if (name.isBlank()) continue
                 toolCalls += ToolCallPayload(
-                    id = tcObj.optString("id").ifBlank { "call_$i" },
+                    id = tcObj.optNonNullString("id")?.ifBlank { null } ?: "call_$i",
                     name = name,
-                    argumentsJson = fn.optString("arguments", "{}"),
+                    argumentsJson = fn.optNonNullString("arguments") ?: "{}",
                     index = i
                 )
             }
@@ -347,7 +347,7 @@ class OpenAiProviderAdapter(
                 else -> null
             }
         }
-        val finishReason = firstChoice?.optString("finish_reason")?.takeIf { it.isNotBlank() && it != "null" }
+        val finishReason = firstChoice?.optNonNullString("finish_reason")?.takeIf { it.isNotBlank() }
             ?: if (toolCalls.isNotEmpty()) "tool_calls" else "stop"
 
         return ChatExecutionResult(
@@ -360,7 +360,7 @@ class OpenAiProviderAdapter(
             finishReason = finishReason,
             toolCalls = toolCalls,
             usageReported = usageObj != null,
-            modelUsed = root.optString("model").takeIf { it.isNotBlank() },
+            modelUsed = root.optNonNullString("model")?.takeIf { it.isNotBlank() },
             actualBilledCostUsd = actualBilledCost
         )
     }
@@ -393,16 +393,16 @@ class OpenAiProviderAdapter(
             for (i in 0 until tcArr.length()) {
                 val tc = tcArr.optJSONObject(i) ?: continue
                 val idx = tc.optInt("index", i)
-                val id = tc.optString("id").takeIf { it.isNotBlank() }
+                val id = tc.optNonNullString("id")?.takeIf { it.isNotBlank() }
                 val fn = tc.optJSONObject("function")
-                val name = fn?.optString("name")?.takeIf { it.isNotBlank() }
-                val args = fn?.optString("arguments")?.takeIf { it.isNotEmpty() }
+                val name = fn?.optNonNullString("name")?.takeIf { it.isNotBlank() }
+                val args = fn?.optNonNullString("arguments")?.takeIf { it.isNotEmpty() }
                 tcDeltas += ToolCallDelta(index = idx, id = id, name = name, argumentsChunk = args)
             }
         }
         state.recordToolDeltas(tcDeltas)
 
-        val finishReason = choice?.optString("finish_reason")?.takeIf { it.isNotBlank() && it != "null" }
+        val finishReason = choice?.optNonNullString("finish_reason")?.takeIf { it.isNotBlank() }
         if (finishReason != null) state.finishReason = finishReason
 
         val u = json.optJSONObject("usage")
@@ -418,6 +418,11 @@ class OpenAiProviderAdapter(
             outputTokens = outTok,
             finishReason = finishReason
         )
+    }
+
+    private fun JSONObject.optNonNullString(key: String): String? {
+        if (!has(key) || isNull(key)) return null
+        return optString(key)
     }
 
     override fun normalizeHttpError(

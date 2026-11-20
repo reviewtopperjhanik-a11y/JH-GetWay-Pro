@@ -576,6 +576,8 @@ class LocalGatewayHttpServer(
         withContext(Dispatchers.IO) {
             runCatching { current.stop(gracePeriodMillis = 500, timeoutMillis = 2000) }
         }
+        activeCount.set(0)
+        _runtimeState.update { it.copy(activeRequests = 0) }
     }
 
     private suspend fun handleWithConcurrencyLimit(
@@ -590,8 +592,8 @@ class LocalGatewayHttpServer(
             )
             return
         }
-        val currentActive = activeCount.incrementAndGet()
-        _runtimeState.update { it.copy(activeRequests = currentActive) }
+        activeCount.incrementAndGet()
+        _runtimeState.update { it.copy(activeRequests = activeCount.get().coerceAtLeast(0)) }
         try {
             if (!validateHeadersSize(call)) {
                 respondJson(
@@ -618,8 +620,8 @@ class LocalGatewayHttpServer(
                 )
             }
         } finally {
-            val left = activeCount.decrementAndGet().coerceAtLeast(0)
-            _runtimeState.update { it.copy(activeRequests = left) }
+            activeCount.decrementAndGet().coerceAtLeast(0)
+            _runtimeState.update { it.copy(activeRequests = activeCount.get().coerceAtLeast(0)) }
             concurrencyLimiter.release()
         }
     }
@@ -1392,7 +1394,8 @@ class LocalGatewayHttpServer(
                     toolChoice = parsed.toolChoice,
                     responseFormat = parsed.responseFormat
                 ),
-                anthropicErrorFormat = false
+                anthropicErrorFormat = false,
+                preStreamTimeoutSec = settings.gatewayTimeoutSec
             ) {
                 val cid = "chatcmpl-${UUID.randomUUID().toString().take(8)}"
                 var firstChunk = true
@@ -1497,7 +1500,8 @@ class LocalGatewayHttpServer(
                     toolChoice = parsed.toolChoice,
                     responseFormat = parsed.responseFormat
                 ),
-                anthropicErrorFormat = false
+                anthropicErrorFormat = false,
+                preStreamTimeoutSec = settings.gatewayTimeoutSec
             ) {
                 val respId = "resp_${UUID.randomUUID().toString().take(8)}"
                 val sseWriter = GatewayApiContract.ResponsesSseWriter(this, respId, parsed.model)
@@ -1598,7 +1602,8 @@ class LocalGatewayHttpServer(
                     toolChoice = parsed.toolChoice,
                     responseFormat = parsed.responseFormat
                 ),
-                anthropicErrorFormat = true
+                anthropicErrorFormat = true,
+                preStreamTimeoutSec = settings.gatewayTimeoutSec
             ) {
                 val msgId = "msg_${UUID.randomUUID().toString().take(8)}"
                 val sseWriter = GatewayApiContract.AnthropicSseWriter(this, msgId, parsed.model)
@@ -1612,6 +1617,7 @@ class LocalGatewayHttpServer(
         client: AuthenticatedClient,
         flow: Flow<Pair<StreamEvent, RouterDecisionSnapshot?>>,
         anthropicErrorFormat: Boolean,
+        preStreamTimeoutSec: Int = 75,
         initWriter: java.io.Writer.() -> ((StreamEvent) -> Unit)
     ) = coroutineScope {
         val eventChannel = Channel<Pair<StreamEvent, RouterDecisionSnapshot?>>(capacity = 64)
@@ -1625,18 +1631,32 @@ class LocalGatewayHttpServer(
             }
         }
 
-        val firstItem = eventChannel.receiveCatching().getOrNull()
+        val preStreamTimeoutMs = (preStreamTimeoutSec.coerceIn(2, 80) + 5L) * 1000L
+        var timedOutPreStream = true
+        val firstItem = withTimeoutOrNull(preStreamTimeoutMs) {
+            val received = eventChannel.receiveCatching().getOrNull()
+            timedOutPreStream = false
+            received
+        }
         val firstEvent = firstItem?.first
-        if (firstItem == null || (firstEvent is StreamEvent.Failed && !firstEvent.emittedAnyChunk)) {
+        if (timedOutPreStream || firstItem == null || (firstEvent is StreamEvent.Failed && !firstEvent.emittedAnyChunk)) {
             producerJob.cancel()
             val decision = firstItem?.second
             if (decision != null) {
                 reconcileAgentUsageIfNeeded(client, decision.resolvedUsage)
             }
             val failedErr = (firstEvent as? StreamEvent.Failed)?.error
-            val statusCode = (failedErr?.statusCode ?: 502).coerceIn(400, 599)
+            val statusCode = if (timedOutPreStream) {
+                504
+            } else {
+                (failedErr?.statusCode ?: 502).coerceIn(400, 599)
+            }
             val httpStatus = HttpStatusCode.fromValue(statusCode)
-            val message = failedErr?.safeErrorMessage ?: "Upstream streaming request failed before producing output"
+            val message = if (timedOutPreStream) {
+                "Gateway timed out waiting for upstream model response (${preStreamTimeoutSec.coerceIn(2, 80)}s)."
+            } else {
+                failedErr?.safeErrorMessage ?: "Upstream streaming request failed before producing output"
+            }
             val errBody = if (anthropicErrorFormat) {
                 val errType = when (statusCode) {
                     400 -> "invalid_request_error"
@@ -1652,8 +1672,8 @@ class LocalGatewayHttpServer(
                     "error",
                     JSONObject()
                         .put("message", message)
-                        .put("type", "upstream_error")
-                        .put("code", failedErr?.errorCode ?: "gateway_error")
+                        .put("type", if (timedOutPreStream) "timeout_error" else "upstream_error")
+                        .put("code", if (timedOutPreStream) "GATEWAY_TIMEOUT" else (failedErr?.errorCode ?: "gateway_error"))
                 ).toString()
             }
             respondJson(call, httpStatus, errBody)

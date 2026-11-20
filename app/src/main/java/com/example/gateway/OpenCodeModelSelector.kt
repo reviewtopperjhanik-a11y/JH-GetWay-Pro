@@ -307,17 +307,40 @@ object OpenCodeModelCatalogResolver {
         settings: GatewaySettingsState,
         nowMs: Long = System.currentTimeMillis()
     ): Pair<List<EligibleModelRecord>, EligibleModelRecord?> {
-        val disabledModelKeys = allModels
-            .filter { !it.enabled }
-            .map { "${it.providerId}::${it.modelId.lowercase(Locale.US)}" }
-            .toSet()
+        val disabledModelKeys = HashSet<String>()
+        val storedModelKeys = HashSet<String>(allModels.size)
+        val enabledModelsByProvider = HashMap<String, MutableList<ModelEntity>>()
+        for (m in allModels) {
+            val compositeKey = "${m.providerId}::${m.modelId.lowercase(Locale.US)}"
+            storedModelKeys += compositeKey
+            if (!m.enabled) {
+                disabledModelKeys += compositeKey
+            } else {
+                enabledModelsByProvider.getOrPut(m.providerId) { mutableListOf() }.add(m)
+            }
+        }
+        val keysByProvider = allKeys.groupBy { it.providerId }
+        val decryptedKeyValidCache = HashMap<String, Boolean>(allKeys.size)
+        fun isValidApiKey(key: ApiKeyEntity): Boolean {
+            if (!key.enabled ||
+                key.status == KeyStatus.DISABLED ||
+                key.status == KeyStatus.INVALID ||
+                key.status == KeyStatus.EXPIRED
+            ) {
+                return false
+            }
+            return decryptedKeyValidCache.getOrPut(key.id) {
+                CryptoManager.decryptResult(key.encryptedKey).getOrNull()?.isNotBlank() == true
+            }
+        }
 
         val eligibleRecords = mutableListOf<EligibleModelRecord>()
 
         // Cloud providers
         val includeCloud = settings.localRoutingPolicy != LocalRoutingPolicy.LOCAL_ONLY
         if (includeCloud) {
-            for (provider in providers.filter { it.enabled }) {
+            for (provider in providers) {
+                if (!provider.enabled) continue
                 val cleanUrl = provider.baseUrl.trim()
                 if (cleanUrl.isBlank()) continue
                 val allowLocalHttp = settings.localNetworkAccessAllowed
@@ -327,19 +350,12 @@ object OpenCodeModelCatalogResolver {
                 ) {
                     continue
                 }
-                val keysForProvider = allKeys.filter { key ->
-                    key.providerId == provider.id &&
-                        key.enabled &&
-                        key.status != KeyStatus.DISABLED &&
-                        key.status != KeyStatus.INVALID &&
-                        key.status != KeyStatus.EXPIRED &&
-                        CryptoManager.decryptResult(key.encryptedKey).getOrNull()?.isNotBlank() == true
-                }
-                if (keysForProvider.isEmpty()) continue
+                val providerKeys = keysByProvider[provider.id].orEmpty()
+                if (providerKeys.none { isValidApiKey(it) }) continue
 
                 val adapter = ProviderAdapterRegistry.adapterFor(provider.apiFormat)
-                val providerModels = allModels
-                    .filter { it.providerId == provider.id && it.enabled }
+                val providerModels = enabledModelsByProvider[provider.id]
+                    .orEmpty()
                     .distinctBy { it.modelId.lowercase(Locale.US) }
                     .toMutableList()
 
@@ -401,6 +417,7 @@ object OpenCodeModelCatalogResolver {
                         pricing != null -> (pricing.inputPer1M + pricing.outputPer1M) / 2.0
                         else -> null
                     }
+                    val compositeKey = "${provider.id}::${model.modelId.lowercase(Locale.US)}"
                     eligibleRecords += EligibleModelRecord(
                         providerId = provider.id,
                         providerName = provider.name,
@@ -415,16 +432,15 @@ object OpenCodeModelCatalogResolver {
                         codingProfile = codingProfile,
                         codingScore = codingScore,
                         effectiveCostPer1M = avgCost,
-                        isSynthesizedFromDefault = allModels.none {
-                            it.providerId == provider.id && it.modelId.equals(model.modelId, ignoreCase = true)
-                        }
+                        isSynthesizedFromDefault = !storedModelKeys.contains(compositeKey)
                     )
                 }
             }
         }
 
         // Local AI servers
-        for (srv in localServers.filter { it.enabled }) {
+        for (srv in localServers) {
+            if (!srv.enabled) continue
             val localId = "local:${srv.id}"
             val authOk = !srv.hasAuth || CryptoManager.decryptResult(srv.encryptedAuthToken).getOrNull() != null
             if (!authOk) continue
@@ -439,8 +455,8 @@ object OpenCodeModelCatalogResolver {
             }
             val format = if (srv.engineType == LocalEngineType.OLLAMA) ApiFormat.OLLAMA else ApiFormat.OPENAI
             val adapter = ProviderAdapterRegistry.adapterFor(format)
-            val srvModels = allModels
-                .filter { it.providerId == localId && it.enabled }
+            val srvModels = enabledModelsByProvider[localId]
+                .orEmpty()
                 .distinctBy { it.modelId.lowercase(Locale.US) }
                 .toMutableList()
 

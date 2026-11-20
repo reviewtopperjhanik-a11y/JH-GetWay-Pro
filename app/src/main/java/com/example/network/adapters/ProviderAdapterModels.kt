@@ -259,11 +259,25 @@ internal object AdapterHelper {
                 lower.contains("rate limit") || lower.contains("rate_limit") -> "RATE_LIMITED" to true
                 lower.contains("quota") || lower.contains("insufficient_balance") || lower.contains("credit balance") -> "QUOTA_EXCEEDED" to true
                 lower.contains("model_not_found") || lower.contains("model does not exist") -> "MODEL_UNAVAILABLE" to true
+                lower.contains("does not support") ||
+                    lower.contains("not supported") ||
+                    lower.contains("function calling is not enabled") ||
+                    lower.contains("context length") ||
+                    lower.contains("maximum context") -> "UNSUPPORTED_CAPABILITY" to true
                 else -> "INVALID_REQUEST" to false
             }
             401, 403 -> "INVALID_CREDENTIAL" to true
+            402 -> "QUOTA_EXCEEDED" to true
             404 -> "MODEL_UNAVAILABLE" to true
             408 -> "TIMEOUT" to true
+            422 -> when {
+                lower.contains("model") ||
+                    lower.contains("support") ||
+                    lower.contains("tool") ||
+                    lower.contains("parameter") ||
+                    lower.contains("unknown") -> "UNSUPPORTED_CAPABILITY" to true
+                else -> "INVALID_REQUEST" to false
+            }
             429 -> "RATE_LIMITED" to true
             in 500..599 -> "PROVIDER_SERVER_ERROR" to true
             else -> "HTTP_$httpCode" to false

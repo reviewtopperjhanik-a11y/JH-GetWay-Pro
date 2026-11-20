@@ -54,55 +54,74 @@ object CryptoManager {
     const val CURRENT_VERSION = "v1"
 
     private val androidKeystoreProvider = object : MasterKeyProvider {
+        @Volatile
+        private var cachedKey: SecretKey? = null
+
         override fun getOrCreateKey(): SecretKey {
-            return try {
-                val keyStore = KeyStore.getInstance(KEYSTORE_PROVIDER).apply { load(null) }
-                val existing = try {
-                    keyStore.getKey(KEY_ALIAS, null) as? SecretKey
-                } catch (e: KeyPermanentlyInvalidatedException) {
-                    throw CryptoFailureException(
-                        CryptoFailureReason.KEY_INVALIDATED,
-                        "Vault master key was invalidated by device security state changes. Reset vault key to re-save credentials.",
-                        e
+            cachedKey?.let { return it }
+            return synchronized(this) {
+                cachedKey?.let { return it }
+                try {
+                    val keyStore = KeyStore.getInstance(KEYSTORE_PROVIDER).apply { load(null) }
+                    val existing = try {
+                        keyStore.getKey(KEY_ALIAS, null) as? SecretKey
+                    } catch (e: KeyPermanentlyInvalidatedException) {
+                        cachedKey = null
+                        throw CryptoFailureException(
+                            CryptoFailureReason.KEY_INVALIDATED,
+                            "Vault master key was invalidated by device security state changes. Reset vault key to re-save credentials.",
+                            e
+                        )
+                    } catch (e: UnrecoverableKeyException) {
+                        cachedKey = null
+                        throw CryptoFailureException(
+                            CryptoFailureReason.KEY_INVALIDATED,
+                            "Vault master key is no longer recoverable. Reset vault key to re-save credentials.",
+                            e
+                        )
+                    }
+                    if (existing != null) {
+                        cachedKey = existing
+                        return existing
+                    }
+
+                    val keyGenerator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, KEYSTORE_PROVIDER)
+                    val spec = KeyGenParameterSpec.Builder(
+                        KEY_ALIAS,
+                        KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
                     )
-                } catch (e: UnrecoverableKeyException) {
+                        .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                        .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                        .setKeySize(256)
+                        .build()
+                    keyGenerator.init(spec)
+                    keyGenerator.generateKey().also { cachedKey = it }
+                } catch (e: CryptoFailureException) {
+                    throw e
+                } catch (e: Exception) {
                     throw CryptoFailureException(
-                        CryptoFailureReason.KEY_INVALIDATED,
-                        "Vault master key is no longer recoverable. Reset vault key to re-save credentials.",
+                        CryptoFailureReason.KEYSTORE_UNAVAILABLE,
+                        "Android Keystore unavailable; refusing to use weak fallback encryption.",
                         e
                     )
                 }
-                if (existing != null) return existing
-
-                val keyGenerator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, KEYSTORE_PROVIDER)
-                val spec = KeyGenParameterSpec.Builder(
-                    KEY_ALIAS,
-                    KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
-                )
-                    .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
-                    .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
-                    .setKeySize(256)
-                    .build()
-                keyGenerator.init(spec)
-                keyGenerator.generateKey()
-            } catch (e: CryptoFailureException) {
-                throw e
-            } catch (e: Exception) {
-                throw CryptoFailureException(
-                    CryptoFailureReason.KEYSTORE_UNAVAILABLE,
-                    "Android Keystore unavailable; refusing to use weak fallback encryption.",
-                    e
-                )
             }
         }
 
         override fun deleteKeyIfExists() {
-            runCatching {
-                val keyStore = KeyStore.getInstance(KEYSTORE_PROVIDER).apply { load(null) }
-                if (keyStore.containsAlias(KEY_ALIAS)) {
-                    keyStore.deleteEntry(KEY_ALIAS)
+            synchronized(this) {
+                cachedKey = null
+                runCatching {
+                    val keyStore = KeyStore.getInstance(KEYSTORE_PROVIDER).apply { load(null) }
+                    if (keyStore.containsAlias(KEY_ALIAS)) {
+                        keyStore.deleteEntry(KEY_ALIAS)
+                    }
                 }
             }
+        }
+
+        fun invalidateCache() {
+            cachedKey = null
         }
     }
 
@@ -187,6 +206,7 @@ object CryptoManager {
             System.arraycopy(cipherText, 0, combined, iv.size, cipherText.size)
             "$CURRENT_VERSION:" + Base64.encodeToString(combined, Base64.NO_WRAP)
         } catch (e: KeyPermanentlyInvalidatedException) {
+            androidKeystoreProvider.invalidateCache()
             throw CryptoFailureException(
                 CryptoFailureReason.KEY_INVALIDATED,
                 "Vault master key invalidated; reset key and re-enter credentials.",
@@ -240,6 +260,7 @@ object CryptoManager {
                 e
             )
         } catch (e: KeyPermanentlyInvalidatedException) {
+            androidKeystoreProvider.invalidateCache()
             throw CryptoFailureException(
                 CryptoFailureReason.KEY_INVALIDATED,
                 "Vault master key invalidated; old credentials cannot be decrypted until reset.",

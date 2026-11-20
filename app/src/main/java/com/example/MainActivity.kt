@@ -8,8 +8,10 @@ import android.os.Bundle
 import android.os.CancellationSignal
 import android.provider.Settings
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -57,6 +59,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.NavigationBar
@@ -82,6 +85,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
@@ -127,6 +131,7 @@ import com.example.ui.screens.SmartRouterScreen
 import com.example.ui.screens.VaultScreen
 import com.example.ui.screens.WorkflowsScreen
 import com.example.ui.theme.JhGetWayTheme
+import com.example.updater.AppUpdateManager
 import kotlinx.coroutines.delay
 import java.util.Locale
 
@@ -379,6 +384,7 @@ private fun AppLockGateScreen(
 private fun MainGatewayScaffold(viewModel: GatewayViewModel) {
     val s = LocalStrings.current
     val context = LocalContext.current
+    val uriHandler = LocalUriHandler.current
     val navController = rememberNavController()
     val navBackStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = navBackStackEntry?.destination?.route ?: Routes.DASHBOARD
@@ -390,6 +396,12 @@ private fun MainGatewayScaffold(viewModel: GatewayViewModel) {
     val updateState by viewModel.appUpdateUiState.collectAsState()
     val snackbarHostState = remember { SnackbarHostState() }
     var showMoreSheet by remember { mutableStateOf(false) }
+
+    val unknownSourcesLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) {
+        viewModel.onUnknownSourcesPermissionReturned()
+    }
 
     LaunchedEffect(bannerMessage) {
         val msg = bannerMessage
@@ -728,10 +740,17 @@ private fun MainGatewayScaffold(viewModel: GatewayViewModel) {
     val availableRelease = updateState.availableRelease
     if (updateState.showPromptDialog && availableRelease != null) {
         AlertDialog(
-            onDismissRequest = { viewModel.dismissUpdateDialog() },
+            onDismissRequest = { if (!updateState.isDownloading) viewModel.dismissUpdateDialog() },
             title = { Text("${s.updateAvailableTitle}: ${availableRelease.tagName}") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (!BuildConfig.DEBUG && availableRelease.signingMode == "ci-ephemeral") {
+                        Text(
+                            text = s.ephemeralReleaseWarning,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.tertiary
+                        )
+                    }
                     if (availableRelease.releaseNotes.isNotBlank()) {
                         Text(
                             text = availableRelease.releaseNotes.take(400),
@@ -740,27 +759,86 @@ private fun MainGatewayScaffold(viewModel: GatewayViewModel) {
                     }
                     if (updateState.isDownloading) {
                         Spacer(Modifier.height(4.dp))
+                        LinearProgressIndicator(
+                            progress = { updateState.downloadProgressPct / 100f },
+                            modifier = Modifier.fillMaxWidth()
+                        )
                         Text(
                             text = "${s.downloadingUpdateLabel} ${updateState.downloadProgressPct}%",
                             style = MaterialTheme.typography.labelSmall
                         )
+                    } else if (updateState.signingConflict) {
+                        Text(
+                            text = s.updateSigningConflictMessage,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error
+                        )
+                    } else {
+                        updateState.errorMessage?.let { errMsg ->
+                            Text(
+                                text = errMsg,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error
+                            )
+                            val fallbackUrl = updateState.manualReleasesUrl
+                                ?: availableRelease.htmlUrl.takeIf { it.isNotBlank() }
+                            if (fallbackUrl != null) {
+                                OutlinedButton(
+                                    onClick = { runCatching { uriHandler.openUri(fallbackUrl) } },
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Text(s.openOfficialReleasesAction)
+                                }
+                            }
+                        }
+                        if (updateState.errorMessage == null &&
+                            updateState.downloadedApkFile != null &&
+                            !updateState.statusMessage.isNullOrBlank()
+                        ) {
+                            Text(
+                                text = updateState.statusMessage!!,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                        }
                     }
                 }
             },
             confirmButton = {
-                Button(
-                    onClick = { viewModel.downloadAndInstallUpdate() },
-                    enabled = !updateState.isDownloading
-                ) {
-                    Text(s.downloadAndInstallAction)
+                if (updateState.signingConflict) {
+                    Button(
+                        onClick = {
+                            viewModel.dismissUpdateDialog()
+                            runCatching { uriHandler.openUri(availableRelease.htmlUrl) }
+                        }
+                    ) {
+                        Text(s.openReleasePageLabel)
+                    }
+                } else if (updateState.downloadedApkFile != null && !updateState.isDownloading) {
+                    Button(onClick = { viewModel.launchDownloadedApkInstall() }) {
+                        Text(s.installDownloadedAction)
+                    }
+                } else {
+                    Button(
+                        onClick = { viewModel.downloadAndInstallUpdate() },
+                        enabled = !updateState.isDownloading
+                    ) {
+                        Text(s.downloadAndInstallAction)
+                    }
                 }
             },
             dismissButton = {
                 Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    TextButton(onClick = { viewModel.skipCurrentUpdate() }) {
+                    TextButton(
+                        onClick = { viewModel.skipCurrentUpdate() },
+                        enabled = !updateState.isDownloading
+                    ) {
                         Text(s.skipThisVersionLabel)
                     }
-                    TextButton(onClick = { viewModel.dismissUpdateDialog() }) {
+                    TextButton(
+                        onClick = { viewModel.dismissUpdateDialog() },
+                        enabled = !updateState.isDownloading
+                    ) {
                         Text(s.laterLabel)
                     }
                 }
@@ -775,14 +853,24 @@ private fun MainGatewayScaffold(viewModel: GatewayViewModel) {
             text = { Text(s.installPermissionMessage) },
             confirmButton = {
                 Button(onClick = {
-                    viewModel.dismissInstallPermissionPrompt()
+                    viewModel.onInstallPermissionSettingsOpened()
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                         runCatching {
-                            val intent = Intent(
-                                Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
-                                Uri.parse("package:${context.packageName}")
-                            ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                            context.startActivity(intent)
+                            unknownSourcesLauncher.launch(
+                                AppUpdateManager.createUnknownSourcesSettingsIntent(
+                                    context = context,
+                                    forActivityResult = true
+                                )
+                            )
+                        }.onFailure {
+                            runCatching {
+                                context.startActivity(
+                                    AppUpdateManager.createUnknownSourcesSettingsIntent(
+                                        context = context,
+                                        forActivityResult = false
+                                    )
+                                )
+                            }
                         }
                     }
                 }) {
