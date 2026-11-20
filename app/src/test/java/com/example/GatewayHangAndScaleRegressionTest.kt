@@ -471,13 +471,22 @@ class GatewayHangAndScaleRegressionTest {
                 },
                 "lines": {
                   "type": "array",
+                  "uniqueItems": true,
                   "items": {
                     "type": "integer",
+                    "exclusiveMinimum": 0,
+                    "exclusiveMaximum": 1000,
                     "default": 1
                   }
+                },
+                "patternField": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 64,
+                  "pattern": "^[a-z]+$"
                 }
               },
-              "required": ["filePath"]
+              "required": ["filePath", "nonExistentKey"]
             }
             """.trimIndent()
         )
@@ -506,13 +515,24 @@ class GatewayHangAndScaleRegressionTest {
         assertFalse(paramsOut.has("\$schema"))
         assertFalse(paramsOut.has("additionalProperties"))
         assertFalse(paramsOut.has("title"))
+        val reqArr = paramsOut.getJSONArray("required")
+        assertEquals(1, reqArr.length())
+        assertEquals("filePath", reqArr.getString(0))
         val filePathSchema = paramsOut.getJSONObject("properties").getJSONObject("filePath")
         assertEquals("string", filePathSchema.getString("type"))
         assertTrue(filePathSchema.getBoolean("nullable"))
         assertFalse(filePathSchema.has("default"))
-        val itemsSchema = paramsOut.getJSONObject("properties").getJSONObject("lines").getJSONObject("items")
+        val linesSchema = paramsOut.getJSONObject("properties").getJSONObject("lines")
+        assertFalse(linesSchema.has("uniqueItems"))
+        val itemsSchema = linesSchema.getJSONObject("items")
         assertEquals("integer", itemsSchema.getString("type"))
         assertFalse(itemsSchema.has("default"))
+        assertFalse(itemsSchema.has("exclusiveMinimum"))
+        assertFalse(itemsSchema.has("exclusiveMaximum"))
+        val patternSchema = paramsOut.getJSONObject("properties").getJSONObject("patternField")
+        assertFalse(patternSchema.has("minLength"))
+        assertFalse(patternSchema.has("maxLength"))
+        assertFalse(patternSchema.has("pattern"))
     }
 
     @Test
@@ -576,5 +596,93 @@ class GatewayHangAndScaleRegressionTest {
         assertEquals(400, res400.execution.statusCode)
         assertEquals(1, res400.decision.attemptCount)
         assertEquals("Plain HTTP 400 must not hit Backup", 1, backupHits.get())
+    }
+
+    @Test
+    fun openRouterMultiModel402CreditError_skipsDepletedProviderAndReachesHealthyBackupViaStreaming() = runBlocking {
+        val depletedHits = AtomicInteger(0)
+        val unknownFieldHits = AtomicInteger(0)
+
+        val depletedUrl = startMockUpstream {
+            post("/v1/chat/completions") {
+                depletedHits.incrementAndGet()
+                // Simulate OpenRouter streaming HTTP 200 inline SSE 402 error
+                call.respondTextWriter(ContentType.Text.EventStream, HttpStatusCode.OK) {
+                    write("data: {\"error\":{\"message\":\"This request requires more credits, or fewer max_tokens. You requested up to 32000 tokens, but can only afford 63.\",\"code\":402}}\n\n")
+                    flush()
+                }
+            }
+        }
+        val schemaRejectUrl = startMockUpstream {
+            post("/v1/chat/completions") {
+                unknownFieldHits.incrementAndGet()
+                call.respondText(
+                    """{"error":{"message":"Invalid JSON payload received. Unknown name \"exclusiveMinimum\" at 'tools[0]': Cannot find field.","status":"INVALID_ARGUMENT"}}""",
+                    ContentType.Application.Json,
+                    HttpStatusCode.BadRequest
+                )
+            }
+        }
+        val healthyUrl = startMockUpstream {
+            post("/v1/chat/completions") {
+                call.respondTextWriter(ContentType.Text.EventStream, HttpStatusCode.OK) {
+                    write("data: ${JSONObject("""{"id":"ok","choices":[{"index":0,"delta":{"content":"Recovered cleanly"},"finish_reason":"stop"}]}""")}\n\n")
+                    write("data: [DONE]\n\n")
+                    flush()
+                }
+            }
+        }
+
+        // OpenRouter has 4 distinct models; without provider-level 402 skipping, auto would waste all retries on OpenRouter!
+        db.providerDao().upsert(
+            ProviderEntity(
+                id = "or", name = "OpenRouter", apiFormat = ApiFormat.OPENAI,
+                baseUrl = "$depletedUrl/v1", defaultModel = "or-model-1", priority = 1,
+                status = ProviderStatus.CONNECTED, enabled = true
+            )
+        )
+        db.providerDao().upsert(
+            ProviderEntity(
+                id = "p_schema", name = "SchemaReject", apiFormat = ApiFormat.OPENAI,
+                baseUrl = "$schemaRejectUrl/v1", defaultModel = "sr-model", priority = 2,
+                status = ProviderStatus.CONNECTED, enabled = true
+            )
+        )
+        db.providerDao().upsert(
+            ProviderEntity(
+                id = "p_ok", name = "HealthyProvider", apiFormat = ApiFormat.OPENAI,
+                baseUrl = "$healthyUrl/v1", defaultModel = "ok-model", priority = 3,
+                status = ProviderStatus.CONNECTED, enabled = true
+            )
+        )
+        db.apiKeyDao().upsert(ApiKeyEntity(id = "k_or", providerId = "or", label = "KOR", encryptedKey = CryptoManager.encrypt("sk-or"), maskedPreview = "sk-or"))
+        db.apiKeyDao().upsert(ApiKeyEntity(id = "k_sr", providerId = "p_schema", label = "KSR", encryptedKey = CryptoManager.encrypt("sk-sr"), maskedPreview = "sk-sr"))
+        db.apiKeyDao().upsert(ApiKeyEntity(id = "k_ok", providerId = "p_ok", label = "KOK", encryptedKey = CryptoManager.encrypt("sk-ok"), maskedPreview = "sk-ok"))
+        db.modelDao().upsertAll(
+            listOf(
+                ModelEntity(id = "or::m1", modelId = "or-model-1", displayName = "OR 1", providerId = "or", providerName = "OpenRouter", supportsChat = true, supportsTools = true, supportsStreaming = true, enabled = true),
+                ModelEntity(id = "or::m2", modelId = "or-model-2", displayName = "OR 2", providerId = "or", providerName = "OpenRouter", supportsChat = true, supportsTools = true, supportsStreaming = true, enabled = true),
+                ModelEntity(id = "or::m3", modelId = "or-model-3", displayName = "OR 3", providerId = "or", providerName = "OpenRouter", supportsChat = true, supportsTools = true, supportsStreaming = true, enabled = true),
+                ModelEntity(id = "or::m4", modelId = "or-model-4", displayName = "OR 4", providerId = "or", providerName = "OpenRouter", supportsChat = true, supportsTools = true, supportsStreaming = true, enabled = true)
+            )
+        )
+
+        val (server, baseUrl, token) = startLocalGateway(timeoutSec = 10, maxRetries = 2, autoAllowPaid = true)
+        val reqBody = """{"model":"jh-getway/auto","stream":true,"messages":[{"role":"user","content":"hi"}]}"""
+        val req = Request.Builder()
+            .url("$baseUrl/v1/chat/completions")
+            .header("Authorization", "Bearer $token")
+            .post(reqBody.toRequestBody("application/json".toMediaType()))
+            .build()
+
+        val respText = client.newCall(req).execute().use { resp ->
+            assertEquals(200, resp.code)
+            resp.body!!.string()
+        }
+        assertTrue("Expected fallback to HealthyProvider after OR 402 + Schema 400, got: $respText", respText.contains("Recovered cleanly"))
+        assertEquals("OpenRouter must be skipped after first 402 instead of retrying its other models", 1, depletedHits.get())
+        assertEquals(1, unknownFieldHits.get())
+        delay(100)
+        assertEquals(0, server.runtimeState.value.activeRequests)
     }
 }

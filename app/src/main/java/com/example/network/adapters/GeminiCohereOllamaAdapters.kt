@@ -289,59 +289,148 @@ class GeminiProviderAdapter : ProviderAdapter {
     }
 
     private fun sanitizeGeminiSchema(schema: JSONObject): JSONObject {
-        val unsupportedKeys = setOf(
-            "\$schema", "\$id", "\$defs", "definitions", "\$comment", "\$ref",
-            "additionalProperties", "default", "title", "examples",
-            "readOnly", "writeOnly", "deprecated", "const", "propertyNames",
-            "patternProperties", "unevaluatedProperties", "minProperties", "maxProperties"
-        )
+        val allowedFormats = setOf("date-time", "enum", "int32", "int64", "float", "double")
+        val merged = JSONObject()
+
+        // Flatten allOf into merged schema first if present
+        val allOfArr = schema.optJSONArray("allOf")
+        if (allOfArr != null) {
+            for (i in 0 until allOfArr.length()) {
+                val sub = allOfArr.optJSONObject(i) ?: continue
+                val subKeys = sub.keys()
+                while (subKeys.hasNext()) {
+                    val k = subKeys.next()
+                    if (k == "properties") {
+                        val targetProps = merged.optJSONObject("properties") ?: JSONObject().also { merged.put("properties", it) }
+                        val subProps = sub.optJSONObject("properties")
+                        if (subProps != null) {
+                            val pKeys = subProps.keys()
+                            while (pKeys.hasNext()) {
+                                val pk = pKeys.next()
+                                targetProps.put(pk, subProps.opt(pk))
+                            }
+                        }
+                    } else if (k == "required") {
+                        val targetReq = merged.optJSONArray("required") ?: JSONArray().also { merged.put("required", it) }
+                        val subReq = sub.optJSONArray("required")
+                        if (subReq != null) {
+                            for (r in 0 until subReq.length()) {
+                                targetReq.put(subReq.opt(r))
+                            }
+                        }
+                    } else if (!merged.has(k)) {
+                        merged.put(k, sub.opt(k))
+                    }
+                }
+            }
+        }
+        val origKeys = schema.keys()
+        while (origKeys.hasNext()) {
+            val k = origKeys.next()
+            if (k == "allOf") continue
+            if (k == "properties" && merged.has("properties")) {
+                val targetProps = merged.getJSONObject("properties")
+                val origProps = schema.optJSONObject("properties")
+                if (origProps != null) {
+                    val pKeys = origProps.keys()
+                    while (pKeys.hasNext()) {
+                        val pk = pKeys.next()
+                        targetProps.put(pk, origProps.opt(pk))
+                    }
+                }
+            } else if (k == "required" && merged.has("required")) {
+                val targetReq = merged.getJSONArray("required")
+                val origReq = schema.optJSONArray("required")
+                if (origReq != null) {
+                    for (r in 0 until origReq.length()) {
+                        targetReq.put(origReq.opt(r))
+                    }
+                }
+            } else {
+                merged.put(k, schema.opt(k))
+            }
+        }
+
         val out = JSONObject()
-        val keys = schema.keys()
+        var sanitizedProps: JSONObject? = null
+        val keys = merged.keys()
         while (keys.hasNext()) {
             val key = keys.next()
-            if (key in unsupportedKeys) continue
-            val value = schema.opt(key) ?: continue
-            when {
-                key == "type" && value is JSONArray -> {
-                    var chosen: String? = null
-                    var hasNull = false
-                    for (i in 0 until value.length()) {
-                        val t = value.optString(i)
-                        if (t.equals("null", ignoreCase = true)) {
-                            hasNull = true
-                        } else if (chosen == null && t.isNotBlank()) {
-                            chosen = t
+            val value = merged.opt(key) ?: continue
+            when (key) {
+                "type" -> when (value) {
+                    is JSONArray -> {
+                        var chosen: String? = null
+                        var hasNull = false
+                        for (i in 0 until value.length()) {
+                            val t = value.optString(i)
+                            if (t.equals("null", ignoreCase = true)) {
+                                hasNull = true
+                            } else if (chosen == null && t.isNotBlank()) {
+                                chosen = t
+                            }
                         }
+                        if (chosen != null) out.put("type", chosen)
+                        if (hasNull) out.put("nullable", true)
                     }
-                    if (chosen != null) out.put("type", chosen)
-                    if (hasNull) out.put("nullable", true)
+                    is String -> if (value.isNotBlank()) out.put("type", value)
                 }
-                key == "properties" && value is JSONObject -> {
-                    val sanitizedProps = JSONObject()
+                "description", "nullable", "minimum", "maximum", "minItems", "maxItems" -> {
+                    out.put(key, value)
+                }
+                "format" -> {
+                    val fmt = value.toString()
+                    if (fmt in allowedFormats) out.put("format", fmt)
+                }
+                "enum" -> if (value is JSONArray) out.put("enum", value)
+                "const" -> if (!merged.has("enum")) {
+                    out.put("enum", JSONArray().put(value))
+                }
+                "properties" -> if (value is JSONObject) {
+                    val props = JSONObject()
                     val propKeys = value.keys()
                     while (propKeys.hasNext()) {
                         val pKey = propKeys.next()
                         val propObj = value.optJSONObject(pKey)
                         if (propObj != null) {
-                            sanitizedProps.put(pKey, sanitizeGeminiSchema(propObj))
+                            props.put(pKey, sanitizeGeminiSchema(propObj))
                         }
                     }
-                    out.put("properties", sanitizedProps)
+                    sanitizedProps = props
+                    out.put("properties", props)
                 }
-                key == "items" && value is JSONObject -> {
+                "items" -> if (value is JSONObject) {
                     out.put("items", sanitizeGeminiSchema(value))
                 }
-                (key == "anyOf" || key == "oneOf" || key == "allOf") && value is JSONArray -> {
+                "anyOf", "oneOf" -> if (value is JSONArray && !out.has("anyOf")) {
                     val sanitizedArr = JSONArray()
                     for (i in 0 until value.length()) {
                         value.optJSONObject(i)?.let { sanitizedArr.put(sanitizeGeminiSchema(it)) }
                     }
-                    if (sanitizedArr.length() > 0) out.put(key, sanitizedArr)
+                    if (sanitizedArr.length() > 0) out.put("anyOf", sanitizedArr)
                 }
-                value is JSONObject -> out.put(key, sanitizeGeminiSchema(value))
-                else -> out.put(key, value)
             }
         }
+
+        // Filter required keys to ones present in properties when properties exist (Gemini rejects unknown required keys)
+        val rawRequired = merged.optJSONArray("required")
+        if (rawRequired != null) {
+            val filteredReq = JSONArray()
+            val seenReq = HashSet<String>()
+            for (i in 0 until rawRequired.length()) {
+                val reqName = rawRequired.optString(i).takeIf { it.isNotBlank() } ?: continue
+                if ((sanitizedProps == null || sanitizedProps.has(reqName)) && seenReq.add(reqName)) {
+                    filteredReq.put(reqName)
+                }
+            }
+            if (filteredReq.length() > 0) out.put("required", filteredReq)
+        }
+
+        // Gemini requires array schemas to include items
+        if (out.optString("type").equals("array", ignoreCase = true) && !out.has("items")) {
+            out.put("items", JSONObject().put("type", "string"))
+        }
+
         return out
     }
 

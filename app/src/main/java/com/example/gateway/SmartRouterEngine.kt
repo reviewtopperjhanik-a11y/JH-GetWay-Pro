@@ -321,7 +321,13 @@ class SmartRouterEngine(
                 effectiveMode == RoutingMode.AUTO_FREE ||
                 OpenCodeSelectorIds.isVirtualSelector(normalizedSelector)
         }
-        val maxAttempts = if (allowFallback) (1 + settings.maxRetries).coerceAtMost(candidates.size) else 1
+        val configuredAttempts = 1 + settings.maxRetries
+        val effectiveAttemptCap = if (OpenCodeSelectorIds.isVirtualSelector(normalizedSelector)) {
+            maxOf(configuredAttempts, 6)
+        } else {
+            configuredAttempts
+        }
+        val maxAttempts = if (allowFallback) effectiveAttemptCap.coerceAtMost(candidates.size) else 1
         val requestStartNs = System.nanoTime()
         val totalBudgetSec = settings.gatewayTimeoutSec.coerceIn(2, 75)
         val deadlineNs = requestStartNs + totalBudgetSec * 1_000_000_000L
@@ -415,8 +421,10 @@ class SmartRouterEngine(
             failedModels += candidate.id to candidate.modelId.lowercase(Locale.US)
             if (normalizedRes.statusCode >= 500 ||
                 normalizedRes.statusCode == 429 ||
+                normalizedRes.statusCode == 402 ||
                 normalizedRes.statusCode == 401 ||
                 normalizedRes.statusCode == 403 ||
+                normalizedRes.errorCode == "QUOTA_EXCEEDED" ||
                 normalizedRes.errorCode == "TIMEOUT" ||
                 normalizedRes.errorCode == "CONNECTION_ERROR" ||
                 normalizedRes.errorCode == "EMPTY_RESPONSE"
@@ -579,7 +587,13 @@ class SmartRouterEngine(
                 effectiveMode == RoutingMode.AUTO_FREE ||
                 OpenCodeSelectorIds.isVirtualSelector(normalizedSelector)
         }
-        val maxAttempts = if (allowFallback) (1 + settings.maxRetries).coerceAtMost(candidates.size) else 1
+        val configuredStreamAttempts = 1 + settings.maxRetries
+        val effectiveStreamAttemptCap = if (OpenCodeSelectorIds.isVirtualSelector(normalizedSelector)) {
+            maxOf(configuredStreamAttempts, 6)
+        } else {
+            configuredStreamAttempts
+        }
+        val maxAttempts = if (allowFallback) effectiveStreamAttemptCap.coerceAtMost(candidates.size) else 1
         val requestStartNs = System.nanoTime()
         val totalBudgetSec = settings.gatewayTimeoutSec.coerceIn(2, 75)
         val deadlineNs = requestStartNs + totalBudgetSec * 1_000_000_000L
@@ -708,8 +722,10 @@ class SmartRouterEngine(
                             failedModels += candidate.id to candidate.modelId.lowercase(Locale.US)
                             if (event.error.statusCode >= 500 ||
                                 event.error.statusCode == 429 ||
+                                event.error.statusCode == 402 ||
                                 event.error.statusCode == 401 ||
                                 event.error.statusCode == 403 ||
+                                event.error.errorCode == "QUOTA_EXCEEDED" ||
                                 event.error.errorCode == "TIMEOUT" ||
                                 event.error.errorCode == "CONNECTION_ERROR" ||
                                 event.error.errorCode == "EMPTY_RESPONSE"
@@ -1750,8 +1766,11 @@ class SmartRouterEngine(
     }
 
     private suspend fun updateProviderAndKeyHealth(candidate: RouteCandidate, res: ChatExecutionResult) {
-        // Non-retryable client validation/schema errors (e.g. HTTP 400 malformed request) must NOT poison healthy providers
-        val isClientMalformed = !res.success && !res.retryable && res.statusCode in 400..499 && res.statusCode != 401 && res.statusCode != 403 && res.statusCode != 429
+        // Non-retryable client validation/schema errors or per-model capability mismatches must NOT poison healthy providers
+        val isClientMalformed = !res.success && (
+            res.errorCode == "UNSUPPORTED_CAPABILITY" ||
+                (!res.retryable && res.statusCode in 400..499 && res.statusCode != 401 && res.statusCode != 402 && res.statusCode != 403 && res.statusCode != 429)
+            )
         if (!candidate.isLocal) {
             if (!isClientMalformed) {
                 db.providerDao().getById(candidate.id)?.let { p ->

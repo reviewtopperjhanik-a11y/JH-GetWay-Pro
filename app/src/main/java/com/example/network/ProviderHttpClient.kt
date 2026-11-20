@@ -702,33 +702,47 @@ class ProviderHttpClient(
                         if (jsonText.isEmpty() || jsonText == "[DONE]") continue
 
                         val parsed = runCatching { adapter.parseStreamLine(currentEventType, jsonText, streamState) }.getOrNull()
-                        val inlineError = parsed?.errorMessage ?: runCatching {
-                            val obj = org.json.JSONObject(jsonText)
+                        val inlineObj = if (parsed?.errorMessage == null) {
+                            runCatching { org.json.JSONObject(jsonText) }.getOrNull()
+                        } else null
+                        val parsedInlineFailure = inlineObj?.let { obj ->
+                            AdapterHelper.parseInlineErrorIfPresent(
+                                root = obj,
+                                httpCode = 502,
+                                latencyMs = (System.nanoTime() - start) / 1_000_000L,
+                                apiKey = apiKey
+                            )
+                        }
+                        val inlineError = parsed?.errorMessage ?: parsedInlineFailure?.safeErrorMessage ?: inlineObj?.let { obj ->
                             when {
                                 currentEventType == "error" || obj.optString("type") == "error" ->
                                     obj.optJSONObject("error")?.optString("message")?.ifBlank { null }
                                         ?: obj.optString("message").ifBlank { null }
                                         ?: "Upstream stream error"
-                                obj.has("error") && !obj.isNull("error") ->
-                                    obj.optJSONObject("error")?.optString("message")?.ifBlank { null }
-                                        ?: obj.optString("error").ifBlank { null }
-                                        ?: "Upstream stream error"
                                 else -> null
                             }
-                        }.getOrNull()
+                        }
                         if (inlineError != null) {
                             val errLatency = (System.nanoTime() - start) / 1_000_000L
                             val hasEmitted = emittedAny.get()
+                            val failureResult = if (parsedInlineFailure != null) {
+                                parsedInlineFailure.copy(
+                                    latencyMs = errLatency,
+                                    retryable = !hasEmitted && parsedInlineFailure.retryable
+                                )
+                            } else {
+                                ChatExecutionResult(
+                                    success = false,
+                                    latencyMs = errLatency,
+                                    statusCode = 502,
+                                    errorCode = "STREAM_ERROR",
+                                    safeErrorMessage = MaskingUtils.sanitizeErrorMessage(inlineError, listOf(apiKey)),
+                                    retryable = !hasEmitted
+                                )
+                            }
                             sendTerminal(
                                 StreamEvent.Failed(
-                                    ChatExecutionResult(
-                                        success = false,
-                                        latencyMs = errLatency,
-                                        statusCode = 502,
-                                        errorCode = "STREAM_ERROR",
-                                        safeErrorMessage = MaskingUtils.sanitizeErrorMessage(inlineError, listOf(apiKey)),
-                                        retryable = !hasEmitted
-                                    ),
+                                    failureResult,
                                     emittedAnyChunk = hasEmitted
                                 )
                             )
