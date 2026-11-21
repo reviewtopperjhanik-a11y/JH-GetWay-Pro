@@ -513,7 +513,7 @@ class PhaseEAdvancedIntegrationsTest {
             .build()
         try {
             val writableDb = migratedDb.openHelper.writableDatabase
-            assertEquals(6, writableDb.version)
+            assertEquals(7, writableDb.version)
             writableDb.query("SELECT name FROM sqlite_master WHERE type='table' AND name='service_pool_keys'").use { c ->
                 assertTrue("Expected service_pool_keys table to exist after v6 migration", c.moveToFirst())
             }

@@ -48,7 +48,8 @@ data class ConnectionTestResult(
     val status: ProviderStatus,
     val latencyMs: Long,
     val httpCode: Int? = null,
-    val message: String
+    val message: String,
+    val retryAfterSec: Int? = null
 )
 
 data class ChatMessagePayload(
@@ -90,7 +91,8 @@ data class ChatExecutionResult(
     val toolCalls: List<ToolCallPayload> = emptyList(),
     val usageReported: Boolean = false,
     val modelUsed: String? = null,
-    val actualBilledCostUsd: Double? = null
+    val actualBilledCostUsd: Double? = null,
+    val retryAfterSec: Int? = null
 )
 
 sealed interface StreamEvent {
@@ -158,6 +160,29 @@ class ProviderHttpClient(
         return buffer.clone().readString(readCount, Charsets.UTF_8)
     }
 
+    private fun parseRetryAfterSeconds(resp: okhttp3.Response): Int? {
+        val raw = resp.header("Retry-After")?.trim().orEmpty()
+        if (raw.isEmpty()) return null
+        raw.toIntOrNull()?.let { return it.coerceIn(5, 3600) }
+        val patterns = listOf(
+            "EEE, dd MMM yyyy HH:mm:ss zzz",
+            "EEEE, dd-MMM-yy HH:mm:ss zzz",
+            "EEE MMM d HH:mm:ss yyyy"
+        )
+        for (pattern in patterns) {
+            val parsedMs = runCatching {
+                java.text.SimpleDateFormat(pattern, java.util.Locale.US).apply {
+                    timeZone = java.util.TimeZone.getTimeZone("GMT")
+                }.parse(raw)?.time
+            }.getOrNull()
+            if (parsedMs != null) {
+                val deltaSec = ((parsedMs - System.currentTimeMillis()) / 1000L).toInt()
+                return deltaSec.coerceIn(5, 3600)
+            }
+        }
+        return null
+    }
+
     suspend fun testProviderConnection(
         provider: ProviderEntity,
         apiKey: String,
@@ -201,7 +226,8 @@ class ProviderHttpClient(
                         status = ProviderStatus.RATE_LIMITED,
                         latencyMs = latency,
                         httpCode = resp.code,
-                        message = "Rate limited (HTTP 429)"
+                        message = "Rate limited (HTTP 429)",
+                        retryAfterSec = parseRetryAfterSeconds(resp)
                     )
                     resp.code == 401 || resp.code == 403 -> ConnectionTestResult(
                         status = ProviderStatus.ERROR,
@@ -377,7 +403,9 @@ class ProviderHttpClient(
                     val latency = (System.nanoTime() - start) / 1_000_000L
                     val bodyStr = readBoundedBody(resp)
                     if (!resp.isSuccessful) {
+                        val retryAfter = parseRetryAfterSeconds(resp)
                         return@withContext adapter.normalizeHttpError(resp.code, bodyStr, latency, apiKey)
+                            .copy(retryAfterSec = retryAfter)
                     }
                     val parsed = adapter.parseChatResponse(bodyStr, latency, resp.code)
                     if (parsed.success && parsed.content.isEmpty() && parsed.toolCalls.isEmpty()) {
@@ -599,7 +627,14 @@ class ProviderHttpClient(
                     val latency = (System.nanoTime() - start) / 1_000_000L
                     if (!okResp.isSuccessful) {
                         val errBody = readBoundedBody(okResp)
-                        sendTerminal(StreamEvent.Failed(adapter.normalizeHttpError(okResp.code, errBody, latency, apiKey), emittedAnyChunk = false))
+                        val retryAfter = parseRetryAfterSeconds(okResp)
+                        sendTerminal(
+                            StreamEvent.Failed(
+                                adapter.normalizeHttpError(okResp.code, errBody, latency, apiKey)
+                                    .copy(retryAfterSec = retryAfter),
+                                emittedAnyChunk = false
+                            )
+                        )
                         close()
                         return@launch
                     }

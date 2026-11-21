@@ -281,7 +281,9 @@ data class EligibleModelRecord(
     val codingProfile: CodingCapabilityProfile,
     val codingScore: Int,
     val effectiveCostPer1M: Double?,
-    val isSynthesizedFromDefault: Boolean = false
+    val isSynthesizedFromDefault: Boolean = false,
+    val cooldownUntilMs: Long? = null,
+    val effectiveStatus: ProviderStatus = providerStatus
 )
 
 object OpenCodeModelCatalogResolver {
@@ -395,6 +397,13 @@ object OpenCodeModelCatalogResolver {
                     }
                 }
 
+                val effectiveStatus = effectiveRoutingStatus(
+                    status = provider.status,
+                    cooldownUntilMs = provider.cooldownUntilMs,
+                    lastCheckedAt = provider.lastCheckedAt,
+                    isLocal = false,
+                    nowMs = nowMs
+                )
                 for (model in providerModels) {
                     if (ModelCapabilityRegistry.isNonChatModel(model.modelType, model.modelId, model.supportsChat)) {
                         continue
@@ -405,7 +414,7 @@ object OpenCodeModelCatalogResolver {
                         model = model,
                         profile = codingProfile,
                         caps = caps,
-                        providerStatus = provider.status,
+                        providerStatus = effectiveStatus,
                         providerPriority = provider.priority,
                         lastLatencyMs = provider.lastLatencyMs ?: 5000L
                     )
@@ -432,7 +441,9 @@ object OpenCodeModelCatalogResolver {
                         codingProfile = codingProfile,
                         codingScore = codingScore,
                         effectiveCostPer1M = avgCost,
-                        isSynthesizedFromDefault = !storedModelKeys.contains(compositeKey)
+                        isSynthesizedFromDefault = !storedModelKeys.contains(compositeKey),
+                        cooldownUntilMs = provider.cooldownUntilMs,
+                        effectiveStatus = effectiveStatus
                     )
                 }
             }
@@ -488,6 +499,13 @@ object OpenCodeModelCatalogResolver {
                 }
             }
 
+            val effectiveLocalStatus = effectiveRoutingStatus(
+                status = srv.status,
+                cooldownUntilMs = srv.cooldownUntilMs,
+                lastCheckedAt = srv.lastCheckedAt,
+                isLocal = true,
+                nowMs = nowMs
+            )
             for (model in srvModels) {
                 if (ModelCapabilityRegistry.isNonChatModel(model.modelType, model.modelId, model.supportsChat)) {
                     continue
@@ -498,7 +516,7 @@ object OpenCodeModelCatalogResolver {
                     model = model,
                     profile = codingProfile,
                     caps = caps,
-                    providerStatus = srv.status,
+                    providerStatus = effectiveLocalStatus,
                     providerPriority = if (settings.localRoutingPolicy == LocalRoutingPolicy.CLOUD_FIRST) 25 else 5,
                     lastLatencyMs = srv.lastLatencyMs ?: 1000L
                 )
@@ -509,13 +527,15 @@ object OpenCodeModelCatalogResolver {
                     isLocal = true,
                     providerPriority = if (settings.localRoutingPolicy == LocalRoutingPolicy.CLOUD_FIRST) 25 else 5,
                     providerStatus = srv.status,
-                    lastCheckedAt = null,
+                    lastCheckedAt = srv.lastCheckedAt,
                     lastLatencyMs = srv.lastLatencyMs ?: 1000L,
                     model = model,
                     capabilities = caps,
                     codingProfile = codingProfile,
                     codingScore = codingScore,
-                    effectiveCostPer1M = 0.0
+                    effectiveCostPer1M = 0.0,
+                    cooldownUntilMs = srv.cooldownUntilMs,
+                    effectiveStatus = effectiveLocalStatus
                 )
             }
         }
@@ -530,12 +550,57 @@ object OpenCodeModelCatalogResolver {
         return eligibleRecords to canonicalDefault
     }
 
-    fun isRecordCoolingDown(record: EligibleModelRecord, nowMs: Long): Boolean {
-        if (record.providerStatus != ProviderStatus.ERROR && record.providerStatus != ProviderStatus.RATE_LIMITED) {
-            return false
-        }
-        val checked = record.lastCheckedAt ?: return record.isLocal
+    fun isStatusCoolingDown(
+        status: ProviderStatus,
+        cooldownUntilMs: Long?,
+        lastCheckedAt: Long?,
+        isLocal: Boolean,
+        nowMs: Long
+    ): Boolean {
+        val inFailureState = status == ProviderStatus.ERROR ||
+            status == ProviderStatus.RATE_LIMITED ||
+            (isLocal && status == ProviderStatus.DISCONNECTED)
+        if (!inFailureState) return false
+        cooldownUntilMs?.let { until -> return nowMs < until }
+        val checked = lastCheckedAt ?: return isLocal
         return (nowMs - checked) in 0 until SmartRouterEngine.COOLDOWN_WINDOW_MS
+    }
+
+    fun effectiveRoutingStatus(
+        status: ProviderStatus,
+        cooldownUntilMs: Long?,
+        lastCheckedAt: Long?,
+        isLocal: Boolean,
+        nowMs: Long
+    ): ProviderStatus {
+        if (isStatusCoolingDown(status, cooldownUntilMs, lastCheckedAt, isLocal, nowMs)) {
+            return status
+        }
+        return when {
+            status == ProviderStatus.RATE_LIMITED -> ProviderStatus.UNKNOWN
+            status == ProviderStatus.ERROR && (cooldownUntilMs != null || lastCheckedAt != null) ->
+                ProviderStatus.UNKNOWN
+            isLocal && status == ProviderStatus.DISCONNECTED && (cooldownUntilMs != null || lastCheckedAt != null) ->
+                ProviderStatus.UNKNOWN
+            else -> status
+        }
+    }
+
+    fun isRecordCoolingDown(record: EligibleModelRecord, nowMs: Long): Boolean =
+        isStatusCoolingDown(
+            status = record.providerStatus,
+            cooldownUntilMs = record.cooldownUntilMs,
+            lastCheckedAt = record.lastCheckedAt,
+            isLocal = record.isLocal,
+            nowMs = nowMs
+        )
+
+    private fun healthOrder(status: ProviderStatus): Int = when (status) {
+        ProviderStatus.CONNECTED -> 0
+        ProviderStatus.UNKNOWN, ProviderStatus.CHECKING -> 1
+        ProviderStatus.DISCONNECTED -> 2
+        ProviderStatus.RATE_LIMITED, ProviderStatus.ERROR -> 3
+        ProviderStatus.DISABLED -> 4
     }
 
     fun resolveCanonicalDefaultRecord(
@@ -564,7 +629,19 @@ object OpenCodeModelCatalogResolver {
 
         // 3. Highest-priority healthy ProviderEntity.defaultModel
         val orderedProviders = providers.filter { it.enabled }
-            .sortedWith(compareBy<ProviderEntity> { it.priority }.thenBy { it.lastLatencyMs ?: 5000L })
+            .sortedWith(
+                compareBy<ProviderEntity> {
+                    healthOrder(
+                        effectiveRoutingStatus(
+                            status = it.status,
+                            cooldownUntilMs = it.cooldownUntilMs,
+                            lastCheckedAt = it.lastCheckedAt,
+                            isLocal = false,
+                            nowMs = nowMs
+                        )
+                    )
+                }.thenBy { it.priority }.thenBy { it.lastLatencyMs ?: 5000L }
+            )
         for (p in orderedProviders) {
             val pDef = p.defaultModel.trim()
             if (pDef.isNotBlank()) {
@@ -863,15 +940,7 @@ object OpenCodeModelCatalogResolver {
                     LocalRoutingPolicy.LOCAL_ONLY -> !it.isLocal
                 }
             }
-            .thenBy {
-                when (it.providerStatus) {
-                    ProviderStatus.CONNECTED -> 0
-                    ProviderStatus.UNKNOWN, ProviderStatus.CHECKING -> 1
-                    ProviderStatus.DISCONNECTED -> 2
-                    ProviderStatus.RATE_LIMITED, ProviderStatus.ERROR -> 3
-                    ProviderStatus.DISABLED -> 4
-                }
-            }
+            .thenBy { healthOrder(it.effectiveStatus) }
             .thenByDescending { it.model.isDefault }
             .thenByDescending { it.codingScore }
             .thenBy { it.providerPriority }

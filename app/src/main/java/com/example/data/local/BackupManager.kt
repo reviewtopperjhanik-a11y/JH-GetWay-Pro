@@ -125,7 +125,7 @@ class BackupManager(
 
     companion object {
         const val CURRENT_BACKUP_FORMAT_VERSION = 2
-        const val CURRENT_DB_SCHEMA_VERSION = 6
+        const val CURRENT_DB_SCHEMA_VERSION = 7
         const val MAX_BACKUP_WORKFLOW_RUNS = 500
         const val MAX_BACKUP_METRICS = 2000
         const val MAX_BACKUP_ATTACHMENTS_TOTAL_BYTES = 24L * 1024L * 1024L

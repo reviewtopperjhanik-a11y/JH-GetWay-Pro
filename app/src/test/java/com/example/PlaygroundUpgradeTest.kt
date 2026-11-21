@@ -539,7 +539,7 @@ class PlaygroundUpgradeTest {
             .allowMainThreadQueries()
             .build()
         try {
-            assertEquals(6, migratedDb.openHelper.writableDatabase.version)
+            assertEquals(7, migratedDb.openHelper.writableDatabase.version)
             runBlocking {
                 val models = migratedDb.modelDao().getAllOnce()
                 assertEquals(2, models.size)

@@ -565,7 +565,8 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
         db.providerDao().upsert(
             provider.copy(
                 enabled = !provider.enabled,
-                status = if (!provider.enabled) ProviderStatus.UNKNOWN else ProviderStatus.DISABLED
+                status = if (!provider.enabled) ProviderStatus.UNKNOWN else ProviderStatus.DISABLED,
+                cooldownUntilMs = if (!provider.enabled) null else provider.cooldownUntilMs
             )
         )
     }
@@ -599,12 +600,20 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
             allowLocalHttp = settings.value.localNetworkAccessAllowed,
             timeoutSec = settings.value.gatewayTimeoutSec
         )
+        val nowMs = System.currentTimeMillis()
+        val cooldownUntil = when (result.status) {
+            ProviderStatus.CONNECTED -> null
+            ProviderStatus.RATE_LIMITED -> nowMs + ((result.retryAfterSec ?: 60).coerceIn(5, 600) * 1000L)
+            ProviderStatus.ERROR, ProviderStatus.DISCONNECTED -> nowMs + 60_000L
+            else -> provider.cooldownUntilMs
+        }
         db.providerDao().upsert(
             provider.copy(
                 status = result.status,
                 lastLatencyMs = result.latencyMs,
                 lastError = if (result.status == ProviderStatus.CONNECTED) null else result.message,
-                lastCheckedAt = System.currentTimeMillis()
+                lastCheckedAt = nowMs,
+                cooldownUntilMs = cooldownUntil
             )
         )
         if (activeKey != null) {
@@ -614,7 +623,12 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
                 ProviderStatus.ERROR -> if (result.httpCode == 401 || result.httpCode == 403) KeyStatus.INVALID else KeyStatus.UNKNOWN
                 else -> activeKey.status
             }
-            db.apiKeyDao().upsert(activeKey.copy(status = kStatus, lastTestedAt = System.currentTimeMillis()))
+            val kCooldown = when (result.status) {
+                ProviderStatus.CONNECTED -> null
+                ProviderStatus.RATE_LIMITED -> cooldownUntil
+                else -> if (result.httpCode == 401 || result.httpCode == 403) null else activeKey.cooldownUntilMs
+            }
+            db.apiKeyDao().upsert(activeKey.copy(status = kStatus, lastTestedAt = nowMs, cooldownUntilMs = kCooldown))
         }
         logEvent(ActivityCategory.PROVIDER_CONNECTION, provider.name, result.status.name, result.message)
         postBanner("${provider.name}: ${result.message}")
@@ -791,7 +805,8 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
             keyEntity.copy(
                 encryptedKey = encrypted,
                 maskedPreview = MaskingUtils.maskSecret(newPlainKey.trim()),
-                status = KeyStatus.UNKNOWN
+                status = KeyStatus.UNKNOWN,
+                cooldownUntilMs = null
             )
         )
         logEvent(ActivityCategory.KEY_UPDATE, keyEntity.label, "ROTATED", "API key rotated securely")
@@ -812,7 +827,13 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
             ProviderStatus.ERROR -> if (res.httpCode == 401 || res.httpCode == 403) KeyStatus.INVALID else KeyStatus.UNKNOWN
             else -> KeyStatus.UNKNOWN
         }
-        db.apiKeyDao().upsert(keyEntity.copy(status = status, lastTestedAt = System.currentTimeMillis()))
+        val nowMs = System.currentTimeMillis()
+        val kCooldown = when (res.status) {
+            ProviderStatus.CONNECTED -> null
+            ProviderStatus.RATE_LIMITED -> nowMs + ((res.retryAfterSec ?: 60).coerceIn(5, 600) * 1000L)
+            else -> null
+        }
+        db.apiKeyDao().upsert(keyEntity.copy(status = status, lastTestedAt = nowMs, cooldownUntilMs = kCooldown))
         logEvent(ActivityCategory.KEY_UPDATE, keyEntity.label, status.name, res.message)
         postBanner("${keyEntity.label}: ${res.message}")
     }
@@ -829,7 +850,8 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
         db.apiKeyDao().upsert(
             keyEntity.copy(
                 enabled = !keyEntity.enabled,
-                status = if (!keyEntity.enabled) KeyStatus.UNKNOWN else KeyStatus.DISABLED
+                status = if (!keyEntity.enabled) KeyStatus.UNKNOWN else KeyStatus.DISABLED,
+                cooldownUntilMs = if (!keyEntity.enabled) null else keyEntity.cooldownUntilMs
             )
         )
     }
@@ -1055,14 +1077,29 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
         val token = if (server.hasAuth) {
             CryptoManager.decryptResult(server.encryptedAuthToken).getOrElse { err ->
                 val msg = MaskingUtils.sanitizeErrorMessage(err.message)
-                db.localAiServerDao().upsert(server.copy(status = ProviderStatus.ERROR, lastError = msg))
+                val nowMs = System.currentTimeMillis()
+                db.localAiServerDao().upsert(
+                    server.copy(
+                        status = ProviderStatus.ERROR,
+                        lastError = msg,
+                        lastCheckedAt = nowMs,
+                        cooldownUntilMs = nowMs + 60_000L
+                    )
+                )
                 postBanner("${server.name}: $msg")
                 return@launch
             }
         } else ""
         val res = httpClient.testLocalServer(server, token, settings.value.localNetworkAccessAllowed)
+        val nowMs = System.currentTimeMillis()
         db.localAiServerDao().upsert(
-            server.copy(status = res.status, lastLatencyMs = res.latencyMs, lastError = if (res.status == ProviderStatus.CONNECTED) null else res.message)
+            server.copy(
+                status = res.status,
+                lastLatencyMs = res.latencyMs,
+                lastError = if (res.status == ProviderStatus.CONNECTED) null else res.message,
+                lastCheckedAt = nowMs,
+                cooldownUntilMs = if (res.status == ProviderStatus.CONNECTED) null else nowMs + 60_000L
+            )
         )
         postBanner("${server.name}: ${res.message}")
     }
@@ -1083,7 +1120,14 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
         )
     }
 
-    fun toggleLocalServer(server: LocalAiServerEntity) = viewModelScope.launch { db.localAiServerDao().upsert(server.copy(enabled = !server.enabled)) }
+    fun toggleLocalServer(server: LocalAiServerEntity) = viewModelScope.launch {
+        db.localAiServerDao().upsert(
+            server.copy(
+                enabled = !server.enabled,
+                cooldownUntilMs = if (!server.enabled) null else server.cooldownUntilMs
+            )
+        )
+    }
     fun deleteLocalServer(server: LocalAiServerEntity) = viewModelScope.launch {
         db.withTransaction {
             db.localAiServerDao().deleteById(server.id)

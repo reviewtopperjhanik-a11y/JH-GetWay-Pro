@@ -26,7 +26,8 @@ data class ProviderEntity(
     val lastLatencyMs: Long? = null,
     val lastError: String? = null,
     val lastCheckedAt: Long? = null,
-    val createdAt: Long = System.currentTimeMillis()
+    val createdAt: Long = System.currentTimeMillis(),
+    val cooldownUntilMs: Long? = null
 )
 
 enum class KeyStatus { ACTIVE, INVALID, EXPIRED, RATE_LIMITED, DISABLED, UNKNOWN }
@@ -50,7 +51,8 @@ data class ApiKeyEntity(
     val usageCount: Long = 0,
     val lastUsedAt: Long? = null,
     val lastTestedAt: Long? = null,
-    val createdAt: Long = System.currentTimeMillis()
+    val createdAt: Long = System.currentTimeMillis(),
+    val cooldownUntilMs: Long? = null
 )
 
 enum class ModelType {
@@ -156,7 +158,9 @@ data class LocalAiServerEntity(
     val lastLatencyMs: Long? = null,
     val lastError: String? = null,
     val enabled: Boolean = true,
-    val createdAt: Long = System.currentTimeMillis()
+    val createdAt: Long = System.currentTimeMillis(),
+    val lastCheckedAt: Long? = null,
+    val cooldownUntilMs: Long? = null
 )
 
 enum class McpTransportType { STDIO, STREAMABLE_HTTP }
