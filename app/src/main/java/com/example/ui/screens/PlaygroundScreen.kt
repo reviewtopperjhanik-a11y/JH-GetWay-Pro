@@ -110,37 +110,47 @@ fun PlaygroundScreen(
         }
     }
 
-    val compareAvailableModels = remember(models, localServers, enabledProviderIds) {
-        val dbModels = models.filter { it.enabled && it.supportsChat && it.providerId in enabledProviderIds }
-        val localFallbacks = localServers.filter { it.enabled && it.defaultModel.isNotBlank() }.mapNotNull { srv ->
-            val lid = "local:${srv.id}"
-            val hasDbLocal = dbModels.any { it.providerId == lid }
-            if (hasDbLocal) null
-            else ModelEntity(
-                id = "$lid::${srv.defaultModel}",
-                modelId = srv.defaultModel,
-                displayName = srv.defaultModel,
-                providerId = lid,
-                providerName = srv.name,
-                isLocal = true,
-                accessTier = AccessTier.LOCAL
-            )
-        }
-        dbModels + localFallbacks
-    }
-    val compareAvailableById = remember(compareAvailableModels) { compareAvailableModels.associateBy { it.id } }
-    val compareSelectedSet = remember(compareState.selectedModelKeys) { compareState.selectedModelKeys.toSet() }
-    val compareSelectedModels = remember(compareState.selectedModelKeys, compareAvailableById, compareState.entries) {
-        compareState.selectedModelKeys.mapNotNull { key ->
-            compareAvailableById[key] ?: compareState.entries.firstOrNull { it.entryKey == key }?.let { entry ->
-                ModelEntity(
-                    id = entry.entryKey,
-                    modelId = entry.modelId,
-                    displayName = entry.displayName,
-                    providerId = entry.providerId,
-                    providerName = entry.providerName,
-                    supportsStreaming = entry.supportsStreaming
+    val compareAvailableModels = remember(compareMode, models, localServers, enabledProviderIds) {
+        if (!compareMode) {
+            emptyList()
+        } else {
+            val dbModels = models.filter { it.enabled && it.supportsChat && it.providerId in enabledProviderIds }
+            val localFallbacks = localServers.filter { it.enabled && it.defaultModel.isNotBlank() }.mapNotNull { srv ->
+                val lid = "local:${srv.id}"
+                val hasDbLocal = dbModels.any { it.providerId == lid }
+                if (hasDbLocal) null
+                else ModelEntity(
+                    id = "$lid::${srv.defaultModel}",
+                    modelId = srv.defaultModel,
+                    displayName = srv.defaultModel,
+                    providerId = lid,
+                    providerName = srv.name,
+                    isLocal = true,
+                    accessTier = AccessTier.LOCAL
                 )
+            }
+            dbModels + localFallbacks
+        }
+    }
+    val compareAvailableById = remember(compareAvailableModels) {
+        if (compareAvailableModels.isEmpty()) emptyMap() else compareAvailableModels.associateBy { it.id }
+    }
+    val compareSelectedSet = remember(compareState.selectedModelKeys) { compareState.selectedModelKeys.toSet() }
+    val compareSelectedModels = remember(compareMode, compareState.selectedModelKeys, compareAvailableById, compareState.entries) {
+        if (!compareMode && compareState.selectedModelKeys.isEmpty()) {
+            emptyList()
+        } else {
+            compareState.selectedModelKeys.mapNotNull { key ->
+                compareAvailableById[key] ?: compareState.entries.firstOrNull { it.entryKey == key }?.let { entry ->
+                    ModelEntity(
+                        id = entry.entryKey,
+                        modelId = entry.modelId,
+                        displayName = entry.displayName,
+                        providerId = entry.providerId,
+                        providerName = entry.providerName,
+                        supportsStreaming = entry.supportsStreaming
+                    )
+                }
             }
         }
     }
@@ -163,10 +173,14 @@ fun PlaygroundScreen(
         }
     }
 
-    val selectedModelEntity = remember(models, selectedProviderId, selectedModelId) {
-        models.firstOrNull {
-            (selectedProviderId == null || it.providerId == selectedProviderId) &&
-                it.modelId.equals(selectedModelId, ignoreCase = true)
+    val selectedModelEntity = remember(isAutoMode, models, selectedProviderId, selectedModelId) {
+        if (isAutoMode || selectedModelId.isBlank()) {
+            null
+        } else {
+            models.firstOrNull {
+                (selectedProviderId == null || it.providerId == selectedProviderId) &&
+                    it.modelId.equals(selectedModelId, ignoreCase = true)
+            }
         }
     }
 
@@ -406,7 +420,10 @@ fun PlaygroundScreen(
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
-                        if (isAutoMode && eligibleFreeCount == 0) {
+                        val showFreePoolWarning = isAutoMode &&
+                            (settings.defaultRoutingMode == RoutingMode.AUTO_FREE || !settings.autoAllowPaidModels) &&
+                            eligibleFreeCount == 0
+                        if (showFreePoolWarning) {
                             Spacer(Modifier.height(4.dp))
                             Surface(
                                 shape = RoundedCornerShape(14.dp),

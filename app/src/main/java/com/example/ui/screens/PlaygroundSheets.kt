@@ -128,10 +128,13 @@ fun PlaygroundModelSelectorSheet(
 
     val enabledProviders = remember(providers) { providers.filter { it.enabled } }
     val enabledLocal = remember(localServers) { localServers.filter { it.enabled } }
+    val chatModelsByProvider = remember(models) {
+        models.filter { it.enabled && it.supportsChat }.groupBy { it.providerId }
+    }
 
-    val providerGroups = remember(enabledProviders, models, searchQuery) {
+    val providerGroups = remember(enabledProviders, chatModelsByProvider, searchQuery) {
         enabledProviders.mapNotNull { prov ->
-            val dbModels = models.filter { it.providerId == prov.id && it.enabled && it.supportsChat }
+            val dbModels = chatModelsByProvider[prov.id].orEmpty()
             val withFallback = if (prov.defaultModel.isNotBlank() &&
                 dbModels.none { it.modelId.equals(prov.defaultModel, true) }
             ) {
@@ -147,21 +150,24 @@ fun PlaygroundModelSelectorSheet(
                 )
             } else dbModels
 
-            val filtered = withFallback.filter { m ->
-                searchQuery.isBlank() ||
+            val filtered = if (searchQuery.isBlank()) {
+                withFallback
+            } else {
+                withFallback.filter { m ->
                     m.displayName.contains(searchQuery, true) ||
-                    m.modelId.contains(searchQuery, true) ||
-                    m.alias.contains(searchQuery, true) ||
-                    prov.name.contains(searchQuery, true)
+                        m.modelId.contains(searchQuery, true) ||
+                        m.alias.contains(searchQuery, true) ||
+                        prov.name.contains(searchQuery, true)
+                }
             }
             if (filtered.isEmpty() && searchQuery.isNotBlank()) null else (prov to filtered)
         }
     }
 
-    val localModels = remember(enabledLocal, models, searchQuery) {
+    val localModels = remember(enabledLocal, chatModelsByProvider, searchQuery) {
         enabledLocal.flatMap { srv ->
             val lid = "local:${srv.id}"
-            val dbLocal = models.filter { it.providerId == lid && it.enabled && it.supportsChat }
+            val dbLocal = chatModelsByProvider[lid].orEmpty()
             val list = if (dbLocal.isNotEmpty()) {
                 dbLocal
             } else if (srv.defaultModel.isNotBlank()) {
@@ -177,12 +183,16 @@ fun PlaygroundModelSelectorSheet(
                     )
                 )
             } else emptyList()
-            list.filter { m ->
-                searchQuery.isBlank() ||
+            val filtered = if (searchQuery.isBlank()) {
+                list
+            } else {
+                list.filter { m ->
                     m.displayName.contains(searchQuery, true) ||
-                    m.modelId.contains(searchQuery, true) ||
-                    srv.name.contains(searchQuery, true)
-            }.map { srv to it }
+                        m.modelId.contains(searchQuery, true) ||
+                        srv.name.contains(searchQuery, true)
+                }
+            }
+            filtered.map { srv to it }
         }
     }
 

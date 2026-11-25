@@ -46,10 +46,14 @@ fun DashboardScreen(
     val settings by viewModel.settings.collectAsState()
     val runtime by viewModel.gatewayRuntime.collectAsState()
     val providers by viewModel.providers.collectAsState()
-    val models by viewModel.models.collectAsState()
+    val modelCounts by viewModel.modelSummaryCounts.collectAsState()
     val devices by viewModel.devices.collectAsState()
     val metrics by viewModel.metrics.collectAsState()
     val logs by viewModel.activityLogs.collectAsState()
+
+    LaunchedEffect(Unit) {
+        viewModel.refreshExpiredCooldowns()
+    }
 
     val startOfDay = remember {
         Calendar.getInstance().apply {
@@ -60,20 +64,64 @@ fun DashboardScreen(
         }.timeInMillis
     }
 
-    val todayCount = metrics.count { it.timestamp >= startOfDay }
-    val totalReq = metrics.size
-    val totalIn = metrics.sumOf { it.inputTokens.toLong() }
-    val totalOut = metrics.sumOf { it.outputTokens.toLong() }
-    val knownCosts = metrics.mapNotNull { it.estimatedCostUsd }
-    val totalCost: Double? = if (knownCosts.isEmpty()) null else knownCosts.sum()
-    val avgLatency = if (metrics.isEmpty()) null else metrics.map { it.latencyMs }.average().toLong()
-    val successRate = if (metrics.isEmpty()) null else (metrics.count { it.success } * 100.0 / metrics.size)
-    val errorCount = metrics.count { !it.success }
-    val fallbackCount = metrics.count { it.fallbackAttempts > 0 }
+    val metricStats = remember(metrics, startOfDay) {
+        var today = 0
+        var totalIn = 0L
+        var totalOut = 0L
+        var knownCostSum = 0.0
+        var hasKnownCost = false
+        var billedSum = 0.0
+        var hasBilled = false
+        var latencySum = 0L
+        var successCount = 0
+        var fallbacks = 0
+        for (m in metrics) {
+            if (m.timestamp >= startOfDay) today++
+            totalIn += m.inputTokens.toLong()
+            totalOut += m.outputTokens.toLong()
+            m.estimatedCostUsd?.let {
+                knownCostSum += it
+                hasKnownCost = true
+            }
+            m.actualBilledCostUsd?.let {
+                billedSum += it
+                hasBilled = true
+            }
+            latencySum += m.latencyMs
+            if (m.success) successCount++
+            if (m.fallbackAttempts > 0) fallbacks++
+        }
+        val size = metrics.size
+        DashboardMetricSummary(
+            todayCount = today,
+            totalReq = size,
+            totalIn = totalIn,
+            totalOut = totalOut,
+            displayCost = if (hasBilled) billedSum else if (hasKnownCost) knownCostSum else null,
+            hasActualBilled = hasBilled,
+            avgLatency = if (size == 0) null else latencySum / size,
+            successRate = if (size == 0) null else (successCount * 100.0 / size),
+            fallbackCount = fallbacks
+        )
+    }
 
-    val activeProviders = providers.count { it.enabled && it.status == ProviderStatus.CONNECTED }
-    val failedProviders = providers.count { it.status == ProviderStatus.ERROR || it.status == ProviderStatus.DISCONNECTED }
-    val rateLimitedProviders = providers.count { it.status == ProviderStatus.RATE_LIMITED }
+    val providerCounts = remember(providers) {
+        var active = 0
+        var failed = 0
+        var rateLimited = 0
+        for (p in providers) {
+            when {
+                p.enabled && p.status == ProviderStatus.CONNECTED -> active++
+                p.status == ProviderStatus.ERROR || p.status == ProviderStatus.DISCONNECTED -> failed++
+                p.status == ProviderStatus.RATE_LIMITED -> rateLimited++
+            }
+        }
+        Triple(active, failed, rateLimited)
+    }
+    val activeProviders = providerCounts.first
+    val failedProviders = providerCounts.second
+    val rateLimitedProviders = providerCounts.third
+    val connectedDeviceCount = remember(devices) { devices.count { !it.revoked && it.enabled } }
 
     val (gwLabel, gwTone) = gatewayStatusLabelAndTone(runtime.status)
     val context = LocalContext.current
@@ -98,7 +146,9 @@ fun DashboardScreen(
     }
 
     LazyColumn(
-        modifier = Modifier.fillMaxSize(),
+        modifier = Modifier
+            .fillMaxSize()
+            .testTag("dashboard_list"),
         contentPadding = PaddingValues(16.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
@@ -156,7 +206,7 @@ fun DashboardScreen(
                     ) {
                         MetricMiniTile(
                             label = s.connectedDevices,
-                            value = devices.count { !it.revoked && it.enabled }.toString(),
+                            value = connectedDeviceCount.toString(),
                             modifier = Modifier.weight(1f)
                         )
                         MetricMiniTile(
@@ -231,10 +281,10 @@ fun DashboardScreen(
                 BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
                     val cols = if (maxWidth < 360.dp) 2 else 4
                     val tiles = listOf(
-                        Triple(s.totalModels, models.size.toString(), MaterialTheme.colorScheme.primary),
-                        Triple(s.availableModels, models.count { it.enabled }.toString(), StatusConnected),
-                        Triple(s.localModels, models.count { it.isLocal }.toString(), MaterialTheme.colorScheme.primary),
-                        Triple(s.cloudModels, models.count { !it.isLocal }.toString(), MaterialTheme.colorScheme.primary)
+                        Triple(s.totalModels, modelCounts.totalCount.toString(), MaterialTheme.colorScheme.primary),
+                        Triple(s.availableModels, modelCounts.enabledCount.toString(), StatusConnected),
+                        Triple(s.localModels, modelCounts.localCount.toString(), MaterialTheme.colorScheme.primary),
+                        Triple(s.cloudModels, modelCounts.cloudCount.toString(), MaterialTheme.colorScheme.primary)
                     )
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         tiles.chunked(cols).forEach { rowTiles ->
@@ -251,9 +301,8 @@ fun DashboardScreen(
 
         // Usage & Performance Overview
         item {
-            val billedCosts = metrics.mapNotNull { it.actualBilledCostUsd }
-            val displayCost = if (billedCosts.isNotEmpty()) billedCosts.sum() else totalCost
-            val displayCostLabel = if (billedCosts.isNotEmpty()) s.actualBilledCostLabel else s.estimatedCost
+            val displayCost = metricStats.displayCost
+            val displayCostLabel = if (metricStats.hasActualBilled) s.actualBilledCostLabel else s.estimatedCost
             GatewayCard(onClick = { onNavigate(Routes.ANALYTICS) }, modifier = Modifier.testTag("dashboard_usage_card")) {
                 SectionHeader(title = s.usageOverview) {
                     Icon(Icons.Default.ChevronRight, contentDescription = s.analyticsTitle)
@@ -262,16 +311,16 @@ fun DashboardScreen(
                 BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
                     val cols = if (maxWidth < 360.dp) 2 else 4
                     val row1 = listOf(
-                        Triple(s.todayRequests, todayCount.toString(), MaterialTheme.colorScheme.primary),
-                        Triple(s.totalRequests, totalReq.toString(), MaterialTheme.colorScheme.primary),
-                        Triple(s.inputTokens, formatNumberCompact(totalIn), MaterialTheme.colorScheme.primary),
-                        Triple(s.outputTokens, formatNumberCompact(totalOut), MaterialTheme.colorScheme.primary)
+                        Triple(s.todayRequests, metricStats.todayCount.toString(), MaterialTheme.colorScheme.primary),
+                        Triple(s.totalRequests, metricStats.totalReq.toString(), MaterialTheme.colorScheme.primary),
+                        Triple(s.inputTokens, formatNumberCompact(metricStats.totalIn), MaterialTheme.colorScheme.primary),
+                        Triple(s.outputTokens, formatNumberCompact(metricStats.totalOut), MaterialTheme.colorScheme.primary)
                     )
                     val row2 = listOf(
                         Triple(displayCostLabel, formatCurrency(displayCost, settings.analyticsCurrency, s.unknown), MaterialTheme.colorScheme.primary),
-                        Triple(s.avgLatency, avgLatency?.let { "${it}ms" } ?: "—", MaterialTheme.colorScheme.primary),
-                        Triple(s.successRate, successRate?.let { String.format(Locale.US, "%.0f%%", it) } ?: "—", StatusConnected),
-                        Triple(s.fallbackCount, fallbackCount.toString(), MaterialTheme.colorScheme.primary)
+                        Triple(s.avgLatency, metricStats.avgLatency?.let { "${it}ms" } ?: "—", MaterialTheme.colorScheme.primary),
+                        Triple(s.successRate, metricStats.successRate?.let { String.format(Locale.US, "%.0f%%", it) } ?: "—", StatusConnected),
+                        Triple(s.fallbackCount, metricStats.fallbackCount.toString(), MaterialTheme.colorScheme.primary)
                     )
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         row1.chunked(cols).forEach { chunk ->
@@ -390,3 +439,15 @@ private fun QuickModuleButton(
         }
     }
 }
+
+private data class DashboardMetricSummary(
+    val todayCount: Int,
+    val totalReq: Int,
+    val totalIn: Long,
+    val totalOut: Long,
+    val displayCost: Double?,
+    val hasActualBilled: Boolean,
+    val avgLatency: Long?,
+    val successRate: Double?,
+    val fallbackCount: Int
+)

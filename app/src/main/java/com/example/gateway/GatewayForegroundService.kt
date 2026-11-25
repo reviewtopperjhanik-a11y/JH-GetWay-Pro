@@ -19,12 +19,15 @@ import com.example.R
 import com.example.data.local.ActivityCategory
 import com.example.data.local.ActivityLogEntity
 import com.example.data.local.GatewayMode
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 /**
@@ -37,6 +40,7 @@ class GatewayForegroundService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var stateObserverJob: Job? = null
     private var commandJob: Job? = null
+    private var cooldownMaintenanceJob: Job? = null
 
     private val appInstance: JhGetWayApplication
         get() = application as JhGetWayApplication
@@ -50,6 +54,11 @@ class GatewayForegroundService : Service() {
                     val manager = getSystemService(NotificationManager::class.java)
                     manager?.notify(NOTIFICATION_ID, buildNotification(state))
                 }
+                if (state.status == GatewayRunStatus.LOCAL_RUNNING) {
+                    startCooldownMaintenanceIfNeeded()
+                } else {
+                    stopCooldownMaintenance()
+                }
             }
         }
     }
@@ -61,6 +70,7 @@ class GatewayForegroundService : Service() {
         when (action) {
             ACTION_STOP -> {
                 promoteForeground(currentState)
+                stopCooldownMaintenance()
                 commandJob?.cancel()
                 commandJob = serviceScope.launch {
                     appInstance.preferences.setGatewayServiceDesiredRunning(false)
@@ -172,8 +182,29 @@ class GatewayForegroundService : Service() {
         }
         stateObserverJob?.cancel()
         commandJob?.cancel()
+        stopCooldownMaintenance()
         serviceScope.cancel()
         super.onDestroy()
+    }
+
+    private fun startCooldownMaintenanceIfNeeded() {
+        if (cooldownMaintenanceJob?.isActive == true) return
+        cooldownMaintenanceJob = serviceScope.launch {
+            while (isActive) {
+                try {
+                    SmartRouterEngine.refreshExpiredCooldownStatuses(appInstance.database)
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Exception) {
+                }
+                delay(COOLDOWN_REFRESH_INTERVAL_MS)
+            }
+        }
+    }
+
+    private fun stopCooldownMaintenance() {
+        cooldownMaintenanceJob?.cancel()
+        cooldownMaintenanceJob = null
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -278,6 +309,7 @@ class GatewayForegroundService : Service() {
         const val ACTION_RESTART = "com.example.gateway.action.RESTART"
         const val NOTIFICATION_CHANNEL_ID = "jh_getway_gateway_service"
         const val NOTIFICATION_ID = 1001
+        const val COOLDOWN_REFRESH_INTERVAL_MS = 30_000L
 
         fun startGatewayIntent(context: Context): Intent =
             Intent(context, GatewayForegroundService::class.java).setAction(ACTION_START)

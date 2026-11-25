@@ -67,22 +67,49 @@ internal fun aggregateMetricsIntoBuckets(
     val pattern = if (range == AnalyticsRange.TODAY) "HH:mm" else "MMM d"
     val fmt = SimpleDateFormat(pattern, Locale.getDefault())
 
+    val okCounts = IntArray(bucketCount)
+    val failCounts = IntArray(bucketCount)
+    val latencySums = LongArray(bucketCount)
+    val totals = IntArray(bucketCount)
+
+    for (m in metrics) {
+        if (m.timestamp < startMs) continue
+        val idx = (((m.timestamp - startMs) / step).toInt()).coerceIn(0, bucketCount - 1)
+        totals[idx]++
+        if (m.success) okCounts[idx]++ else failCounts[idx]++
+        latencySums[idx] += m.latencyMs
+    }
+
     return (0 until bucketCount).map { idx ->
         val bStart = startMs + idx * step
-        val bEnd = if (idx == bucketCount - 1) Long.MAX_VALUE else bStart + step
-        val inBucket = metrics.filter { it.timestamp in bStart until bEnd }
-        val ok = inBucket.count { it.success }
-        val fail = inBucket.size - ok
-        val lat = if (inBucket.isEmpty()) 0L else inBucket.map { it.latencyMs }.average().toLong()
+        val total = totals[idx]
         TimeBucketPoint(
             label = fmt.format(Date(bStart)),
-            successCount = ok,
-            failCount = fail,
-            totalCount = inBucket.size,
-            avgLatencyMs = lat
+            successCount = okCounts[idx],
+            failCount = failCounts[idx],
+            totalCount = total,
+            avgLatencyMs = if (total == 0) 0L else latencySums[idx] / total
         )
     }
 }
+
+private data class AnalyticsFilterSummary(
+    val total: Int,
+    val successCount: Int,
+    val failCount: Int,
+    val inTokens: Long,
+    val outTokens: Long,
+    val actualBilledTotal: Double?,
+    val estCost: Double?,
+    val avgLatency: Long,
+    val p95Latency: Long,
+    val fallbacks: Int,
+    val actualUsageCount: Int,
+    val estimatedUsageCount: Int,
+    val unknownUsageCount: Int,
+    val sourceText: String,
+    val latestPricingDate: String?
+)
 
 @Composable
 fun AnalyticsScreen(viewModel: GatewayViewModel) {
@@ -119,35 +146,88 @@ fun AnalyticsScreen(viewModel: GatewayViewModel) {
         }
     }
 
-    val total = filtered.size
-    val successCount = filtered.count { it.success }
-    val failCount = total - successCount
-    val inTokens = filtered.sumOf { it.inputTokens.toLong() }
-    val outTokens = filtered.sumOf { it.outputTokens.toLong() }
-    val billedCosts = filtered.mapNotNull { it.actualBilledCostUsd }
-    val actualBilledTotal: Double? = if (billedCosts.isEmpty()) null else billedCosts.sum()
-    val knownEstCosts = filtered.mapNotNull { it.estimatedCostUsd }
-    val estCost: Double? = if (knownEstCosts.isEmpty()) null else knownEstCosts.sum()
-    val pricingMeta = remember(filtered) {
-        val sources = filtered.mapNotNull { it.pricingSource?.takeIf(String::isNotBlank) }.distinct()
-        val updatedDates = filtered.mapNotNull { it.pricingUpdatedAt?.takeIf(String::isNotBlank) }.distinct()
-        val fallbackDates = filtered
-            .filter { it.actualBilledCostUsd == null && it.pricingSource.isNullOrBlank() }
-            .mapNotNull { ProviderPresets.lookupPricing(it.modelId)?.updatedAt }
-            .distinct()
-        val finalDate = updatedDates.maxOrNull() ?: fallbackDates.maxOrNull()
-        val sourceText = sources.joinToString(", ").ifBlank { s.unknown }
-        sourceText to finalDate
+    val summary = remember(filtered, s) {
+        if (filtered.isEmpty()) {
+            AnalyticsFilterSummary(
+                total = 0, successCount = 0, failCount = 0, inTokens = 0L, outTokens = 0L,
+                actualBilledTotal = null, estCost = null, avgLatency = 0L, p95Latency = 0L,
+                fallbacks = 0, actualUsageCount = 0, estimatedUsageCount = 0, unknownUsageCount = 0,
+                sourceText = s.unknown, latestPricingDate = null
+            )
+        } else {
+            var ok = 0
+            var inTok = 0L
+            var outTok = 0L
+            var billedSum = 0.0
+            var hasBilled = false
+            var estSum = 0.0
+            var hasEst = false
+            var latSum = 0L
+            var fb = 0
+            var actUsage = 0
+            var estUsage = 0
+            var unkUsage = 0
+            val latencies = LongArray(filtered.size)
+            val sources = LinkedHashSet<String>()
+            val updatedDates = LinkedHashSet<String>()
+            val fallbackDates = LinkedHashSet<String>()
+
+            filtered.forEachIndexed { i, m ->
+                if (m.success) ok++
+                inTok += m.inputTokens.toLong()
+                outTok += m.outputTokens.toLong()
+                m.actualBilledCostUsd?.let { billedSum += it; hasBilled = true }
+                m.estimatedCostUsd?.let { estSum += it; hasEst = true }
+                latSum += m.latencyMs
+                latencies[i] = m.latencyMs
+                fb += m.fallbackAttempts
+                when (m.usageSource) {
+                    "ACTUAL" -> actUsage++
+                    "ESTIMATED" -> estUsage++
+                    else -> unkUsage++
+                }
+                m.pricingSource?.takeIf(String::isNotBlank)?.let { sources.add(it) }
+                m.pricingUpdatedAt?.takeIf(String::isNotBlank)?.let { updatedDates.add(it) }
+                if (m.actualBilledCostUsd == null && m.pricingSource.isNullOrBlank()) {
+                    ProviderPresets.lookupPricing(m.modelId)?.updatedAt?.let { fallbackDates.add(it) }
+                }
+            }
+            latencies.sort()
+            val p95 = latencies[((latencies.size - 1) * 0.95).toInt()]
+            val totalSize = filtered.size
+            AnalyticsFilterSummary(
+                total = totalSize,
+                successCount = ok,
+                failCount = totalSize - ok,
+                inTokens = inTok,
+                outTokens = outTok,
+                actualBilledTotal = if (hasBilled) billedSum else null,
+                estCost = if (hasEst) estSum else null,
+                avgLatency = latSum / totalSize,
+                p95Latency = p95,
+                fallbacks = fb,
+                actualUsageCount = actUsage,
+                estimatedUsageCount = estUsage,
+                unknownUsageCount = unkUsage,
+                sourceText = sources.joinToString(", ").ifBlank { s.unknown },
+                latestPricingDate = updatedDates.maxOrNull() ?: fallbackDates.maxOrNull()
+            )
+        }
     }
-    val avgLatency = if (filtered.isEmpty()) 0L else filtered.map { it.latencyMs }.average().toLong()
-    val p95Latency = if (filtered.isEmpty()) 0L else {
-        val sorted = filtered.map { it.latencyMs }.sorted()
-        sorted[((sorted.size - 1) * 0.95).toInt()]
-    }
-    val fallbacks = filtered.sumOf { it.fallbackAttempts }
-    val actualUsageCount = filtered.count { it.usageSource == "ACTUAL" }
-    val estimatedUsageCount = filtered.count { it.usageSource == "ESTIMATED" }
-    val unknownUsageCount = filtered.count { it.usageSource != "ACTUAL" && it.usageSource != "ESTIMATED" }
+    val total = summary.total
+    val successCount = summary.successCount
+    val failCount = summary.failCount
+    val inTokens = summary.inTokens
+    val outTokens = summary.outTokens
+    val actualBilledTotal = summary.actualBilledTotal
+    val estCost = summary.estCost
+    val pricingMeta = summary.sourceText to summary.latestPricingDate
+    val avgLatency = summary.avgLatency
+    val p95Latency = summary.p95Latency
+    val fallbacks = summary.fallbacks
+    val actualUsageCount = summary.actualUsageCount
+    val estimatedUsageCount = summary.estimatedUsageCount
+    val unknownUsageCount = summary.unknownUsageCount
     val buckets = remember(filtered, range) { aggregateMetricsIntoBuckets(filtered, range) }
 
     LazyColumn(

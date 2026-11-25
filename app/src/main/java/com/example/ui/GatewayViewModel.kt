@@ -38,6 +38,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicLong
 
 data class CompareModelOutput(
     val modelId: String,
@@ -160,25 +161,40 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
     val recentRouterDecisions: StateFlow<List<RouterDecisionSnapshot>> = router.recentDecisions
 
     val providers: StateFlow<List<ProviderEntity>> = db.providerDao().observeAll()
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+        .distinctUntilChanged()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(60_000), emptyList())
 
     val apiKeys: StateFlow<List<ApiKeyEntity>> = db.apiKeyDao().observeAll()
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+        .distinctUntilChanged()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(60_000), emptyList())
 
     val servicePoolKeys: StateFlow<List<ServicePoolKeyEntity>> = db.servicePoolDao().observeAll()
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+        .distinctUntilChanged()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(60_000), emptyList())
 
     val models: StateFlow<List<ModelEntity>> = db.modelDao().observeAll()
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+        .distinctUntilChanged()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(60_000), emptyList())
+
+    val modelSummaryCounts: StateFlow<ModelSummaryCounts> = db.modelDao().observeModelSummaryCounts()
+        .distinctUntilChanged()
+        .stateIn(
+            viewModelScope,
+            SharingStarted.WhileSubscribed(60_000),
+            ModelSummaryCounts(totalCount = 0, enabledCount = 0, localCount = 0, cloudCount = 0)
+        )
 
     val routingRules: StateFlow<List<RoutingRuleEntity>> = db.routingRuleDao().observeAll()
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+        .distinctUntilChanged()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(60_000), emptyList())
 
     val codingAgents: StateFlow<List<CodingAgentEntity>> = db.codingAgentDao().observeAll()
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+        .distinctUntilChanged()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(60_000), emptyList())
 
     val localServers: StateFlow<List<LocalAiServerEntity>> = db.localAiServerDao().observeAll()
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+        .distinctUntilChanged()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(60_000), emptyList())
 
     @OptIn(ExperimentalCoroutinesApi::class)
     val eligibleAutoFreeCount: StateFlow<Int> = combine(
@@ -189,8 +205,9 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
         settings
     ) { _, _, _, _, s -> s }
         .mapLatest { s -> router.countEligibleAutoFreeModels(s) }
+        .distinctUntilChanged()
         .flowOn(Dispatchers.Default)
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(60_000), 0)
 
     val openCodeCuratedCatalog: StateFlow<CuratedModelCatalog> = combine(
         combine(providers, localServers, models) { p, l, m -> Triple(p, l, m) },
@@ -205,10 +222,11 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
             settings = s
         )
     }
+        .distinctUntilChanged()
         .flowOn(Dispatchers.Default)
         .stateIn(
         viewModelScope,
-        SharingStarted.WhileSubscribed(5000),
+        SharingStarted.WhileSubscribed(60_000),
         CuratedModelCatalog(
             entries = emptyList(),
             totalEligibleModelsCount = 0,
@@ -227,28 +245,36 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
     )
 
     val mcpServers: StateFlow<List<McpServerEntity>> = db.mcpDao().observeServers()
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+        .distinctUntilChanged()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(60_000), emptyList())
 
     val mcpTools: StateFlow<List<McpToolEntity>> = db.mcpDao().observeTools()
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+        .distinctUntilChanged()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(60_000), emptyList())
 
     val workflows: StateFlow<List<WorkflowEntity>> = db.workflowDao().observeWorkflows()
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+        .distinctUntilChanged()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(60_000), emptyList())
 
     val workflowRuns: StateFlow<List<WorkflowRunEntity>> = db.workflowDao().observeRuns()
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+        .distinctUntilChanged()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(60_000), emptyList())
 
     val devices: StateFlow<List<DeviceEntity>> = db.deviceDao().observeAll()
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+        .distinctUntilChanged()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(60_000), emptyList())
 
     val metrics: StateFlow<List<RequestMetricEntity>> = db.metricAndLogDao().observeMetrics()
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+        .distinctUntilChanged()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(60_000), emptyList())
 
     val activityLogs: StateFlow<List<ActivityLogEntity>> = db.metricAndLogDao().observeLogs()
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+        .distinctUntilChanged()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(60_000), emptyList())
 
     val playgroundSessions: StateFlow<List<PlaygroundSessionEntity>> = db.playgroundDao().observeSessions()
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+        .distinctUntilChanged()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(60_000), emptyList())
 
     private val _activeSessionId = MutableStateFlow<String?>(null)
     val activeSessionId: StateFlow<String?> = _activeSessionId.asStateFlow()
@@ -258,7 +284,8 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
         .flatMapLatest { sid ->
             if (sid == null) flowOf(emptyList()) else db.playgroundDao().observeMessages(sid)
         }
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+        .distinctUntilChanged()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(60_000), emptyList())
 
     private val _ephemeralMessages = MutableStateFlow<List<PlaygroundMessageEntity>>(emptyList())
     val ephemeralMessages: StateFlow<List<PlaygroundMessageEntity>> = _ephemeralMessages.asStateFlow()
@@ -374,10 +401,26 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
                     PlaygroundAttachmentManager.deleteAttachmentsFromMetadata(app, metaList)
                 }
             )
+            withContext(Dispatchers.IO) {
+                runCatching { SmartRouterEngine.refreshExpiredCooldownStatuses(db) }
+            }
             val isRobolectric = android.os.Build.FINGERPRINT.equals("robolectric", ignoreCase = true)
             if (!isRobolectric && s.autoCheckUpdates && effectiveGithubUpdateRepo(s).isNotBlank()) {
                 checkForAppUpdates(silent = true)
             }
+        }
+    }
+
+    private val lastCooldownRefreshMs = AtomicLong(0L)
+
+    fun refreshExpiredCooldowns(force: Boolean = false) {
+        val now = System.currentTimeMillis()
+        val prev = lastCooldownRefreshMs.get()
+        if (!force && now - prev < 15_000L) return
+        if (!force && !lastCooldownRefreshMs.compareAndSet(prev, now)) return
+        if (force) lastCooldownRefreshMs.set(now)
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { SmartRouterEngine.refreshExpiredCooldownStatuses(db) }
         }
     }
 
@@ -501,7 +544,12 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
         }
         if (trimmedModel.isNotBlank()) {
             val existingModels = db.modelDao().getByProvider(provider.id)
+            val activeDefaultProvider = settings.value.defaultProviderId
+                .takeIf { it.isNotBlank() }
+                ?.let { db.providerDao().getById(it) }
             val shouldSetGlobalDefault = settings.value.defaultModelId.isBlank() ||
+                activeDefaultProvider == null ||
+                !activeDefaultProvider.enabled ||
                 (existingId != null && existingId == settings.value.defaultProviderId)
             val matched = existingModels.firstOrNull { it.modelId == trimmedModel }
             if (matched == null) {
@@ -1460,27 +1508,47 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
             val neededDocMimes = attachments.filter { it.category == AttachmentCategory.DOCUMENT }
                 .map { it.mimeType }.toSet()
 
+            val currentSettings = settings.value
+            val routingModeForRequest = when {
+                isAutoMode -> currentSettings.defaultRoutingMode
+                cleanExplicitProviderId == null -> {
+                    if (currentSettings.defaultRoutingMode == RoutingMode.AUTO_FREE) RoutingMode.AUTOMATIC
+                    else currentSettings.defaultRoutingMode
+                }
+                else -> RoutingMode.MANUAL
+            }
+            val effectiveModelSelector = when {
+                isAutoMode && routingModeForRequest == RoutingMode.AUTO_FREE -> ""
+                isAutoMode -> OpenCodeSelectorIds.STABLE_AUTO_ID
+                else -> modelIdOrAlias
+            }
+
             // Pre-send capability validation before mutating conversation history or clearing draft
             if (isAutoMode || cleanExplicitProviderId == null) {
                 val (autoCandidates, _) = router.resolveCandidates(
-                    requestedModelOrAlias = "",
-                    settings = settings.value,
-                    mode = RoutingMode.AUTO_FREE,
+                    requestedModelOrAlias = effectiveModelSelector,
+                    settings = currentSettings,
+                    mode = routingModeForRequest,
                     explicitProviderId = null,
                     requireVision = needsVision,
                     requiredDocumentMimeTypes = neededDocMimes
                 )
                 if (autoCandidates.isEmpty()) {
-                    val (unfilteredFree, _) = router.resolveCandidates(
-                        requestedModelOrAlias = "",
-                        settings = settings.value,
-                        mode = RoutingMode.AUTO_FREE,
+                    val (unfiltered, _) = router.resolveCandidates(
+                        requestedModelOrAlias = effectiveModelSelector,
+                        settings = currentSettings,
+                        mode = routingModeForRequest,
                         explicitProviderId = null
                     )
-                    val errText = if (attachments.isNotEmpty() && unfilteredFree.isNotEmpty()) {
-                        "No verified free models support the attached file type(s)."
-                    } else {
-                        "No verified free models available. Configure a free-tier provider, confirm free access in Models, or select a specific model."
+                    val isFreePoolMode = isAutoMode && routingModeForRequest == RoutingMode.AUTO_FREE
+                    val errText = when {
+                        attachments.isNotEmpty() && unfiltered.isNotEmpty() ->
+                            if (isFreePoolMode) "No verified free models support the attached file type(s)."
+                            else "No eligible model supports the attached file type(s)."
+                        isFreePoolMode ->
+                            "No verified free models available. Configure a free-tier provider, confirm free access in Models, or select a specific model."
+                        else ->
+                            "No eligible model available. Enable a provider with an active API key or select a specific model."
                     }
                     onValidationError(errText)
                     postBanner(errText)
@@ -1516,7 +1584,7 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
 
             onRequestAccepted()
 
-            val saveHistory = settings.value.saveChatHistoryAllowed
+            val saveHistory = currentSettings.saveChatHistoryAllowed
             var sid = _activeSessionId.value
             val sessionTitle = prompt.trim().ifBlank { attachments.firstOrNull()?.displayName ?: "Attachment" }.take(28)
             if (sid == null) {
@@ -1544,15 +1612,10 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
                 add(ChatMessagePayload(role = "user", content = prompt, contentParts = userParts))
             }
 
-            val routingModeForRequest = if (isAutoMode || cleanExplicitProviderId == null) {
-                RoutingMode.AUTO_FREE
+            val allowFallbackForRequest = if (isAutoMode || cleanExplicitProviderId == null) {
+                currentSettings.fallbackEnabled || routingModeForRequest == RoutingMode.AUTO_FREE || isAutoMode
             } else {
-                RoutingMode.MANUAL
-            }
-            val allowFallbackForRequest = if (routingModeForRequest == RoutingMode.AUTO_FREE) {
-                true
-            } else {
-                settings.value.manualModelFallbackEnabled && settings.value.fallbackEnabled
+                currentSettings.manualModelFallbackEnabled && currentSettings.fallbackEnabled
             }
 
             _isStreaming.value = true
@@ -1561,9 +1624,9 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
             try {
                 if (streaming) {
                     router.streamRoutedChat(
-                        requestedModelOrAlias = if (routingModeForRequest == RoutingMode.AUTO_FREE) "" else modelIdOrAlias,
+                        requestedModelOrAlias = effectiveModelSelector,
                         messages = payloadMsgs,
-                        settings = settings.value,
+                        settings = currentSettings,
                         routingModeOverride = routingModeForRequest,
                         explicitProviderId = cleanExplicitProviderId,
                         deviceName = "Playground",
@@ -1617,9 +1680,9 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
                     }
                 } else {
                     val res = router.executeRoutedChat(
-                        requestedModelOrAlias = if (routingModeForRequest == RoutingMode.AUTO_FREE) "" else modelIdOrAlias,
+                        requestedModelOrAlias = effectiveModelSelector,
                         messages = payloadMsgs,
-                        settings = settings.value,
+                        settings = currentSettings,
                         routingModeOverride = routingModeForRequest,
                         explicitProviderId = cleanExplicitProviderId,
                         deviceName = "Playground",

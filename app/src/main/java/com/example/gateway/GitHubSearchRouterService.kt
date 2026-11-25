@@ -154,7 +154,21 @@ class GitHubSearchRouterService(
 
         val candidates = selectOrderedPats(enabledPats, startedAt)
         if (candidates.isEmpty()) {
-            val minWaitSec = enabledPats
+            val nonTerminalPats = enabledPats.filter {
+                it.status != KeyStatus.INVALID &&
+                    it.status != KeyStatus.EXPIRED &&
+                    it.status != KeyStatus.DISABLED
+            }
+            if (nonTerminalPats.isEmpty()) {
+                return GitHubSearchGatewayResult.Failure(
+                    statusCode = 503,
+                    errorCode = "github_pats_unavailable",
+                    safeMessage = "All enabled GitHub PATs are invalid, expired, or disabled. Verify or replace tokens in Search Pools.",
+                    retryAfterSeconds = null,
+                    attempts = 0
+                )
+            }
+            val minWaitSec = nonTerminalPats
                 .mapNotNull { pat ->
                     val until = pat.cooldownUntilMs ?: pat.rateLimitResetAtMs
                     until?.let { ((it - startedAt + 999L) / 1000L).toInt() }
@@ -184,7 +198,7 @@ class GitHubSearchRouterService(
                     status = KeyStatus.INVALID,
                     nowMs = nowMs(),
                     lastError = msg,
-                    cooldownUntilMs = nowMs() + 300_000L,
+                    cooldownUntilMs = null,
                     rateLimitRemaining = null,
                     rateLimitResetAtMs = null
                 )
@@ -246,13 +260,21 @@ class GitHubSearchRouterService(
 
                 is GitHubAttemptResult.Failure -> {
                     val failNow = nowMs()
+                    val isTerminalKeyStatus = searchOutcome.keyStatus == KeyStatus.INVALID ||
+                        searchOutcome.keyStatus == KeyStatus.EXPIRED ||
+                        searchOutcome.keyStatus == KeyStatus.DISABLED
                     val cooldownSec = searchOutcome.cooldownSeconds.coerceAtLeast(30)
-                    val cooldownUntil = searchOutcome.cooldownUntilMs?.takeIf { it > failNow }
-                        ?: (failNow + cooldownSec * 1000L)
+                    val cooldownUntil = if (isTerminalKeyStatus) {
+                        null
+                    } else {
+                        searchOutcome.cooldownUntilMs?.takeIf { it > failNow } ?: (failNow + cooldownSec * 1000L)
+                    }
                     if (searchOutcome.httpCode == 403 || searchOutcome.httpCode == 429) {
                         sawRateLimit = true
                     }
-                    minRetryAfterSec = listOfNotNull(minRetryAfterSec, ((cooldownUntil - failNow + 999L) / 1000L).toInt()).minOrNull()
+                    if (cooldownUntil != null) {
+                        minRetryAfterSec = listOfNotNull(minRetryAfterSec, ((cooldownUntil - failNow + 999L) / 1000L).toInt()).minOrNull()
+                    }
                     val safeErr = MaskingUtils.sanitizeErrorMessage(searchOutcome.safeError, listOf(plainPat))
                     lastSafeError = safeErr
                     servicePoolDao.recordFailureOrCooldown(
@@ -315,7 +337,7 @@ class GitHubSearchRouterService(
                         status = status,
                         nowMs = nowMs(),
                         lastError = safeErr,
-                        cooldownUntilMs = resetAtMs ?: (nowMs() + 120_000L),
+                        cooldownUntilMs = if (status == KeyStatus.INVALID) null else (resetAtMs ?: (nowMs() + 120_000L)),
                         rateLimitRemaining = remaining,
                         rateLimitResetAtMs = resetAtMs
                     )
@@ -416,10 +438,11 @@ class GitHubSearchRouterService(
                         }
                         return ""
                     } else if (resp.code == 401 || resp.code == 403 || resp.code == 429) {
-                        val cooldownUntil = resetAtMs?.takeIf { it > callNow } ?: (callNow + 60_000L)
+                        val isInvalid = resp.code == 401
+                        val cooldownUntil = if (isInvalid) null else (resetAtMs?.takeIf { it > callNow } ?: (callNow + 60_000L))
                         servicePoolDao.recordFailureOrCooldown(
                             id = patEntity.id,
-                            status = if (resp.code == 401) KeyStatus.INVALID else KeyStatus.RATE_LIMITED,
+                            status = if (isInvalid) KeyStatus.INVALID else KeyStatus.RATE_LIMITED,
                             nowMs = callNow,
                             lastError = "GitHub README HTTP ${resp.code}",
                             cooldownUntilMs = cooldownUntil,
@@ -439,6 +462,12 @@ class GitHubSearchRouterService(
 
     private fun isPatAvailable(pat: ServicePoolKeyEntity, now: Long): Boolean {
         if (!pat.enabled) return false
+        if (pat.status == KeyStatus.INVALID ||
+            pat.status == KeyStatus.EXPIRED ||
+            pat.status == KeyStatus.DISABLED
+        ) {
+            return false
+        }
         val cd = pat.cooldownUntilMs
         if (cd != null && cd > now) return false
         val rem = pat.rateLimitRemaining

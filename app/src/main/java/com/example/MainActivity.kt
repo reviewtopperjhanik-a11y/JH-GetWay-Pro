@@ -13,6 +13,9 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -448,27 +451,31 @@ private fun MainGatewayScaffold(viewModel: GatewayViewModel) {
         }
     }
 
-    val primaryTabs = listOf(
-        NavMenuItem(Routes.DASHBOARD, s.navHome, Icons.Default.Home, "bottom_nav_dashboard"),
-        NavMenuItem(Routes.PROVIDERS, s.navProviders, Icons.Default.Cloud, "bottom_nav_providers"),
-        NavMenuItem(Routes.PLAYGROUND, s.navPlayground, Icons.Default.Chat, "bottom_nav_playground"),
-        NavMenuItem(Routes.ANALYTICS, s.navAnalytics, Icons.Default.Analytics, "bottom_nav_analytics")
-    )
+    val primaryTabs = remember(s) {
+        listOf(
+            NavMenuItem(Routes.DASHBOARD, s.navHome, Icons.Default.Home, "bottom_nav_dashboard"),
+            NavMenuItem(Routes.PROVIDERS, s.navProviders, Icons.Default.Cloud, "bottom_nav_providers"),
+            NavMenuItem(Routes.PLAYGROUND, s.navPlayground, Icons.Default.Chat, "bottom_nav_playground"),
+            NavMenuItem(Routes.ANALYTICS, s.navAnalytics, Icons.Default.Analytics, "bottom_nav_analytics")
+        )
+    }
 
-    val secondaryDestinations = listOf(
-        NavMenuItem(Routes.MODELS, s.navModels, Icons.Default.Memory, "more_nav_models"),
-        NavMenuItem(Routes.GATEWAY, s.navGateway, Icons.Default.Hub, "more_nav_gateway"),
-        NavMenuItem(Routes.SMART_ROUTER, s.navSmartRouter, Icons.AutoMirrored.Filled.AltRoute, "more_nav_smart_router"),
-        NavMenuItem(Routes.CODING_AGENTS, s.navCodingAgents, Icons.Default.Code, "more_nav_coding_agents"),
-        NavMenuItem(Routes.LOCAL_AI, s.navLocalAi, Icons.Default.Computer, "more_nav_local_ai"),
-        NavMenuItem(Routes.MCP_SERVERS, s.navMcpServers, Icons.Default.Extension, "more_nav_mcp"),
-        NavMenuItem(Routes.WORKFLOWS, s.navWorkflows, Icons.Default.AccountTree, "more_nav_workflows"),
-        NavMenuItem(Routes.DEVICES, s.navDevices, Icons.Default.Devices, "more_nav_devices"),
-        NavMenuItem(Routes.SEARCH_POOLS, s.navSearchPools, Icons.Default.Search, "more_nav_search_pools"),
-        NavMenuItem(Routes.VAULT, s.navVault, Icons.Default.VpnKey, "more_nav_vault"),
-        NavMenuItem(Routes.ACTIVITY_LOGS, s.navActivityLogs, Icons.Default.History, "more_nav_logs"),
-        NavMenuItem(Routes.SETTINGS, s.navSettings, Icons.Default.Settings, "more_nav_settings")
-    )
+    val secondaryDestinations = remember(s) {
+        listOf(
+            NavMenuItem(Routes.MODELS, s.navModels, Icons.Default.Memory, "more_nav_models"),
+            NavMenuItem(Routes.GATEWAY, s.navGateway, Icons.Default.Hub, "more_nav_gateway"),
+            NavMenuItem(Routes.SMART_ROUTER, s.navSmartRouter, Icons.AutoMirrored.Filled.AltRoute, "more_nav_smart_router"),
+            NavMenuItem(Routes.CODING_AGENTS, s.navCodingAgents, Icons.Default.Code, "more_nav_coding_agents"),
+            NavMenuItem(Routes.LOCAL_AI, s.navLocalAi, Icons.Default.Computer, "more_nav_local_ai"),
+            NavMenuItem(Routes.MCP_SERVERS, s.navMcpServers, Icons.Default.Extension, "more_nav_mcp"),
+            NavMenuItem(Routes.WORKFLOWS, s.navWorkflows, Icons.Default.AccountTree, "more_nav_workflows"),
+            NavMenuItem(Routes.DEVICES, s.navDevices, Icons.Default.Devices, "more_nav_devices"),
+            NavMenuItem(Routes.SEARCH_POOLS, s.navSearchPools, Icons.Default.Search, "more_nav_search_pools"),
+            NavMenuItem(Routes.VAULT, s.navVault, Icons.Default.VpnKey, "more_nav_vault"),
+            NavMenuItem(Routes.ACTIVITY_LOGS, s.navActivityLogs, Icons.Default.History, "more_nav_logs"),
+            NavMenuItem(Routes.SETTINGS, s.navSettings, Icons.Default.Settings, "more_nav_settings")
+        )
+    }
 
     val isPrimaryRoute = primaryTabs.any { it.route == currentRoute }
     val selectedTabRoute = when {
@@ -477,13 +484,14 @@ private fun MainGatewayScaffold(viewModel: GatewayViewModel) {
         else -> null
     }
     val activeDetailGroupKey = navBackStackEntry?.arguments?.getString("groupKey")?.let { Uri.decode(it) }
-    val currentTitle = remember(currentRoute, activeDetailGroupKey, providers, s) {
+    val scopedProvidersForTitle = if (currentRoute == Routes.PROVIDER_DETAIL_PATTERN) providers else null
+    val currentTitle = remember(currentRoute, activeDetailGroupKey, scopedProvidersForTitle, s) {
         when (currentRoute) {
             Routes.DASHBOARD -> s.appName
             Routes.PROVIDERS -> s.navProviders
             Routes.PROVIDERS_ALL -> s.allApisTitle
             Routes.PROVIDER_DETAIL_PATTERN -> activeDetailGroupKey?.let { key ->
-                ProviderDirectoryHelper.findGroup(providers, key)?.displayName
+                scopedProvidersForTitle?.let { ProviderDirectoryHelper.findGroup(it, key)?.displayName }
             } ?: s.providersTitle
             Routes.MODELS -> s.navModels
             Routes.GATEWAY -> s.navGateway
@@ -569,6 +577,10 @@ private fun MainGatewayScaffold(viewModel: GatewayViewModel) {
         NavHost(
             navController = navController,
             startDestination = Routes.DASHBOARD,
+            enterTransition = { fadeIn(animationSpec = tween(90)) },
+            exitTransition = { fadeOut(animationSpec = tween(70)) },
+            popEnterTransition = { fadeIn(animationSpec = tween(90)) },
+            popExitTransition = { fadeOut(animationSpec = tween(70)) },
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)

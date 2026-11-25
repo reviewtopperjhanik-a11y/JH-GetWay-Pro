@@ -88,6 +88,70 @@ class SmartRouterEngine(
             "run_command", "grep", "glob", "find", "lsp", "git", "test", "lint", "compile",
             "read_file", "write_file", "edit_file", "list_dir"
         )
+
+        fun isApiKeyCoolingDown(key: ApiKeyEntity, nowMs: Long): Boolean {
+            key.cooldownUntilMs?.let { until -> return nowMs < until }
+            if (key.status != KeyStatus.RATE_LIMITED) return false
+            val usedAt = key.lastUsedAt ?: return true
+            return (nowMs - usedAt) in 0 until COOLDOWN_WINDOW_MS
+        }
+
+        suspend fun refreshExpiredCooldownStatuses(
+            db: JhGetWayDatabase,
+            nowMs: Long = System.currentTimeMillis()
+        ): Int {
+            var updated = 0
+            for (p in db.providerDao().getAllOnce()) {
+                if (p.status == ProviderStatus.RATE_LIMITED &&
+                    !OpenCodeModelCatalogResolver.isStatusCoolingDown(
+                        status = p.status,
+                        cooldownUntilMs = p.cooldownUntilMs,
+                        lastCheckedAt = p.lastCheckedAt,
+                        isLocal = false,
+                        nowMs = nowMs
+                    )
+                ) {
+                    db.providerDao().upsert(p.copy(status = ProviderStatus.UNKNOWN, cooldownUntilMs = null))
+                    updated++
+                }
+            }
+            for (k in db.apiKeyDao().getAllOnce()) {
+                if (k.status == KeyStatus.RATE_LIMITED && !isApiKeyCoolingDown(k, nowMs)) {
+                    db.apiKeyDao().upsert(k.copy(status = KeyStatus.UNKNOWN, cooldownUntilMs = null))
+                    updated++
+                }
+            }
+            for (srv in db.localAiServerDao().getAllOnce()) {
+                if (srv.status == ProviderStatus.RATE_LIMITED &&
+                    !OpenCodeModelCatalogResolver.isStatusCoolingDown(
+                        status = srv.status,
+                        cooldownUntilMs = srv.cooldownUntilMs,
+                        lastCheckedAt = srv.lastCheckedAt,
+                        isLocal = true,
+                        nowMs = nowMs
+                    )
+                ) {
+                    db.localAiServerDao().upsert(srv.copy(status = ProviderStatus.UNKNOWN, cooldownUntilMs = null))
+                    updated++
+                }
+            }
+            for (spk in db.servicePoolDao().getAllOnce()) {
+                if (spk.status == KeyStatus.RATE_LIMITED) {
+                    val rlBlocked = spk.rateLimitRemaining != null &&
+                        spk.rateLimitRemaining <= 0 &&
+                        (spk.rateLimitResetAtMs == null || nowMs < spk.rateLimitResetAtMs)
+                    val cooldownExpired = spk.cooldownUntilMs?.let { nowMs >= it }
+                        ?: spk.rateLimitResetAtMs?.let { nowMs >= it }
+                        ?: spk.lastUsedAt?.let { nowMs - it >= COOLDOWN_WINDOW_MS }
+                        ?: false
+                    if (!rlBlocked && cooldownExpired) {
+                        db.servicePoolDao().upsert(spk.copy(status = KeyStatus.UNKNOWN, cooldownUntilMs = null))
+                        updated++
+                    }
+                }
+            }
+            return updated
+        }
     }
 
     private val roundRobinCounter = AtomicInteger(0)
@@ -380,7 +444,7 @@ class SmartRouterEngine(
         }
         val configuredAttempts = 1 + settings.maxRetries
         val effectiveAttemptCap = if (OpenCodeSelectorIds.isVirtualSelector(normalizedSelector)) {
-            maxOf(configuredAttempts, 6)
+            configuredAttempts.coerceAtLeast(3)
         } else {
             configuredAttempts
         }
@@ -440,12 +504,12 @@ class SmartRouterEngine(
             val attemptTimeoutSec = if (hasMoreBackupCandidates) {
                 minOf(
                     remainingBudgetSec,
-                    minOf(25, (totalBudgetSec * 2 / (plannedRemainingAttempts + 2)).coerceAtLeast(2))
+                    minOf(15, (totalBudgetSec * 2 / (plannedRemainingAttempts + 2)).coerceAtLeast(2))
                 )
             } else {
                 remainingBudgetSec
             }
-            val attemptConnectSec = minOf(attemptTimeoutSec, 8)
+            val attemptConnectSec = minOf(attemptTimeoutSec, 5)
 
             val res = httpClient.executeChat(
                 baseUrl = candidate.baseUrl,
@@ -662,7 +726,7 @@ class SmartRouterEngine(
         }
         val configuredStreamAttempts = 1 + settings.maxRetries
         val effectiveStreamAttemptCap = if (OpenCodeSelectorIds.isVirtualSelector(normalizedSelector)) {
-            maxOf(configuredStreamAttempts, 6)
+            configuredStreamAttempts.coerceAtLeast(3)
         } else {
             configuredStreamAttempts
         }
@@ -717,12 +781,12 @@ class SmartRouterEngine(
             val attemptTimeoutSec = if (hasMoreBackupCandidates) {
                 minOf(
                     remainingBudgetSec,
-                    minOf(25, (totalBudgetSec * 2 / (plannedRemainingAttempts + 2)).coerceAtLeast(2))
+                    minOf(15, (totalBudgetSec * 2 / (plannedRemainingAttempts + 2)).coerceAtLeast(2))
                 )
             } else {
                 remainingBudgetSec
             }
-            val attemptConnectSec = minOf(attemptTimeoutSec, 8)
+            val attemptConnectSec = minOf(attemptTimeoutSec, 5)
 
             var finishedCleanly = false
             var canRetryNext = false
@@ -1528,26 +1592,22 @@ class SmartRouterEngine(
                             it.providerId == def.providerId && it.model.modelId.equals(def.model.modelId, ignoreCase = true)
                         }
                     }
-                    val preferDefault = settings.preferConfiguredDefaultInAuto && defaultInPool != null && (
-                        !intent.isCodingIntent ||
-                            defaultInPool.codingProfile.isCodingCapable ||
-                            gatedRecords.none { it.codingProfile.isCodingCapable }
-                        )
+                    val preferDefault = settings.preferConfiguredDefaultInAuto && defaultInPool != null
                     val explicitLocalFirst = mode == RoutingMode.LOCAL_FIRST ||
                         settings.localRoutingPolicy == LocalRoutingPolicy.LOCAL_FIRST
                     val explicitCloudFirst = mode == RoutingMode.CLOUD_FIRST ||
                         settings.localRoutingPolicy == LocalRoutingPolicy.CLOUD_FIRST
                     val ranked = gatedRecords.sortedWith(
-                        compareBy<EligibleModelRecord> {
+                        compareByDescending<EligibleModelRecord> { rec ->
+                            preferDefault &&
+                                rec.providerId == defaultInPool.providerId &&
+                                rec.model.modelId.equals(defaultInPool.model.modelId, ignoreCase = true)
+                        }.thenBy {
                             when {
                                 explicitLocalFirst -> !it.isLocal
                                 explicitCloudFirst -> it.isLocal
                                 else -> false
                             }
-                        }.thenByDescending { rec ->
-                            preferDefault && defaultInPool != null &&
-                                rec.providerId == defaultInPool.providerId &&
-                                rec.model.modelId.equals(defaultInPool.model.modelId, ignoreCase = true)
                         }.then(smartAutoComparator(settings, mode, intent, canonicalDefaultRec))
                     )
                     orderedRecords = ranked
@@ -1948,12 +2008,8 @@ class SmartRouterEngine(
     private fun hasEligibleKeysForProvider(keys: List<ApiKeyEntity>): Boolean =
         keys.any { isKeyEligible(it) }
 
-    private fun isKeyCoolingDown(key: ApiKeyEntity, nowMs: Long): Boolean {
-        key.cooldownUntilMs?.let { until -> return nowMs < until }
-        if (key.status != KeyStatus.RATE_LIMITED) return false
-        val usedAt = key.lastUsedAt ?: return true
-        return (nowMs - usedAt) in 0 until COOLDOWN_WINDOW_MS
-    }
+    private fun isKeyCoolingDown(key: ApiKeyEntity, nowMs: Long): Boolean =
+        isApiKeyCoolingDown(key, nowMs)
 
     private fun computeCooldownUntilMs(res: ChatExecutionResult, nowMs: Long): Long {
         val retryAfterMs = res.retryAfterSec?.takeIf { it > 0 }?.let { sec ->

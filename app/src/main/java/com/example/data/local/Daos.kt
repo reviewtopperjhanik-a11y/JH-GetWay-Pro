@@ -53,10 +53,29 @@ interface ApiKeyDao {
     suspend fun clearAll()
 }
 
+data class ModelSummaryCounts(
+    val totalCount: Int,
+    val enabledCount: Int,
+    val localCount: Int,
+    val cloudCount: Int
+)
+
 @Dao
 interface ModelDao {
     @Query("SELECT * FROM models ORDER BY isDefault DESC, isLocal ASC, displayName ASC")
     fun observeAll(): Flow<List<ModelEntity>>
+
+    @Query(
+        """
+        SELECT 
+            COUNT(*) AS totalCount,
+            COALESCE(SUM(CASE WHEN enabled = 1 THEN 1 ELSE 0 END), 0) AS enabledCount,
+            COALESCE(SUM(CASE WHEN isLocal = 1 THEN 1 ELSE 0 END), 0) AS localCount,
+            COALESCE(SUM(CASE WHEN isLocal = 0 THEN 1 ELSE 0 END), 0) AS cloudCount
+        FROM models
+        """
+    )
+    fun observeModelSummaryCounts(): Flow<ModelSummaryCounts>
 
     @Query("SELECT * FROM models")
     suspend fun getAllOnce(): List<ModelEntity>

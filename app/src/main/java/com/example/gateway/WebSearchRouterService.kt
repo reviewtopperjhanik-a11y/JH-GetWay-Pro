@@ -182,16 +182,29 @@ class WebSearchRouterService(
         val ddgEnabled = runCatching { prefs.settingsFlow.first().webSearchDuckDuckGoFallbackEnabled }.getOrDefault(false)
 
         if (candidates.isEmpty() && !ddgEnabled) {
-            val coolingWaitSec = enabledKeys
+            val nonTerminalKeys = enabledKeys.filter {
+                it.status != KeyStatus.INVALID &&
+                    it.status != KeyStatus.EXPIRED &&
+                    it.status != KeyStatus.DISABLED
+            }
+            val coolingWaitSec = nonTerminalKeys
                 .mapNotNull { it.cooldownUntilMs?.let { until -> ((until - startedAt + 999L) / 1000L).toInt() } }
                 .filter { it > 0 }
                 .minOrNull()
-            return if (enabledKeys.isNotEmpty() && coolingWaitSec != null) {
+            return if (nonTerminalKeys.isNotEmpty() && coolingWaitSec != null) {
                 WebSearchGatewayResult.Failure(
                     statusCode = 429,
                     errorCode = "rate_limit_exhausted",
                     safeMessage = "All configured Web Search API keys are currently cooling down after rate-limit or error responses.",
                     retryAfterSeconds = coolingWaitSec,
+                    attempts = 0
+                )
+            } else if (enabledKeys.isNotEmpty()) {
+                WebSearchGatewayResult.Failure(
+                    statusCode = 503,
+                    errorCode = "search_providers_unavailable",
+                    safeMessage = "All enabled Web Search API keys are invalid, expired, or disabled. Verify keys in Search Pools.",
+                    retryAfterSeconds = null,
                     attempts = 0
                 )
             } else {
@@ -219,7 +232,7 @@ class WebSearchRouterService(
                     status = KeyStatus.INVALID,
                     nowMs = nowMs(),
                     lastError = msg,
-                    cooldownUntilMs = nowMs() + 300_000L,
+                    cooldownUntilMs = null,
                     rateLimitRemaining = null,
                     rateLimitResetAtMs = null
                 )
@@ -271,12 +284,17 @@ class WebSearchRouterService(
 
                 is ProviderAttemptResult.Failure -> {
                     val failNow = nowMs()
+                    val isTerminalKeyStatus = outcome.keyStatus == KeyStatus.INVALID ||
+                        outcome.keyStatus == KeyStatus.EXPIRED ||
+                        outcome.keyStatus == KeyStatus.DISABLED
                     val cooldownSec = outcome.cooldownSeconds.coerceIn(30, 300)
-                    val cooldownUntil = failNow + cooldownSec * 1000L
+                    val cooldownUntil = if (isTerminalKeyStatus) null else failNow + cooldownSec * 1000L
                     if (outcome.httpCode == 429 || outcome.httpCode == 402 || outcome.httpCode == 403) {
                         sawRateLimit = true
                     }
-                    minCooldownSec = listOfNotNull(minCooldownSec, cooldownSec).minOrNull()
+                    if (!isTerminalKeyStatus) {
+                        minCooldownSec = listOfNotNull(minCooldownSec, cooldownSec).minOrNull()
+                    }
                     val safeErr = MaskingUtils.sanitizeErrorMessage(outcome.safeError, listOf(plainKey))
                     lastSafeError = safeErr
                     servicePoolDao.recordFailureOrCooldown(
@@ -364,12 +382,15 @@ class WebSearchRouterService(
             }
             is ProviderAttemptResult.Failure -> {
                 val safeErr = MaskingUtils.sanitizeErrorMessage(out.safeError, listOf(plain))
+                val isTerminal = out.keyStatus == KeyStatus.INVALID ||
+                    out.keyStatus == KeyStatus.EXPIRED ||
+                    out.keyStatus == KeyStatus.DISABLED
                 servicePoolDao.recordFailureOrCooldown(
                     id = entity.id,
                     status = out.keyStatus,
                     nowMs = nowMs(),
                     lastError = safeErr,
-                    cooldownUntilMs = nowMs() + out.cooldownSeconds.coerceIn(30, 300) * 1000L,
+                    cooldownUntilMs = if (isTerminal) null else nowMs() + out.cooldownSeconds.coerceIn(30, 300) * 1000L,
                     rateLimitRemaining = null,
                     rateLimitResetAtMs = null
                 )
@@ -380,6 +401,12 @@ class WebSearchRouterService(
 
     private fun isKeyAvailable(key: ServicePoolKeyEntity, now: Long): Boolean {
         if (!key.enabled) return false
+        if (key.status == KeyStatus.INVALID ||
+            key.status == KeyStatus.EXPIRED ||
+            key.status == KeyStatus.DISABLED
+        ) {
+            return false
+        }
         val cd = key.cooldownUntilMs
         return cd == null || cd <= now
     }

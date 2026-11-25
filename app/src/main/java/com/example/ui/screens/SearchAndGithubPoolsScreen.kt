@@ -180,10 +180,11 @@ fun SearchAndGithubPoolsScreen(viewModel: GatewayViewModel) {
 
                     val (badgeText, badgeTone) = when {
                         !keyItem.enabled -> s.disabled to StatusTone.NEUTRAL
+                        keyItem.status == KeyStatus.INVALID || keyItem.status == KeyStatus.EXPIRED -> keyItem.status.name to StatusTone.ERROR
+                        keyItem.status == KeyStatus.DISABLED -> s.disabled to StatusTone.NEUTRAL
                         cooldownRemainingSec != null -> "${s.poolStatusCooldownPrefix} ${cooldownRemainingSec}s" to StatusTone.WARNING
                         keyItem.status == KeyStatus.ACTIVE -> "ACTIVE" to StatusTone.SUCCESS
                         keyItem.status == KeyStatus.RATE_LIMITED -> "RATE LIMITED" to StatusTone.WARNING
-                        keyItem.status == KeyStatus.INVALID || keyItem.status == KeyStatus.EXPIRED -> keyItem.status.name to StatusTone.ERROR
                         !keyItem.lastError.isNullOrBlank() -> "ERROR" to StatusTone.ERROR
                         else -> "READY" to StatusTone.INFO
                     }

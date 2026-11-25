@@ -30,9 +30,11 @@ fun ProvidersScreen(
 ) {
     val s = LocalStrings.current
     val providers by viewModel.providers.collectAsState()
-    val metrics by viewModel.metrics.collectAsState()
-    val keys by viewModel.apiKeys.collectAsState()
     val fetchedModelsPrompt by viewModel.fetchedModelsPrompt.collectAsState()
+
+    LaunchedEffect(Unit) {
+        viewModel.refreshExpiredCooldowns()
+    }
 
     val groups = remember(providers) { ProviderDirectoryHelper.groupProviders(providers) }
     var showEditor by remember { mutableStateOf(false) }
@@ -216,8 +218,8 @@ fun ProvidersScreen(
 
     ProviderApiManagementDialogs(
         viewModel = viewModel,
-        metrics = metrics,
-        keys = keys,
+        metrics = emptyList(),
+        keys = emptyList(),
         showEditor = showEditor,
         editingProvider = null,
         initialPresetId = null,
