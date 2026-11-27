@@ -393,8 +393,6 @@ private fun MainGatewayScaffold(viewModel: GatewayViewModel) {
     val currentRoute = navBackStackEntry?.destination?.route ?: Routes.DASHBOARD
 
     val bannerMessage by viewModel.uiBannerMessage.collectAsState()
-    val runtime by viewModel.gatewayRuntime.collectAsState()
-    val providers by viewModel.providers.collectAsState()
     val pendingMcpApproval by viewModel.pendingMcpApproval.collectAsState()
     val updateState by viewModel.appUpdateUiState.collectAsState()
     val snackbarHostState = remember { SnackbarHostState() }
@@ -484,33 +482,6 @@ private fun MainGatewayScaffold(viewModel: GatewayViewModel) {
         else -> null
     }
     val activeDetailGroupKey = navBackStackEntry?.arguments?.getString("groupKey")?.let { Uri.decode(it) }
-    val scopedProvidersForTitle = if (currentRoute == Routes.PROVIDER_DETAIL_PATTERN) providers else null
-    val currentTitle = remember(currentRoute, activeDetailGroupKey, scopedProvidersForTitle, s) {
-        when (currentRoute) {
-            Routes.DASHBOARD -> s.appName
-            Routes.PROVIDERS -> s.navProviders
-            Routes.PROVIDERS_ALL -> s.allApisTitle
-            Routes.PROVIDER_DETAIL_PATTERN -> activeDetailGroupKey?.let { key ->
-                scopedProvidersForTitle?.let { ProviderDirectoryHelper.findGroup(it, key)?.displayName }
-            } ?: s.providersTitle
-            Routes.MODELS -> s.navModels
-            Routes.GATEWAY -> s.navGateway
-            Routes.GATEWAY_CONFIG -> s.gatewayConfigMenuTitle
-            Routes.SMART_ROUTER -> s.navSmartRouter
-            Routes.CODING_AGENTS -> s.navCodingAgents
-            Routes.LOCAL_AI -> s.navLocalAi
-            Routes.MCP_SERVERS -> s.navMcpServers
-            Routes.WORKFLOWS -> s.navWorkflows
-            Routes.PLAYGROUND -> s.navPlayground
-            Routes.ANALYTICS -> s.navAnalytics
-            Routes.DEVICES -> s.navDevices
-            Routes.SEARCH_POOLS -> s.navSearchPools
-            Routes.VAULT -> s.navVault
-            Routes.ACTIVITY_LOGS -> s.navActivityLogs
-            Routes.SETTINGS -> s.navSettings
-            else -> s.appName
-        }
-    }
 
     Scaffold(
         modifier = Modifier.fillMaxSize(),
@@ -519,10 +490,10 @@ private fun MainGatewayScaffold(viewModel: GatewayViewModel) {
         topBar = {
             TopAppBar(
                 title = {
-                    Text(
-                        text = currentTitle,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
+                    TopBarRouteTitle(
+                        currentRoute = currentRoute,
+                        activeDetailGroupKey = activeDetailGroupKey,
+                        viewModel = viewModel
                     )
                 },
                 navigationIcon = {
@@ -536,14 +507,10 @@ private fun MainGatewayScaffold(viewModel: GatewayViewModel) {
                     }
                 },
                 actions = {
-                    val (gwLabel, gwTone) = gatewayStatusLabelAndTone(runtime.status)
-                    Box(
-                        modifier = Modifier
-                            .padding(end = 4.dp)
-                            .clickable { navigateTo(Routes.GATEWAY) }
-                    ) {
-                        StatusPill(text = gwLabel, tone = gwTone)
-                    }
+                    TopBarGatewayStatusPill(
+                        viewModel = viewModel,
+                        onClick = { navigateTo(Routes.GATEWAY) }
+                    )
                     IconButton(onClick = { navigateTo(Routes.SETTINGS) }) {
                         Icon(
                             imageVector = Icons.Default.Settings,
@@ -897,3 +864,66 @@ private fun MainGatewayScaffold(viewModel: GatewayViewModel) {
         )
     }
 }
+
+@Composable
+private fun TopBarRouteTitle(
+    currentRoute: String,
+    activeDetailGroupKey: String?,
+    viewModel: GatewayViewModel
+) {
+    val s = LocalStrings.current
+    val currentTitle = if (currentRoute == Routes.PROVIDER_DETAIL_PATTERN) {
+        val providers by viewModel.providers.collectAsState()
+        remember(activeDetailGroupKey, providers, s) {
+            activeDetailGroupKey?.let { key ->
+                ProviderDirectoryHelper.findGroup(providers, key)?.displayName
+            } ?: s.providersTitle
+        }
+    } else {
+        remember(currentRoute, s) {
+            when (currentRoute) {
+                Routes.DASHBOARD -> s.appName
+                Routes.PROVIDERS -> s.navProviders
+                Routes.PROVIDERS_ALL -> s.allApisTitle
+                Routes.MODELS -> s.navModels
+                Routes.GATEWAY -> s.navGateway
+                Routes.GATEWAY_CONFIG -> s.gatewayConfigMenuTitle
+                Routes.SMART_ROUTER -> s.navSmartRouter
+                Routes.CODING_AGENTS -> s.navCodingAgents
+                Routes.LOCAL_AI -> s.navLocalAi
+                Routes.MCP_SERVERS -> s.navMcpServers
+                Routes.WORKFLOWS -> s.navWorkflows
+                Routes.PLAYGROUND -> s.navPlayground
+                Routes.ANALYTICS -> s.navAnalytics
+                Routes.DEVICES -> s.navDevices
+                Routes.SEARCH_POOLS -> s.navSearchPools
+                Routes.VAULT -> s.navVault
+                Routes.ACTIVITY_LOGS -> s.navActivityLogs
+                Routes.SETTINGS -> s.navSettings
+                else -> s.appName
+            }
+        }
+    }
+    Text(
+        text = currentTitle,
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis
+    )
+}
+
+@Composable
+private fun TopBarGatewayStatusPill(
+    viewModel: GatewayViewModel,
+    onClick: () -> Unit
+) {
+    val runtime by viewModel.gatewayRuntime.collectAsState()
+    val (gwLabel, gwTone) = gatewayStatusLabelAndTone(runtime.status)
+    Box(
+        modifier = Modifier
+            .padding(end = 4.dp)
+            .clickable(onClick = onClick)
+    ) {
+        StatusPill(text = gwLabel, tone = gwTone)
+    }
+}
+

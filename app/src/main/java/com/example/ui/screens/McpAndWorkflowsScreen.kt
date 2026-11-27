@@ -32,6 +32,7 @@ fun McpServersScreen(viewModel: GatewayViewModel) {
     val s = LocalStrings.current
     val servers by viewModel.mcpServers.collectAsState()
     val tools by viewModel.mcpTools.collectAsState()
+    val toolsByServer = remember(tools) { tools.groupBy { it.serverId } }
 
     var showAddDialog by remember { mutableStateOf(false) }
     var runToolTarget by remember { mutableStateOf<Pair<McpServerEntity, McpToolEntity>?>(null) }
@@ -70,7 +71,7 @@ fun McpServersScreen(viewModel: GatewayViewModel) {
                 }
             } else {
                 items(servers, key = { it.id }) { srv ->
-                    val srvTools = tools.filter { it.serverId == srv.id }
+                    val srvTools = toolsByServer[srv.id].orEmpty()
                     val (stTxt, tone) = providerStatusLabelAndTone(srv.status)
                     GatewayCard {
                         Row(
@@ -463,10 +464,12 @@ private fun WorkflowGraphEditorDialog(
     var addNodeType by remember { mutableStateOf(WorkflowNodeType.AI_MODEL) }
     var newNodeTitle by remember { mutableStateOf("") }
     var newNodePrompt by remember { mutableStateOf("{{input}}") }
+    var newNodeMethod by remember { mutableStateOf("GET") }
     var newNodeRetries by remember { mutableStateOf("0") }
     var editingNodeId by remember { mutableStateOf<String?>(null) }
     var editNodeTitle by remember { mutableStateOf("") }
     var editNodePrimaryCfg by remember { mutableStateOf("") }
+    var editNodeMethod by remember { mutableStateOf("GET") }
     var editNodeRetries by remember { mutableStateOf("0") }
     var connectFrom by remember { mutableStateOf(nodes.firstOrNull()?.id.orEmpty()) }
     var connectTo by remember { mutableStateOf(nodes.lastOrNull()?.id.orEmpty()) }
@@ -496,6 +499,7 @@ private fun WorkflowGraphEditorDialog(
                                         ?: n.config["contains"]
                                         ?: n.config["toolName"]
                                         ?: ""
+                                    editNodeMethod = n.config["method"]?.uppercase()?.takeIf { it == "GET" || it == "POST" } ?: "GET"
                                     editNodeRetries = n.config["retryCount"] ?: "0"
                                 }
                             },
@@ -509,22 +513,50 @@ private fun WorkflowGraphEditorDialog(
                     if (target != null) {
                         OutlinedTextField(value = editNodeTitle, onValueChange = { editNodeTitle = it }, label = { Text(s.nodeTitleLabel) }, singleLine = true, modifier = Modifier.fillMaxWidth())
                         OutlinedTextField(value = editNodePrimaryCfg, onValueChange = { editNodePrimaryCfg = it }, label = { Text(s.nodeConfigLabel) }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                        if (target.type == WorkflowNodeType.HTTP_REQUEST) {
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                listOf("GET", "POST").forEach { m ->
+                                    FilterChip(
+                                        selected = editNodeMethod == m,
+                                        onClick = { editNodeMethod = m },
+                                        label = { Text(m) }
+                                    )
+                                }
+                            }
+                        }
                         OutlinedTextField(value = editNodeRetries, onValueChange = { editNodeRetries = it.filter { c -> c.isDigit() }.take(1) }, label = { Text(s.retryCountLabel) }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                        OutlinedButton(onClick = {
-                            val updatedCfg = target.config.toMutableMap()
-                            val key = when (target.type) {
-                                WorkflowNodeType.HTTP_REQUEST -> "url"
-                                WorkflowNodeType.CONDITION -> "contains"
-                                WorkflowNodeType.MCP_TOOL -> "toolName"
-                                else -> "prompt"
-                            }
-                            if (editNodePrimaryCfg.isNotBlank()) updatedCfg[key] = editNodePrimaryCfg
-                            updatedCfg["retryCount"] = (editNodeRetries.toIntOrNull() ?: 0).coerceIn(0, 3).toString()
-                            nodes = nodes.map {
-                                if (it.id == targetId) it.copy(title = editNodeTitle.ifBlank { it.title }, config = updatedCfg) else it
-                            }
-                            editingNodeId = null
-                        }) { Text(s.save) }
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedButton(onClick = {
+                                val updatedCfg = target.config.toMutableMap()
+                                val key = when (target.type) {
+                                    WorkflowNodeType.HTTP_REQUEST -> "url"
+                                    WorkflowNodeType.CONDITION -> "contains"
+                                    WorkflowNodeType.MCP_TOOL -> "toolName"
+                                    else -> "prompt"
+                                }
+                                val cleanedCfg = editNodePrimaryCfg.trim()
+                                if (cleanedCfg.isNotEmpty()) updatedCfg[key] = cleanedCfg else updatedCfg.remove(key)
+                                if (target.type == WorkflowNodeType.HTTP_REQUEST) {
+                                    updatedCfg["method"] = editNodeMethod
+                                }
+                                updatedCfg["retryCount"] = (editNodeRetries.toIntOrNull() ?: 0).coerceIn(0, 3).toString()
+                                nodes = nodes.map {
+                                    if (it.id == targetId) it.copy(title = editNodeTitle.ifBlank { it.title }, config = updatedCfg) else it
+                                }
+                                editingNodeId = null
+                            }) { Text(s.save) }
+                            TextButton(
+                                onClick = {
+                                    val remaining = nodes.filterNot { it.id == targetId }
+                                    nodes = remaining
+                                    edges = edges.filterNot { it.fromNodeId == targetId || it.toNodeId == targetId }
+                                    if (connectFrom == targetId) connectFrom = remaining.firstOrNull()?.id.orEmpty()
+                                    if (connectTo == targetId) connectTo = remaining.lastOrNull()?.id.orEmpty()
+                                    editingNodeId = null
+                                },
+                                colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)
+                            ) { Text(s.delete) }
+                        }
                     }
                 }
 
@@ -537,12 +569,23 @@ private fun WorkflowGraphEditorDialog(
                 }
                 OutlinedTextField(value = newNodeTitle, onValueChange = { newNodeTitle = it }, label = { Text(s.nodeTitleLabel) }, singleLine = true, modifier = Modifier.fillMaxWidth())
                 OutlinedTextField(value = newNodePrompt, onValueChange = { newNodePrompt = it }, label = { Text(s.nodeConfigLabel) }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                if (addNodeType == WorkflowNodeType.HTTP_REQUEST) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        listOf("GET", "POST").forEach { m ->
+                            FilterChip(
+                                selected = newNodeMethod == m,
+                                onClick = { newNodeMethod = m },
+                                label = { Text(m) }
+                            )
+                        }
+                    }
+                }
                 OutlinedTextField(value = newNodeRetries, onValueChange = { newNodeRetries = it.filter { c -> c.isDigit() }.take(1) }, label = { Text(s.retryCountLabel) }, singleLine = true, modifier = Modifier.fillMaxWidth())
                 OutlinedButton(onClick = {
                     val nid = "n_${UUID.randomUUID().toString().take(5)}"
                     val retryStr = (newNodeRetries.toIntOrNull() ?: 0).coerceIn(0, 3).toString()
                     val cfg = when (addNodeType) {
-                        WorkflowNodeType.HTTP_REQUEST -> mapOf("url" to newNodePrompt, "method" to "GET", "retryCount" to retryStr)
+                        WorkflowNodeType.HTTP_REQUEST -> mapOf("url" to newNodePrompt.trim(), "method" to newNodeMethod, "retryCount" to retryStr)
                         WorkflowNodeType.CONDITION -> mapOf("contains" to newNodePrompt, "retryCount" to retryStr)
                         else -> mapOf("prompt" to newNodePrompt, "retryCount" to retryStr)
                     }

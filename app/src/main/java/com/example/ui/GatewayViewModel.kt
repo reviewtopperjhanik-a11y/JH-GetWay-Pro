@@ -1433,6 +1433,31 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
         _playgroundTarget.value = null
     }
 
+    private suspend fun persistPlaygroundMessage(
+        sessionId: String,
+        message: PlaygroundMessageEntity,
+        fallbackTitle: String = "Session",
+        fallbackModelId: String = "",
+        fallbackSystemPrompt: String = ""
+    ) {
+        db.withTransaction {
+            db.playgroundDao().insertMessage(message)
+            val updated = db.playgroundDao().touchSessionUpdatedAt(sessionId, message.timestamp)
+            if (updated == 0) {
+                db.playgroundDao().upsertSession(
+                    PlaygroundSessionEntity(
+                        id = sessionId,
+                        title = fallbackTitle,
+                        modelId = fallbackModelId,
+                        systemPrompt = fallbackSystemPrompt,
+                        createdAt = message.timestamp,
+                        updatedAt = message.timestamp
+                    )
+                )
+            }
+        }
+    }
+
     fun stopPlaygroundStreaming() {
         val partial = _streamingBuffer.value
         val sid = _activeSessionId.value
@@ -1450,7 +1475,7 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
                     modelId = "Stopped",
                     providerName = ""
                 )
-                if (saveHistory) db.playgroundDao().insertMessage(partialMsg)
+                if (saveHistory) persistPlaygroundMessage(sid, partialMsg)
                 else _ephemeralMessages.update { it + partialMsg }
             }
         }
@@ -1601,7 +1626,13 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
                 content = prompt,
                 attachmentsMetadataJson = metaJson
             )
-            if (saveHistory) db.playgroundDao().insertMessage(userMsg)
+            if (saveHistory) persistPlaygroundMessage(
+                sessionId = sid,
+                message = userMsg,
+                fallbackTitle = sessionTitle,
+                fallbackModelId = modelIdOrAlias,
+                fallbackSystemPrompt = systemPrompt
+            )
             else _ephemeralMessages.update { it + userMsg }
 
             val history = if (saveHistory) db.playgroundDao().getMessagesOnce(sid) else _ephemeralMessages.value
@@ -1658,7 +1689,7 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
                                     outputTokens = event.result.outputTokens,
                                     estimatedCostUsd = estCost
                                 )
-                                if (saveHistory) db.playgroundDao().insertMessage(assistantMsg)
+                                if (saveHistory) persistPlaygroundMessage(sid, assistantMsg, sessionTitle, modelIdOrAlias, systemPrompt)
                                 else _ephemeralMessages.update { it + assistantMsg }
                                 _streamingBuffer.value = ""
                             }
@@ -1672,7 +1703,7 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
                                     latencyMs = event.error.latencyMs,
                                     isError = true
                                 )
-                                if (saveHistory) db.playgroundDao().insertMessage(errMsg)
+                                if (saveHistory) persistPlaygroundMessage(sid, errMsg, sessionTitle, modelIdOrAlias, systemPrompt)
                                 else _ephemeralMessages.update { it + errMsg }
                                 _streamingBuffer.value = ""
                             }
@@ -1712,7 +1743,7 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
                         estimatedCostUsd = estCost,
                         isError = !res.execution.success
                     )
-                    if (saveHistory) db.playgroundDao().insertMessage(msg)
+                    if (saveHistory) persistPlaygroundMessage(sid, msg, sessionTitle, modelIdOrAlias, systemPrompt)
                     else _ephemeralMessages.update { it + msg }
                 }
             } finally {
@@ -2198,7 +2229,14 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
             postBanner(MaskingUtils.sanitizeErrorMessage(err.message, listOf(raw)))
             return@launch
         }
-        db.deviceDao().upsert(device.copy(encryptedToken = enc, tokenPreview = MaskingUtils.maskSecret(raw), revoked = false))
+        db.deviceDao().upsert(
+            device.copy(
+                encryptedToken = enc,
+                tokenPreview = MaskingUtils.maskSecret(raw),
+                revoked = false,
+                enabled = if (device.revoked) true else device.enabled
+            )
+        )
         logEvent(ActivityCategory.DEVICE_CONNECTION, device.name, "TOKEN_ROTATED", "Device token regenerated")
     }
     fun revokeDevice(device: DeviceEntity) = viewModelScope.launch {

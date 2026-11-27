@@ -117,6 +117,12 @@ fun DevicesScreen(viewModel: GatewayViewModel) {
                             OutlinedButton(onClick = { viewModel.regenerateDeviceToken(dev) }) { Text(s.regenerateToken) }
                             TextButton(onClick = { renameTarget = dev }) { Text(s.renameLabel) }
                             if (!dev.revoked) {
+                                IconButton(onClick = { viewModel.toggleDeviceEnabled(dev) }) {
+                                    Icon(
+                                        imageVector = if (dev.enabled) Icons.Default.ToggleOn else Icons.Default.ToggleOff,
+                                        contentDescription = if (dev.enabled) s.disable else s.enable
+                                    )
+                                }
                                 TextButton(
                                     onClick = { viewModel.revokeDevice(dev) },
                                     colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)

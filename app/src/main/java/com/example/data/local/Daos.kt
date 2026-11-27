@@ -323,6 +323,9 @@ interface PlaygroundDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertSession(session: PlaygroundSessionEntity)
 
+    @Query("UPDATE playground_sessions SET updatedAt = :updatedAt WHERE id = :id")
+    suspend fun touchSessionUpdatedAt(id: String, updatedAt: Long): Int
+
     @Query("DELETE FROM playground_sessions WHERE id = :id")
     suspend fun deleteSession(id: String)
 

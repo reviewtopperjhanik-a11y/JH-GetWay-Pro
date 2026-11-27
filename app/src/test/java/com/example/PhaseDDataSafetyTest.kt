@@ -206,6 +206,46 @@ class PhaseDDataSafetyTest {
         assertEquals(listOf("m-fresh"), db.metricAndLogDao().getMetricsOnce().map { it.id })
     }
 
+    @Test
+    fun playgroundSessionTouchUpdatedAt_preservesActiveSessionDuringRetentionCleanup() = runBlocking {
+        val nowMs = 1_800_000_000_000L
+        val dayMs = 86_400_000L
+
+        // Session created 90 days ago, then newly active 1 day ago via touchSessionUpdatedAt
+        db.playgroundDao().upsertSession(
+            PlaygroundSessionEntity(
+                id = "sess-active-old",
+                title = "Long Running Chat",
+                createdAt = nowMs - 90 * dayMs,
+                updatedAt = nowMs - 90 * dayMs
+            )
+        )
+        val touchedRows = db.playgroundDao().touchSessionUpdatedAt("sess-active-old", nowMs - 1 * dayMs)
+        assertEquals(1, touchedRows)
+
+        db.playgroundDao().insertMessage(
+            PlaygroundMessageEntity(
+                id = "msg-recent",
+                sessionId = "sess-active-old",
+                role = "user",
+                content = "still chatting",
+                timestamp = nowMs - 1 * dayMs
+            )
+        )
+
+        val report = DataRetentionManager(db).enforcePolicies(
+            logRetentionDays = 30,
+            usageRetentionDays = 90,
+            playgroundRetentionDays = 60,
+            nowMs = nowMs
+        )
+
+        assertEquals(0, report.deletedPlaygroundSessions)
+        assertEquals(0, report.deletedPlaygroundMessages)
+        assertEquals(listOf("sess-active-old"), db.playgroundDao().getSessionsOnce().map { it.id })
+        assertEquals(listOf("msg-recent"), db.playgroundDao().getMessagesOnce("sess-active-old").map { it.id })
+    }
+
     // -------------------------------------------------------------------------
     // Versioned Encrypted Backup: Export, Integrity, Preview, Conflict, Rollback
     // -------------------------------------------------------------------------

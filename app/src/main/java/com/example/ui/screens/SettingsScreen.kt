@@ -36,6 +36,7 @@ import com.example.ui.navigation.Routes
 import com.example.ui.theme.MonoTextStyle
 import com.example.ui.theme.ThemeMode
 import kotlinx.coroutines.launch
+import kotlin.math.roundToInt
 
 @Composable
 fun SettingsScreen(
@@ -239,22 +240,28 @@ fun SettingsScreen(
                     }
                 }
                 Spacer(Modifier.height(8.dp))
-                Text("${s.logRetentionLabel}: ${settings.logRetentionDays} ${s.daysUnit}", style = MaterialTheme.typography.bodySmall)
+                var logDaysDraft by remember(settings.logRetentionDays) { mutableFloatStateOf(settings.logRetentionDays.toFloat()) }
+                Text("${s.logRetentionLabel}: ${logDaysDraft.roundToInt()} ${s.daysUnit}", style = MaterialTheme.typography.bodySmall)
                 Slider(
-                    value = settings.logRetentionDays.toFloat(),
-                    onValueChange = { viewModel.setLogRetentionDays(it.toInt()) },
+                    value = logDaysDraft,
+                    onValueChange = { logDaysDraft = it },
+                    onValueChangeFinished = { viewModel.setLogRetentionDays(logDaysDraft.roundToInt()) },
                     valueRange = 7f..90f
                 )
-                Text("${s.usageRetentionLabel}: ${settings.usageRetentionDays} ${s.daysUnit}", style = MaterialTheme.typography.bodySmall)
+                var usageDaysDraft by remember(settings.usageRetentionDays) { mutableFloatStateOf(settings.usageRetentionDays.toFloat()) }
+                Text("${s.usageRetentionLabel}: ${usageDaysDraft.roundToInt()} ${s.daysUnit}", style = MaterialTheme.typography.bodySmall)
                 Slider(
-                    value = settings.usageRetentionDays.toFloat(),
-                    onValueChange = { viewModel.setUsageRetentionDays(it.toInt()) },
+                    value = usageDaysDraft,
+                    onValueChange = { usageDaysDraft = it },
+                    onValueChangeFinished = { viewModel.setUsageRetentionDays(usageDaysDraft.roundToInt()) },
                     valueRange = 7f..365f
                 )
-                Text("${s.playgroundRetentionLabel}: ${settings.playgroundRetentionDays} ${s.daysUnit}", style = MaterialTheme.typography.bodySmall)
+                var playgroundDaysDraft by remember(settings.playgroundRetentionDays) { mutableFloatStateOf(settings.playgroundRetentionDays.toFloat()) }
+                Text("${s.playgroundRetentionLabel}: ${playgroundDaysDraft.roundToInt()} ${s.daysUnit}", style = MaterialTheme.typography.bodySmall)
                 Slider(
-                    value = settings.playgroundRetentionDays.toFloat(),
-                    onValueChange = { viewModel.setPlaygroundRetentionDays(it.toInt()) },
+                    value = playgroundDaysDraft,
+                    onValueChange = { playgroundDaysDraft = it },
+                    onValueChangeFinished = { viewModel.setPlaygroundRetentionDays(playgroundDaysDraft.roundToInt()) },
                     valueRange = 7f..180f
                 )
                 OutlinedButton(

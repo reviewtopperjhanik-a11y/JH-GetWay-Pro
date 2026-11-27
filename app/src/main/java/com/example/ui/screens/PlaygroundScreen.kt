@@ -14,6 +14,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
@@ -49,6 +50,7 @@ import com.example.ui.components.*
 import com.example.ui.navigation.Routes
 import com.example.ui.theme.MonoTextStyle
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -258,11 +260,32 @@ fun PlaygroundScreen(
     }
 
     val listState = rememberLazyListState()
-    LaunchedEffect(messages.size, streamingBuffer.length, isStreaming) {
+    LaunchedEffect(messages.size, isStreaming, compareMode) {
         val totalItems = messages.size + if (isStreaming) 1 else 0
         if (!compareMode && totalItems > 0) {
             listState.animateScrollToItem(totalItems - 1)
         }
+    }
+    LaunchedEffect(isStreaming, compareMode) {
+        if (!isStreaming || compareMode) return@LaunchedEffect
+        snapshotFlow { streamingBuffer.length }
+            .collect {
+                val totalItems = messages.size + 1
+                val layoutInfo = listState.layoutInfo
+                val lastVisible = layoutInfo.visibleItemsInfo.lastOrNull()
+                val nearBottom = lastVisible == null || lastVisible.index >= (totalItems - 2)
+                if (nearBottom) {
+                    if (lastVisible != null && lastVisible.index == totalItems - 1) {
+                        val overflow = (lastVisible.offset + lastVisible.size) - layoutInfo.viewportEndOffset
+                        if (overflow > 0) {
+                            listState.scrollBy(overflow.toFloat())
+                        }
+                    } else {
+                        listState.scrollToItem(totalItems - 1)
+                    }
+                }
+                delay(120)
+            }
     }
 
     fun dispatchChatSend(promptText: String, attachmentsToSend: List<PendingAttachment>) {
@@ -450,6 +473,8 @@ fun PlaygroundScreen(
                     }
                 }
             } else {
+                val lastAssistantId = remember(messages) { messages.lastOrNull { it.role != "user" }?.id }
+                val lastUserMsg = remember(messages) { messages.lastOrNull { it.role == "user" } }
                 LazyColumn(
                     state = listState,
                     modifier = Modifier
@@ -460,7 +485,7 @@ fun PlaygroundScreen(
                 ) {
                     items(messages, key = { it.id }) { msg ->
                         val isUser = msg.role == "user"
-                        val isLastAssistant = !isUser && msg.id == messages.lastOrNull { it.role != "user" }?.id
+                        val isLastAssistant = !isUser && msg.id == lastAssistantId
                         if (isUser) {
                             Column(
                                 modifier = Modifier.fillMaxWidth(),
@@ -578,10 +603,9 @@ fun PlaygroundScreen(
                                             )
                                         }
                                         if (isLastAssistant && !isStreaming) {
-                                            val lastUser = messages.lastOrNull { it.role == "user" }
-                                            if (lastUser != null && lastUser.content.isNotBlank()) {
+                                            if (lastUserMsg != null && lastUserMsg.content.isNotBlank()) {
                                                 IconButton(
-                                                    onClick = { dispatchChatSend(lastUser.content, emptyList()) },
+                                                    onClick = { dispatchChatSend(lastUserMsg.content, emptyList()) },
                                                     modifier = Modifier
                                                         .minimumInteractiveComponentSize()
                                                         .testTag("playground_regenerate_btn")

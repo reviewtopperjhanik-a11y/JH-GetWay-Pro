@@ -257,6 +257,12 @@ fun ProviderDetailScreen(
     val providerTitle = groupSummary?.displayName
         ?: groupProviders.firstOrNull()?.name
         ?: s.providersTitle
+    val keysCountByProvider = remember(keys) {
+        keys.filter { it.enabled }.groupingBy { it.providerId }.eachCount()
+    }
+    val requestsCountByProvider = remember(metrics) {
+        metrics.groupingBy { it.providerId }.eachCount()
+    }
 
     var showEditor by remember { mutableStateOf(false) }
     var editingProvider by remember { mutableStateOf<ProviderEntity?>(null) }
@@ -321,8 +327,8 @@ fun ProviderDetailScreen(
                 }
             } else {
                 items(groupProviders, key = { it.id }) { provider ->
-                    val pKeys = keys.count { it.providerId == provider.id && it.enabled }
-                    val pRequests = metrics.count { it.providerId == provider.id }
+                    val pKeys = keysCountByProvider[provider.id] ?: 0
+                    val pRequests = requestsCountByProvider[provider.id] ?: 0
                     ProviderApiConfigCard(
                         provider = provider,
                         providerBadge = null,
@@ -379,6 +385,15 @@ fun AllApisScreen(viewModel: GatewayViewModel) {
                 .thenBy { it.name.lowercase() }
         )
     }
+    val identitiesById = remember(sortedProviders) {
+        sortedProviders.associate { it.id to ProviderDirectoryHelper.resolveProviderIdentity(it).displayName }
+    }
+    val keysCountByProvider = remember(keys) {
+        keys.filter { it.enabled }.groupingBy { it.providerId }.eachCount()
+    }
+    val requestsCountByProvider = remember(metrics) {
+        metrics.groupingBy { it.providerId }.eachCount()
+    }
 
     var showEditor by remember { mutableStateOf(false) }
     var editingProvider by remember { mutableStateOf<ProviderEntity?>(null) }
@@ -431,12 +446,12 @@ fun AllApisScreen(viewModel: GatewayViewModel) {
                 }
             } else {
                 items(sortedProviders, key = { it.id }) { provider ->
-                    val identity = ProviderDirectoryHelper.resolveProviderIdentity(provider)
-                    val pKeys = keys.count { it.providerId == provider.id && it.enabled }
-                    val pRequests = metrics.count { it.providerId == provider.id }
+                    val identityName = identitiesById[provider.id]
+                    val pKeys = keysCountByProvider[provider.id] ?: 0
+                    val pRequests = requestsCountByProvider[provider.id] ?: 0
                     ProviderApiConfigCard(
                         provider = provider,
-                        providerBadge = identity.displayName,
+                        providerBadge = identityName,
                         keysCount = pKeys,
                         requestsCount = pRequests,
                         isFetching = provider.id in fetchingProviderIds,
@@ -478,6 +493,9 @@ fun VaultScreen(viewModel: GatewayViewModel) {
     val s = LocalStrings.current
     val keys by viewModel.apiKeys.collectAsState()
     val providers by viewModel.providers.collectAsState()
+    val providerNamesById = remember(providers) {
+        providers.associate { it.id to it.name }
+    }
     var showAddDialog by remember { mutableStateOf(false) }
     var rotatingKey by remember { mutableStateOf<ApiKeyEntity?>(null) }
     var deletingKey by remember { mutableStateOf<ApiKeyEntity?>(null) }
@@ -522,7 +540,7 @@ fun VaultScreen(viewModel: GatewayViewModel) {
                 }
             } else {
                 items(keys, key = { it.id }) { keyItem ->
-                    val providerName = providers.firstOrNull { it.id == keyItem.providerId }?.name ?: s.unknownProviderLabel
+                    val providerName = providerNamesById[keyItem.providerId] ?: s.unknownProviderLabel
                     val (statusTxt, tone) = keyStatusLabelAndTone(keyItem.status)
                     GatewayCard {
                         Row(

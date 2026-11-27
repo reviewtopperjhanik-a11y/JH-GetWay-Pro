@@ -30,6 +30,7 @@ import com.example.gateway.OpenCodeSelectorIds
 import com.example.ui.GatewayViewModel
 import com.example.ui.components.*
 import com.example.ui.theme.MonoTextStyle
+import kotlin.math.roundToInt
 
 @Composable
 fun GatewayScreen(
@@ -351,11 +352,19 @@ fun SmartRouterScreen(viewModel: GatewayViewModel) {
                         onCheckedChange = { viewModel.updateRoutingSettings(settings.defaultRoutingMode, it, settings.maxRetries) }
                     )
                 }
+                var sliderRetries by remember(settings.maxRetries) { mutableFloatStateOf(settings.maxRetries.toFloat()) }
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("${s.maxRetries}: ${settings.maxRetries}", style = MaterialTheme.typography.bodyMedium)
+                    Text("${s.maxRetries}: ${sliderRetries.roundToInt()}", style = MaterialTheme.typography.bodyMedium)
                     Slider(
-                        value = settings.maxRetries.toFloat(),
-                        onValueChange = { viewModel.updateRoutingSettings(settings.defaultRoutingMode, settings.fallbackEnabled, it.toInt()) },
+                        value = sliderRetries,
+                        onValueChange = { sliderRetries = it },
+                        onValueChangeFinished = {
+                            viewModel.updateRoutingSettings(
+                                settings.defaultRoutingMode,
+                                settings.fallbackEnabled,
+                                sliderRetries.roundToInt()
+                            )
+                        },
                         valueRange = 0f..5f,
                         steps = 4,
                         modifier = Modifier.weight(1f)
